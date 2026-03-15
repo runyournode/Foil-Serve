@@ -8,13 +8,11 @@ wheels/
 
 # IDE
 .idea
-
-# Claude Code local settings
+.vscode
 .claude/
 
 # Virtual environments
 .venv
 
-
-# dev files
-output
+# Docker runtime files
+docker/mount_runtime/
