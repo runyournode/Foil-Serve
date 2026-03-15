@@ -1,0 +1,228 @@
+# -------------------------------------------------------------------
+# Logging                                                           -
+# -------------------------------------------------------------------
+log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
+log_file = "/tmp/paddleocr_log.log"   # optional: log to file
+
+# Save input files and debug artifacts for any failed processing request.
+# A timestamped subdirectory is created under `failed_artifacts_dir` for each failure,
+# containing: input file, intermediate PDF (if any), partial markdown, meta.txt, trace.txt.
+# There is no clearing mechanism — manage disk space manually.
+save_failed_artifacts = true
+failed_artifacts_dir = "/tmp/paddleocr_failed"
+
+
+# -------------------------------------------------------------------
+# Safety & Startup checks                                           -
+# -------------------------------------------------------------------
+
+# Auth to use this app, if `requires_auth` is false, keys are ignored
+requires_auth = true
+app_api_keys = [
+    "changeme",
+#    "changeme2",
+]
+
+# Check if all vlm_models declared below are properly reachable on server start-up.
+# If any VLM is not reachable, server will not start
+check_vlm_endpoints = true
+
+# Maximum accepted file size in MB, checked BEFORE writing to disk.
+# Applies to all file types.
+max_file_size_mb = 200
+
+# Per-type size limits (checked after MIME detection).
+# Each is independent from max_file_size_mb; both are enforced.
+max_pdf_file_size_mb = 100
+max_image_file_size_mb = 50
+max_office_file_size_mb = 100
+
+# Maximum accepted Excel file size in MB.
+# For .xlsx (ZIP format): both the compressed (on-disk) size and the actual decompressed
+# size are checked. The decompressed size is measured by reading the real deflate output
+# stream — the ZIP central directory 'file_size' field is attacker-controlled and is NOT
+# used, as a forged value would allow a zip bomb to bypass the check.
+# For .xls (OLE2 binary, not ZIP): only the on-disk size is checked.
+max_excel_file_size_mb = 50
+
+
+# -------------------------------------------------------------------
+# Miscellaneous                                                     -
+# -------------------------------------------------------------------
+
+# Minimum image size to be included in the response (in pixels)
+# If image image_description_model_name is requested, `[[vlm_models]].min_size` takes precedence over this value
+image_min_size = [64, 64]
+
+
+# -------------------------------------------------------------------
+# Ressource managaement                                             -
+# -------------------------------------------------------------------
+
+# paddle pipeline seems to naturally leaks memory outside of python, leading enventually to oom (RAM)
+# Actual work-around is to reload the pipeline every N documents, which takes a few seconds.
+# This is acceptable as main model (PaddleOCR-VL-1.5) is not concerned (externally served by vllm).
+# Increasing this value will reduce overhead reloading the pipeline too often but will have a bigger RAM
+# footprint on your server.
+max_tasks_between_pipeline_reload =  5
+
+# Max parallel LibreOffice headless processes (docx, pptx, doc, ppt → pdf conversion)
+max_concurrent_libreoffice = 3
+
+# Max parallel Excel → markdown conversions
+max_concurrent_excel = 5
+
+
+# -------------------------------------------------------------------
+# Definition of available vlm models for image description          -
+# -------------------------------------------------------------------
+
+# [[vlm_models]]
+# enabled = <true | false>
+# max_concurrent_requests = <int>
+# min_size = <Optional min image size to process | [64, 64]>
+# temperature = <float>
+# max_output_tokens = <int>
+# max_input_ocr_length = <Optional max chars of OCR text injected into the VLM prompt | 700>
+# name = <"image_description_model_name from the client">
+# url = <"url to the openai endpoint">
+# endpoint_api_key = <Optional api key | None>
+# endpoint_name = <exact model name to pass to the openai endpoint">
+# prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
+
+[[vlm_models]]
+enabled = true
+max_concurrent_requests = 20
+name = "ministral-3-3b"
+min_size = [64, 64]
+temperature = 0.0
+max_output_tokens = 4000
+max_input_ocr_length = 700
+url = "http://192.168.1.10:1234/v1"
+endpoint_name = "mistralai/ministral-3-3b"
+endpoint_api_key = 'sk-lm-1Yh9Xgv8:RvsUKja4PJmsDqXeTRbg'
+prompt = "default"
+
+
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "ministral-3-14b"
+min_size = [64, 64]
+temperature = 0.0
+max_output_tokens = 5000
+url = "http://192.168.1.10:1234/v1"
+endpoint_name = "mistralai/ministral-3-14b"
+endpoint_api_key = 'changeme'
+prompt = "default"
+
+
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "GLM-4.6V-Flash"
+min_size = [64, 64]
+temperature = 0.0
+max_output_tokens = 5000
+url = "http://192.168.1.10:1234/v1"
+endpoint_name = "zai-org/GLM-4.6V-Flash"  # cyankiwi/GLM-4.6V-Flash-AWQ-4bit
+endpoint_api_key = 'changeme'
+prompt = "default"
+
+
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 2
+name = "Qwen/Qwen3-VL-30B-A3B"
+min_size = [64, 64]
+temperature = 0.0
+max_output_tokens = 3000
+url = "http://localhost:8000/v1"
+endpoint_name = "cyankiwi/Qwen3-VL-30B-A3B-Instruct-AWQ-4bit"
+endpoint_api_key = 'changeme'
+prompt = "default"
+
+# ------------------------------------------
+# Some trials with openrouter
+# ------------------------------------------
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "qwen3-vl-235b-a22b-instruct"
+temperature = 0.0
+max_output_tokens = 7000
+url = "https://openrouter.ai/api/v1"
+endpoint_name = "qwen/qwen3-vl-235b-a22b-instruct"
+endpoint_api_key = 'sk-or-v1-xxx'
+prompt = "default"
+
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "glm-4.6v"
+temperature = 0.0
+max_output_tokens = 7000
+url = "https://openrouter.ai/api/v1"
+endpoint_name = "z-ai/glm-4.6v"
+endpoint_api_key = 'sk-or-v1-xxx'
+prompt = "default"
+
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "kimi-k2.5"
+temperature = 0.0
+max_output_tokens = 7000
+url = "https://openrouter.ai/api/v1"
+endpoint_name = "moonshotai/kimi-k2.5"
+endpoint_api_key = 'sk-or-v1-xxx'
+prompt = "default"
+
+
+# -------------------------------------------------------------------
+# Prompt definition for image description                           -
+# -------------------------------------------------------------------
+
+[prompts]
+
+default = """
+You are a document analysis expert who specializes in creating text descriptions for images.
+You will receive an image of a picture or figure.  Your job will be to create a short description of the image.
+
+**Instructions:**
+1. Carefully examine the provided image and the provided extracted text.
+2. The extracted text may contain OCR errors, hallucinations, or be entirely irrelevant. Cross-reference it with the visual information. Priority Rule: If there is a conflict between the extracted text and what you visually perceive in the image, prioritize your own visual understanding.
+3. Output a faithful description of the image.  Make sure there is enough specific detail to accurately reconstruct the image.  If the image is a figure or contains numeric data, include the numeric data in the output.
+
+**Strict Instructions:**
+1. **Style Neutrality:** Do not describe colors, font styles (modern, bold), or artistic layouts unless they convey specific data.
+2. **Logos & Simple Text:** If the image is a logo or just stylized text, output ONLY the name of the entity or the exact text found. Do not describe the shapes or colors.
+3. **Data Integrity:** If the image is a chart or table, extract the numeric data and titles.
+4. **No Fluff:** Avoid introductory phrases like "The image depicts" or "In this graphic". Start directly with the description.
+
+
+**Example 1 (Logo with Erroneous OCR):**
+Input:
+```text
+D4SSAULT
+AVIATION
+```
+Output:
+Logo of DASSAULT AVIATION.
+
+**Example 2 (Chart):**
+Input:
+```text
+"Fruit Preference Survey"
+20, 15, 10
+Apples, Bananas, Oranges
+```
+Output:
+A bar chart titled "Fruit Preference Survey" is showing the number of people who prefer different types of fruits.  The x-axis shows the types of fruits, and the y-axis shows the number of people.  The bar chart shows that most people prefer apples, followed by bananas and oranges.  20 people prefer apples, 15 people prefer bananas, and 10 people prefer oranges.
+**Input:**
+```text
+{raw_text}
+```
+"""
+
+another_prompt = "You can define as many prompt as you like. (do not use this one for image descripton :-))"

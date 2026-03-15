@@ -1,0 +1,18 @@
+model: cyankiwi/GLM-4.6V-Flash-AWQ-4bit
+served-model-name:
+  - GLM-4.6V-Flash
+  - glm-4.6v-flash
+  - cyankiwi/GLM-4.6V-Flash-AWQ-4bit
+  - zai-org/GLM-4.6V-Flash
+
+# [Recommendation](https://github.com/zai-org/GLM-V)
+tensor-parallel-size: 4
+tool-call-parser: glm45
+reasoning-parser: glm45
+enable-auto-tool-choice : True
+allowed-local-media-path: True
+mm-encoder-tp-mode: data
+mm_processor_cache_type: shm
+
+default-chat-template-kwargs:
+  enable_thinking: false

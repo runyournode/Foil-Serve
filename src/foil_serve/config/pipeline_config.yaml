@@ -1,0 +1,88 @@
+
+pipeline_name: PaddleOCR-VL-1.5
+
+batch_size: 1  # adapt to vram
+
+use_queues: True  # à conserver pour un traitement async
+
+
+use_ocr_for_image_block: True  # Ajoute un ocr basique en plus dans les images
+
+use_doc_preprocessor: True
+use_layout_detection: True
+use_chart_recognition: False  # garder False : l'analyse de paddle n'est pas parfaite, et empêche d'extraire l'image (donc pas img descr par vlm)
+use_seal_recognition: False
+format_block_content: False
+merge_layout_blocks: True  # a priori permet de rassembler les header, footer sans duplication de texte
+markdown_ignore_labels:
+  - number  # num de page (a priori)
+#  - footnote
+#  - header
+#  - header_image
+#  - footer
+#  - footer_image
+#  - aside_text
+
+SubModules:
+  LayoutDetection:
+    module_name: layout_detection
+    model_name: PP-DocLayoutV3
+    model_dir: null
+    batch_size: 8
+    threshold: 0.3
+    layout_nms: True
+    layout_unclip_ratio: [1.0, 1.0] 
+    layout_merge_bboxes_mode: 
+      0: "union" # abstract
+      1: "union" # algorithm
+      2: "union" # aside_text
+      3: "large" # chart
+      4: "union" # content
+      5: "large" # display_formula
+      6: "large" # doc_title
+      7: "union" # figure_title
+      8: "union" # footer
+      9: "union" # footer
+      10: "union" # footnote
+      11: "union" # formula_number
+      12: "union" # header
+      13: "union" # header
+      14: "union" # image
+      15: "large" # inline_formula
+      16: "union" # number
+      17: "large" # paragraph_title
+      18: "union" # reference
+      19: "union" # reference_content
+      20: "union" # seal
+      21: "union" # table
+      22: "union" # text
+      23: "union" # text
+      24: "union" # vision_footnote
+  VLRecognition:
+    module_name: vl_recognition
+    model_name: PaddleOCR-VL-1.5-0.9B
+    model_dir: null
+    batch_size: 4096
+    genai_config:
+#      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
+      backend: vllm-server
+      max_concurrency: 256 # added to mitigate `RuntimeError: Exception from the 'vlm' worker: Error code: 400 - {'error': {'message': 'Already borrowed', 'type': 'BadRequestError', 'param': None, 'code': 400}}`
+      server_url: http://localhost:8088/v1  # en localhost
+#      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # pour docker
+
+SubPipelines:
+  DocPreprocessor:
+    pipeline_name: doc_preprocessor
+    batch_size: 8
+    use_doc_orientation_classify: True
+    use_doc_unwarping: False  # default = True (mais déforme trop et crop les images)
+    SubModules:
+      DocOrientationClassify:
+        module_name: doc_text_orientation
+        model_name: PP-LCNet_x1_0_doc_ori
+        model_dir: null
+        batch_size: 8
+      DocUnwarping:
+        module_name: image_unwarping
+        model_name: UVDoc
+        model_dir: null

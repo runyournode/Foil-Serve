@@ -1,0 +1,15 @@
+model: cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit
+served-model-name:
+  - cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit
+  - qwen3-vl-8b
+
+
+
+max-model-len: 100
+# You can set --max-num-batched-tokens to balance throughput and latency, higher means higher throughput but higher latency.
+max-num-batched-tokens: 100
+
+no-enable-auto-tool-choice: True
+#enable-auto-tool-choice: True  # we don't need tool here
+
+gpu-memory-utilization: 0.4

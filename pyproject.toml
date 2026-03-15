@@ -1,0 +1,61 @@
+[project]
+name = "foil_serve"
+version = "0.1.0"
+description = "Serveur de conversion de fichier en md basé sur PaddleOCR"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "paddleocr[doc-parser]==3.4.0",
+    "paddlepaddle-gpu==3.3.0",
+    "fastapi[standard-no-fastapi-cloud-cli]==0.135.1",
+    "fastapi-offline",
+    "python-magic>=0.4.27",
+    "pandas==3.0.1",
+    "tabulate==0.10.0",
+    "beautifulsoup4>=4.14.3",
+    "xlrd>=2.0.1",
+    "odfpy>=1.4.1",
+    "psutil>=7.2.2",
+    "zstandard>=0.25.0",
+]
+
+[dependency-groups]
+dev = [
+  "pandas-stubs~=3.0.0",
+  "ty>=0.0.21",
+  "ruff>=0.15.5"
+]
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu130" }
+#paddlepaddle = { index = "paddle-cpu" }
+
+[[tool.uv.index]]
+name = "paddle-cu130"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
+
+#[[tool.uv.index]]
+#name = "paddle-cpu"
+#url = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"
+#explicit = true
+
+[tool.ty.environment]
+# Modules use bare imports (e.g. `from schemas import ...`) because the app runs
+# with src/foil_serve/ injected into sys.path at runtime.
+extra-paths = ["src/foil_serve"]
+
+[tool.ty.rules]
+# Pydantic-Settings populates fields from TOML/env — no constructor args needed.
+missing-argument = "ignore"
+
+[tool.ruff.lint.per-file-ignores]
+# os.environ must be set before Paddle imports — E402 is intentional here
+"src/foil_serve/main.py" = ["E402"]
+
+[tool.setuptools]
+packages = ["foil_serve"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+foil_serve = ["*.yaml", "*.toml"]

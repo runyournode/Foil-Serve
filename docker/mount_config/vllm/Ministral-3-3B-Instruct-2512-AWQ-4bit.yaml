@@ -1,0 +1,38 @@
+model: cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
+served-model-name:
+  - cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
+  - mistralai/ministral-3-3b
+
+tokenizer_mode: mistral
+config_format: mistral
+load_format:  mistral
+
+max-model-len: 10000
+max-num-batched-tokens: 10000
+#enable-auto-tool-choice: True
+
+gpu-memory-utilization: 0.65
+
+
+
+
+
+# Validated solution is below = server starts (adjust the number of tokens for prod later)
+
+#model: cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
+#served-model-name:
+#  - cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
+#  - mistralai/ministral-3-3b
+#
+#tokenizer_mode: mistral
+#
+#max-model-len: 3026
+#max-num-batched-tokens: 3025
+##enable-auto-tool-choice: True
+#config_format: mistral
+#load_format:  mistral
+#gpu-memory-utilization: 0.61
+
+# Solution OUT OF ORDER (docker img v0.15.1*)
+# unsloth/Ministral-3-3B-Instruct-2512-bnb-4bit
+# unsloth/Ministral-3-3B-Instruct-2512-unsloth-bnb-4bit
