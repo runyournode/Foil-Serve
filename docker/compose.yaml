@@ -18,8 +18,8 @@ services:
     volumes:
       - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:ro
       - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:ro
-      - ./mount_runtime/foil_serve/foil-serve_failed:/tmp/foil-serve_failed:ro,Z  # [optional] failed conversion
-      - ./mount_runtime/foil_serve/foil-serve.log:/tmp/foil-serve.log # [optional] log file
+      - ./mount_runtime/foil_serve/foil-serve_failed:/tmp/foil-serve_failed:Z  # [optional] failed conversion artifacts
+      - ./mount_runtime/foil_serve/foil-serve.log:/tmp/foil-serve.log:Z # [optional] log file (touch first is file doesn't exist)
 #    restart: unless-stopped
     depends_on:
       foil_vllm-PaddleOCR-VL-1.5:
