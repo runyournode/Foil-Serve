@@ -91,7 +91,7 @@ max_concurrent_excel = 5
 # prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
 
 [[vlm_models]]
-enabled = true
+enabled = false
 max_concurrent_requests = 20
 name = "ministral-3-3b"
 min_size = [64, 64]

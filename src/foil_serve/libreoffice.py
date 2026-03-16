@@ -12,10 +12,19 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-_SOFFICE_PID_FILE = Path("/tmp/paddleocr_soffice.pid")
+_SOFFICE_PID_FILE = Path("/tmp/foil-serve_soffice.pid")
 
 
 def _build_uno_script(file_path: Path, out_dir: Path, port: int) -> str:
+    """
+    This script is passed to the Python host system that will communicate with
+    the LibreOffice headless server we spwaned thanks to the Uno lib.
+    We need a perfect match beetween LibreOffice <-> Uno lib <-> Python.
+    If you installed LibreOffice from your distribution repo it should be fine.
+    (Our venv Python is almost guaranteed to be incompatible).
+    We have to do this since a simple call to `libreoffice --headless --convert-to pdf ...`
+    cannot ACCEPT REVISIONS and the output PDF could be very messy.
+    """
     return f"""
 import uno
 from com.sun.star.beans import PropertyValue
@@ -171,7 +180,7 @@ class LibreOfficeServer:
 
         # Persist PID so a future crash recovery can clean it up
         _SOFFICE_PID_FILE.write_text(str(self._process.pid))
-        logger.info(f"soffice started (pid={self._process.pid}, port={self._port})")
+        logger.info(f"soffice started (pid={self._process.pid}, port={self._port}) (you can safely ignore next javaldx warning)")
 
         self._wait_ready()
         logger.info(f"soffice ready on port {self._port}")
@@ -203,16 +212,31 @@ class LibreOfficeServer:
         out_dir = file_path.parent
         uno_script = _build_uno_script(file_path, out_dir, self._port)
         with tempfile.NamedTemporaryFile(
-            prefix="paddleocr_UnoScript_", suffix=".py", delete=False
+            prefix="foilserve_UnoScript_", suffix=".py", delete=False
         ) as f:
             script_path = Path(f.name)
             script_path.write_text(uno_script)
         try:
-            subprocess.run(
-                ["python3", script_path.as_posix()],
+            result = subprocess.run(
+                # Use the system Python (/usr/bin/python3) rather than "python3"
+                # which could resolves to the venv Python via PATH.
+                ["/usr/bin/python3", script_path.as_posix()],
+                capture_output=True,
+                text=True,
                 check=True,
-                env={**os.environ, "PYTHONPATH": "/usr/lib/libreoffice/program"},
             )
+            if result.stdout:
+                logger.debug("UNO stdout: %s", result.stdout.strip())
+            if result.stderr:
+                logger.warning("UNO stderr: %s", result.stderr.strip())
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "UNO script failed (exit code %d):\n  stdout: %s\n  stderr: %s",
+                e.returncode,
+                (e.output or "").strip(),
+                (e.stderr or "").strip(),
+            )
+            raise
         finally:
             script_path.unlink(missing_ok=True)
 
@@ -239,12 +263,13 @@ def convert_to_pdf(
     """
     Convert an Office document to PDF via LibreOffice UNO (output in same directory as source).
     Returns the path of the generated PDF.
-
-    Note: TIFF files are NOT handled here — use tiff_to_pdf() from utils.py instead.
     """
     generated_pdf = file_path.with_suffix(".pdf")
 
     if mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
+    # We may want to add a .xls and .xlsx if we decided pandas did not 
+    # extract enougth data from the file (e.g., a silly spreadsheet containing
+    # only text boxes and images but no actual data in cells ...) 
         if not file_path.exists():
             raise FileNotFoundError(str(file_path))
         try:

@@ -3,6 +3,7 @@ import warnings
 import gc
 import tempfile
 import time
+from datetime import datetime
 import asyncio
 import logging
 from typing import Annotated, Optional
@@ -182,7 +183,8 @@ async def _process_document(
     except ValueError as e:
         raise HTTPException(status_code=413, detail=str(e))
 
-    with tempfile.TemporaryDirectory(prefix="paddleocr_") as tmpdir_str:
+    timestamp = datetime.now().strftime("%m-%d_%H-%M")
+    with tempfile.TemporaryDirectory(prefix=f"foil-serve_{timestamp}") as tmpdir_str:
         tmpdir = Path(tmpdir_str)
 
         # ── Phase 1 : write file + detect MIME (thread, fast) ────────────────
