@@ -29,6 +29,7 @@ from utils import (
     prepare_input_file,
     image_to_pdf,
     UnsupportedMimeTypeError,
+    MimeExt
 )
 from debug import ArtifactContext
 from libreoffice import LibreOfficeServer, convert_to_pdf
@@ -139,11 +140,17 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPIOffline(
-    title="PaddleOCR-VL Server",
-    description="""
+    title="Foil-Serve 🏄‍",
+    description=f"""
 <div align="center">
-    <h3>Enhanced PaddleOCR-VL Server</h3>
-    <p>Convert your files to <b>Markdown</b> with optional image description.</p>
+  <h3>Document → Markdown conversion server, built on PaddleOCR — with meaningful extras.</h3>
+  <p><b>Supported formats:</b> {' : '.join(x.split('.')[1].upper() for x in MimeExt.__args__)}</p>
+  <p><b>Extras:</b></p>
+  <p>
+    - Extracted figures can be described by any OpenAI-compatible VLM — description injected as &lt;figcaption&gt; in the Markdown output.<br>
+    - HTML tables are simplified (3–5× token reduction) for LLM/RAG workflows.<br>
+    - Writter documents (Open and Word) tracked changes are accepted automatically.
+  </p>
 </div>
     """,
     lifespan=lifespan,
