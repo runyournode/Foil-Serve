@@ -95,11 +95,11 @@ WORKDIR /home/paddleocr
 # Installation dépendances (libreoffice, python)
 # ---------------------------------
 RUN apt update \
-    && apt upgrade \
+    && apt upgrade -y \
     && apt install -y --no-install-recommends \
         libgl1    \
         libreoffice \
-        libmagic1 \
+        libmagic1t64 \
         fontconfig \
         fonts-dejavu-core \
         fonts-liberation \
