@@ -125,7 +125,7 @@ HEALTHCHECK --interval=120s --timeout=15s --start-period=60s \
 
 
 # ---------------------------------
-# Light: no bundled models (downloaded at runtime via vLLM/PaddleOCR)
+# Light: no bundled models (downloaded at runtime via vLLM/PaddleOCR) (save ~ 200 MB compared to -offline)
 # ---------------------------------
 FROM base AS light
 LABEL feature.offline-ready="false"

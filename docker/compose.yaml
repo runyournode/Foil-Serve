@@ -1,10 +1,10 @@
 services:
-  paddle_app:
-    image: ghcr.io/runyournode/foil-serve:0.1.0-offline
+  foil_app:
+    image: ghcr.io/runyournode/foil-serve:deleteme
 #    build:
 #      context: ..
 #      dockerfile: Dockerfile
-    container_name: paddle_main
+    container_name: foil_app
     ipc: host
 #    extra_hosts:
 #      - "host.docker.internal:host-gateway"
@@ -18,15 +18,15 @@ services:
     volumes:
       - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:ro
       - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:ro
-      - ./mount_runtime/foil_serve/tmp/paddleocr_failed:/tmp/paddleocr_failed:ro,Z  # failed conversion
+      - ./mount_runtime/foil_serve/tmp/foil-serve_failed:/tmp/foil-serve_failed:ro,Z  # failed conversion
 #    restart: unless-stopped
     depends_on:
-      paddle_vllm-PaddleOCR-VL-1.5:
+      foil_vllm-PaddleOCR-VL-1.5:
         condition: service_healthy
-      paddle_vllm-ministral-3-3b:
-        condition: service_healthy
+#      foil_vllm-ministral-3-3b:
+#        condition: service_healthy
     networks:
-      - paddle-net
+      - foil-net
     deploy:
       resources:
         reservations:
@@ -35,9 +35,9 @@ services:
               capabilities: [gpu]
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
-  paddle_vllm-PaddleOCR-VL-1.5:
+  foil_vllm-PaddleOCR-VL-1.5:
     image: docker.io/vllm/vllm-openai:v0.17.1-cu130
-    container_name: paddle_vllm-PaddleOCR-VL-1.5
+    container_name: foil_vllm-PaddleOCR-VL-1.5
     ipc: host
     expose:
       - "8000"
@@ -52,7 +52,7 @@ services:
     command: ["--port", "8000", "--config", "/config/config.yaml"]
     restart: unless-stopped
     networks:
-      - paddle-net
+      - foil-net
     healthcheck:
       test: [
         "CMD", "python3", "-c",
@@ -71,9 +71,9 @@ services:
               capabilities: [ gpu ]
 
   # Soft Req : mistralai/ministral-3-3b
-  paddle_vllm-ministral-3-3b:
+  foil-serve_vllm-ministral-3-3b:
     image: docker.io/vllm/vllm-openai:v0.17.1-cu130
-    container_name: paddle_vllm-ministral-3-3b
+    container_name: foil_vllm-ministral-3-3b
     ipc: host
     expose:
       - "8000"
@@ -88,7 +88,7 @@ services:
     command: [ "--port", "8000", "--config", "/config/config.yaml" ]
 #    restart: unless-stopped
     networks:
-      - paddle-net
+      - foil-net
     healthcheck:
       test: [
         "CMD", "python3", "-c",
@@ -108,5 +108,5 @@ services:
 
 
 networks:
-  paddle-net:
+  foil-net:
     driver: bridge

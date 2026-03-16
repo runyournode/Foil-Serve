@@ -2,14 +2,14 @@
 # Logging                                                           -
 # -------------------------------------------------------------------
 log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
-log_file = "/tmp/paddleocr_log.log"   # optional: log to file
+log_file = "/tmp/foil-serve.log"   # optional: log to file
 
 # Save input files and debug artifacts for any failed processing request.
 # A timestamped subdirectory is created under `failed_artifacts_dir` for each failure,
 # containing: input file, intermediate PDF (if any), partial markdown, meta.txt, trace.txt.
 # There is no clearing mechanism — manage disk space manually.
 save_failed_artifacts = true
-failed_artifacts_dir = "/tmp/paddleocr_failed"
+failed_artifacts_dir = "/tmp/foil-serve_failed"
 
 
 # -------------------------------------------------------------------

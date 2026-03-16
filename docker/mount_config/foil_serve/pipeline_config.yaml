@@ -66,8 +66,8 @@ SubModules:
     genai_config:
 #      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
       backend: vllm-server
-      server_url: http://localhost:8088/v1  # in localhost
-#      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # if vlm in docker
+#      server_url: http://localhost:8088/v1  # in localhost
+      server_url: http://foil_vllm-PaddleOCR-VL-1.5:8000/v1  # if vlm in docker
 
 SubPipelines:
   DocPreprocessor:
