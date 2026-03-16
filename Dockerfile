@@ -20,15 +20,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Dowload models
 FROM alpine:3.20 AS models_fetcher
 
-ARG BUILD_FOR_OFFLINE=true
-ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/home/paddleocr
 
 RUN apk add --no-cache wget tar
 
-
 # Without PaddleOCR-VL-1.5
-RUN --mount=type=cache,target=/model_cache if [ "${BUILD_FOR_OFFLINE}" = 'true' ]; then \
+RUN --mount=type=cache,target=/model_cache \
         mkdir -p "${HOME}/.paddlex/official_models" \
         && cd "${HOME}/.paddlex/official_models" \
         && wget https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/UVDoc_infer.tar \
@@ -42,8 +39,7 @@ RUN --mount=type=cache,target=/model_cache if [ "${BUILD_FOR_OFFLINE}" = 'true' 
         && mv PP-DocLayoutV3_infer PP-DocLayoutV3 \
         && rm -f UVDoc_infer.tar PP-LCNet_x1_0_doc_ori_infer.tar PP-DocLayoutV3_infer.tar \
         && mkdir -p "${HOME}/.paddlex/fonts" \
-        && wget -P "${HOME}/.paddlex/fonts" https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/fonts/PingFang-SC-Regular.ttf; \
-    fi
+        && wget -P "${HOME}/.paddlex/fonts" https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/fonts/PingFang-SC-Regular.ttf
 
 # Original full model download
 #RUN --mount=type=cache,target=/model_cache if [ "${BUILD_FOR_OFFLINE}" = 'true' ]; then \
@@ -69,7 +65,10 @@ RUN --mount=type=cache,target=/model_cache if [ "${BUILD_FOR_OFFLINE}" = 'true' 
 
 
 
-FROM  python:3.13.12-slim-trixie
+# ---------------------------------
+# Base: dependencies + venv + source (no models)
+# ---------------------------------
+FROM python:3.13.12-slim-trixie AS base
 
 LABEL org.opencontainers.image.title="PaddleOCR-VL Server"
 LABEL org.opencontainers.image.description="FastAPI server for document-to-markdown conversion based on PaddleOCR VL 1.5"
@@ -78,7 +77,6 @@ LABEL org.opencontainers.image.authors="runyournode"
 LABEL com.paddleocr.cuda.version="13.0"
 LABEL com.paddleocr.engine="PaddlePaddle GPU 3.3.0"
 LABEL feature.libreoffice="true"
-LABEL feature.offline-ready="true"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -88,7 +86,6 @@ ENV PATH="/app/.venv/bin:${PATH}"
 
 RUN groupadd -g 1000 paddleocr \
     && useradd -m -s /bin/bash -u 1000 -g 1000 paddleocr
-ENV HOME=/home/paddleocr
 WORKDIR /home/paddleocr
 
 # ---------------------------------
@@ -111,9 +108,7 @@ RUN apt update \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
-
 COPY --from=uv_fetcher --chown=paddleocr /app/.venv /app/.venv
-COPY --from=models_fetcher --chown=paddleocr ${HOME}/.paddlex ${HOME}/.paddlex
 COPY --chown=paddleocr src/foil_serve /app/
 
 USER paddleocr
@@ -122,9 +117,23 @@ WORKDIR /app
 ENTRYPOINT ["uvicorn", "main:app"]
 CMD ["--host", "0.0.0.0", "--port", "8080"]
 
-
 ENV APP_PORT=8080
 HEALTHCHECK --interval=120s --timeout=15s --start-period=60s \
   CMD python3 -c "import urllib.request, os; \
       port = os.getenv('APP_PORT', '8080'); \
       urllib.request.urlopen(f'http://localhost:{port}/health', timeout=15)" || exit 1
+
+
+# ---------------------------------
+# Light: no bundled models (downloaded at runtime via vLLM/PaddleOCR)
+# ---------------------------------
+FROM base AS light
+LABEL feature.offline-ready="false"
+
+
+# ---------------------------------
+# Offline: models bundled in the image
+# ---------------------------------
+FROM base AS offline
+LABEL feature.offline-ready="true"
+COPY --from=models_fetcher --chown=paddleocr ${HOME}/.paddlex ${HOME}/.paddlex
