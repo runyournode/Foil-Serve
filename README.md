@@ -12,7 +12,7 @@
 Extracted figures can be described by any OpenAI-compatible VLM of your choice. The description is injected directly into the Markdown inside a proper `<figcaption>` tag, keeping the output clean and semantically structured.
 
 ### 📊 HTML table simplification
-PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting attributes and flattens the structure — reducing token count by 3–5× without losing semantic content. This matters when feeding documents into a RAG pipeline or an LLM with limited context.
+PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting attributes and flattens the structure — reducing token count by 3–5 × without losing semantic content. This matters when feeding documents into a RAG pipeline or an LLM with limited context.
 
 ### 📁 Extended input format support
 
@@ -23,6 +23,8 @@ PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting at
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
 | `.xls`, `.xlsx`, `.ods` | Pandas + Tabulate → Markdown tables | — |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
+
+**PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
 
 Only MIME types listed in [`utils.mime_def`](src/foil_serve/utils.py) are accepted.
 
