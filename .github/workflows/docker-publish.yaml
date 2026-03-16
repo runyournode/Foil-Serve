@@ -42,7 +42,7 @@ jobs:
           tags: |
             # main branch
             type=raw,value=main,enable={{is_default_branch}}
-            # dev branch — format() avoids single-quote/YAML parsing conflict inside ${{ }}
+            # dev branch — format() avoids single-quote/YAML parsing conflict in GitHub expressions
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
             # semver releases
             type=semver,pattern={{version}}
