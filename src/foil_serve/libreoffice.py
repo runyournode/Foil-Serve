@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -147,6 +148,17 @@ class LibreOfficeServer:
         finally:
             _SOFFICE_PID_FILE.unlink(missing_ok=True)
 
+    @staticmethod
+    def _drain_stderr(process: subprocess.Popen) -> None:
+        """Read soffice stderr line by line, suppressing the known harmless javaldx warning."""
+        assert process.stderr is not None
+        for raw_line in process.stderr:
+            line = raw_line.decode(errors="replace").rstrip()
+            if "javaldx" in line:
+                continue
+            if line:
+                logger.warning("soffice stderr: %s", line)
+
     def _wait_ready(self, timeout: float = 15.0) -> None:
         """Poll the UNO socket until soffice accepts connections."""
         deadline = time.monotonic() + timeout
@@ -175,12 +187,21 @@ class LibreOfficeServer:
                 "--headless",
                 "--norestore",
                 f"--accept=socket,host=localhost,port={self._port};urp;",
-            ]
+            ],
+            stderr=subprocess.PIPE,
         )
+
+        # Drain soffice stderr in a background thread, filtering out the
+        # harmless "javaldx" warning (Java is not used and not required).
+        threading.Thread(
+            target=self._drain_stderr,
+            args=(self._process,),
+            daemon=True,
+        ).start()
 
         # Persist PID so a future crash recovery can clean it up
         _SOFFICE_PID_FILE.write_text(str(self._process.pid))
-        logger.info(f"soffice started (pid={self._process.pid}, port={self._port}) (you can safely ignore next javaldx warning)")
+        logger.info(f"soffice started (pid={self._process.pid}, port={self._port})")
 
         self._wait_ready()
         logger.info(f"soffice ready on port {self._port}")
@@ -267,9 +288,9 @@ def convert_to_pdf(
     generated_pdf = file_path.with_suffix(".pdf")
 
     if mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
-    # We may want to add a .xls and .xlsx if we decided pandas did not 
-    # extract enougth data from the file (e.g., a silly spreadsheet containing
-    # only text boxes and images but no actual data in cells ...) 
+        # We may want to add a .xls and .xlsx if we decided pandas did not
+        # extract enougth data from the file (e.g., a silly spreadsheet containing
+        # only text boxes and images but no actual data in cells ...)
         if not file_path.exists():
             raise FileNotFoundError(str(file_path))
         try:

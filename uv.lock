@@ -357,6 +357,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
+    { name = "chardet" },
     { name = "fastapi", extra = ["standard-no-fastapi-cloud-cli"] },
     { name = "fastapi-offline" },
     { name = "odfpy" },
@@ -380,6 +381,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
+    { name = "chardet", specifier = ">=7.1.0" },
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = "==0.135.1" },
     { name = "fastapi-offline" },
     { name = "odfpy", specifier = ">=1.4.1" },

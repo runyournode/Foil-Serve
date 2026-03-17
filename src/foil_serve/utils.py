@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
+import chardet
 import magic
 import pandas as pd
 import zstandard
@@ -244,6 +245,46 @@ def build_tar_zst(
 
     tar_buf.seek(0)
     return zstandard.ZstdCompressor().compress(tar_buf.read())
+
+
+def read_text_smart(path: Path) -> str:
+    """
+    Decode a text file with automatic encoding detection.
+
+    Strategy (in order):
+      1. UTF-8 (strict) — covers the vast majority of modern files
+      2. chardet detection — handles exotic encodings (Shift-JIS, EUC-JP, Big5, etc.)
+      3. Fallback chain: UTF-16 → cp1252 → latin-1
+         latin-1 is the last resort as it never raises (every byte maps to U+0000–U+00FF)
+
+    Raises ValueError only when every strategy fails — in practice latin-1 makes that
+    impossible, but the explicit raise keeps the type signature honest.
+    """
+    raw = path.read_bytes()
+
+    # 1. UTF-8 fast path
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 2. chardet detection
+    detected = chardet.detect(raw)
+    enc = detected.get("encoding")
+    if enc:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            pass
+
+    # 3. Fallback chain
+    for fallback in ("utf-16", "cp1252", "latin-1"):
+        try:
+            return raw.decode(fallback)
+        except Exception:
+            continue
+
+    raise ValueError(f"Unable to decode file: {path.name}")
 
 
 def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt, str]:

@@ -17,6 +17,7 @@ dependencies = [
     "odfpy>=1.4.1",
     "psutil>=7.2.2",
     "zstandard>=0.25.0",
+    "chardet>=7.1.0",
 ]
 
 [dependency-groups]

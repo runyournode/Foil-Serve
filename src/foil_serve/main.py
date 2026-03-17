@@ -18,6 +18,10 @@ from PIL.Image import Image
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 # os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"        # ← returns memory to the system
 warnings.filterwarnings("ignore", message="No ccache found", category=UserWarning)
+# requests hardcodes chardet < 6.0.0 but paddlex requires chardet 7.x — both work fine together
+warnings.filterwarnings(
+    "ignore", message="urllib3.*chardet.*doesn't match", category=Warning
+)
 
 from schemas import ProcessedDocument, Metadata
 from utils import (
@@ -27,9 +31,10 @@ from utils import (
     check_zip_uncompressed_size,
     excel2txt,
     prepare_input_file,
+    read_text_smart,
     image_to_pdf,
     UnsupportedMimeTypeError,
-    MimeExt
+    MimeExt,
 )
 from debug import ArtifactContext
 from libreoffice import LibreOfficeServer, convert_to_pdf
@@ -144,7 +149,7 @@ app = FastAPIOffline(
     description=f"""
 <div align="center">
   <h3>Document → Markdown conversion server, built on PaddleOCR — with meaningful extras.</h3>
-  <p><b>Supported formats:</b> {' : '.join(x.split('.')[1].upper() for x in MimeExt.__args__)}</p>
+  <p><b>Supported formats:</b> {" : ".join(x.split(".")[1].upper() for x in MimeExt.__args__)}</p>
   <p><b>Extras:</b></p>
   <p>
     - Extracted figures can be described by any OpenAI-compatible VLM — description injected as &lt;figcaption&gt; in the Markdown output.<br>
@@ -260,7 +265,7 @@ async def _process_document(
         # Short-circuit: plain text — no pipeline needed
         if mime in (".txt", ".json", ".csv", ".xml"):
             _t = time.perf_counter()
-            md = prepared_path.read_text()
+            md = await asyncio.to_thread(read_text_smart, prepared_path)
             t_active += time.perf_counter() - _t
             return (
                 md,
