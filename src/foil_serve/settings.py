@@ -28,8 +28,19 @@ class Settings(BaseSettings):
     max_excel_file_size_mb: int
     save_failed_artifacts: bool = False
     failed_artifacts_dir: str = "/tmp/paddleocr_failed"
+    save_table_conversion_artifacts: bool = False
+    table_conversion_artifacts_dir: str = "/tmp/foil-serve_xls2pdf"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_file: str | None = None
+
+    # Spreadsheet processing
+    excel_output_format: Literal["human", "llm"] = "llm"
+    excel_mask_cell_errors: bool
+    save_cell_error_artifacts: bool = False
+    cell_error_artifacts_dir: str = "/tmp/foil-serve_cell_errors"
+    excel_max_output_ratio: float
+    excel_min_input_for_fallback_mb: float
+    excel_min_output_ratio: float
 
     model_config = SettingsConfigDict(
         toml_file="config/server_config.toml", extra="ignore"

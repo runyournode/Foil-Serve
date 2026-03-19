@@ -24,19 +24,19 @@ warnings.filterwarnings(
 )
 
 from schemas import ProcessedDocument, Metadata
+from spreadsheet import excel2txt
 from utils import (
     batch_pil_to_b64,
     build_tar_zst,
     check_file_size,
     check_zip_uncompressed_size,
-    excel2txt,
     prepare_input_file,
     read_text_smart,
     image_to_pdf,
     UnsupportedMimeTypeError,
     MimeExt,
 )
-from debug import ArtifactContext
+from debug import ArtifactContext, save_table_conversion_artifacts
 from libreoffice import LibreOfficeServer, convert_to_pdf
 from pipeline import PaddlePipelineWrapper
 from vlm import describe_image_sem
@@ -203,7 +203,7 @@ async def _process_document(
         _t = time.perf_counter()
         try:
             prepared_path, mime, raw_mime = await asyncio.to_thread(
-                prepare_input_file, file_content, tmpdir
+                prepare_input_file, file_content=file_content, tmpdir=tmpdir
             )
         except UnsupportedMimeTypeError as e:
             if artifact_ctx is not None:
@@ -236,8 +236,8 @@ async def _process_document(
                 if mime in (".docx", ".pptx", ".odt", ".odp"):
                     await asyncio.to_thread(
                         check_zip_uncompressed_size,
-                        prepared_path,
-                        settings.max_office_file_size_mb * 1024 * 1024,
+                        path=prepared_path,
+                        max_bytes=settings.max_office_file_size_mb * 1024 * 1024,
                     )
             elif mime in (".xls", ".xlsx", ".ods"):
                 # Check on-disk (compressed) size — reliable for all spreadsheet formats
@@ -249,8 +249,8 @@ async def _process_document(
                 if mime in (".xlsx", ".ods"):
                     await asyncio.to_thread(
                         check_zip_uncompressed_size,
-                        prepared_path,
-                        settings.max_excel_file_size_mb * 1024 * 1024,
+                        path=prepared_path,
+                        max_bytes=settings.max_excel_file_size_mb * 1024 * 1024,
                     )
             elif mime in (".txt", ".json", ".csv", ".xml"):
                 pass
@@ -265,7 +265,7 @@ async def _process_document(
         # Short-circuit: plain text — no pipeline needed
         if mime in (".txt", ".json", ".csv", ".xml"):
             _t = time.perf_counter()
-            md = await asyncio.to_thread(read_text_smart, prepared_path)
+            md = await asyncio.to_thread(read_text_smart, path=prepared_path)
             t_active += time.perf_counter() - _t
             return (
                 md,
@@ -279,12 +279,18 @@ async def _process_document(
                 raw_mime,
             )
 
-        # Short-circuit: spreadsheets — semaphored, no pipeline needed
+        # Spreadsheets — try pandas first, fallback to PDF+Paddle if sparse
+        fallback_to_pdf = False
         if mime in (".xls", ".xlsx", ".ods"):
             async with request.app.state.excel_sem:
                 _t = time.perf_counter()
                 try:
-                    md = await asyncio.to_thread(excel2txt, prepared_path)
+                    md = await asyncio.to_thread(
+                        excel2txt,
+                        path=prepared_path,
+                        table_format=settings.excel_output_format,
+                        raw_mime=mime,
+                    )
                 except Exception as e:
                     if artifact_ctx is not None:
                         await artifact_ctx.save(e, t_active=t_active)
@@ -293,17 +299,48 @@ async def _process_document(
                         detail=f"Spreadsheet conversion error ({mime}): {e}",
                     )
                 t_active += time.perf_counter() - _t
-            return (
-                md,
-                {},
-                Metadata(
-                    active_conversion_time_no_img_desc=int(t_active),
-                    img_desc_time=0,
-                    wall_clock_time=int(time.perf_counter() - t0_wall),
-                ),
-                mime,
-                raw_mime,
-            )
+
+            md_bytes = len(md.encode("utf-8"))
+
+            # Guard: reject if output is disproportionately large (bloated / NaN-filled)
+            if md_bytes > _file_size * settings.excel_max_output_ratio:
+                ratio = md_bytes / _file_size
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Spreadsheet output too large: {md_bytes / 1e6:.0f} MB markdown "
+                        f"from {_file_size / 1e6:.0f} MB input "
+                        f"(ratio {ratio:.1f}x, max {settings.excel_max_output_ratio}x)"
+                    ),
+                )
+
+            # Detect sparse spreadsheets (text boxes / images only, no real cell data)
+            if (
+                _file_size >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
+                and md_bytes < _file_size * settings.excel_min_output_ratio
+            ):
+                logger.warning(
+                    "Sparse spreadsheet detected: %d bytes markdown from %d bytes input "
+                    "(ratio %.4f, threshold %.4f) — falling back to PDF+OCR pipeline",
+                    md_bytes,
+                    _file_size,
+                    md_bytes / _file_size,
+                    settings.excel_min_output_ratio,
+                )
+                fallback_to_pdf = True
+                del md
+            else:
+                return (
+                    md,
+                    {},
+                    Metadata(
+                        active_conversion_time_no_img_desc=int(t_active),
+                        img_desc_time=0,
+                        wall_clock_time=int(time.perf_counter() - t0_wall),
+                    ),
+                    mime,
+                    raw_mime,
+                )
 
         # ── Phase 2 : conversion to PDF if needed ────────────────────────────
         # TIFF/WebP: converted via Pillow (TIFF may be multipage; WebP not supported by Paddle).
@@ -314,7 +351,7 @@ async def _process_document(
             _t = time.perf_counter()
             try:
                 pipeline_input = await asyncio.to_thread(
-                    image_to_pdf, prepared_path, tmpdir
+                    image_to_pdf, path=prepared_path, output_dir=tmpdir
                 )
             except Exception as e:
                 if artifact_ctx is not None:
@@ -324,22 +361,45 @@ async def _process_document(
                     detail=f"Image to PDF conversion error ({mime}): {e}",
                 )
             t_active += time.perf_counter() - _t
-        elif mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
+        elif mime in (
+            ".docx",
+            ".doc",
+            ".pptx",
+            ".ppt",
+            ".odt",
+            ".odp",
+            ".xls",
+            ".xlsx",
+            ".ods",
+        ) and (fallback_to_pdf or mime not in (".xls", ".xlsx", ".ods")):
             lo_server: LibreOfficeServer = request.app.state.libreoffice_server
             async with request.app.state.libreoffice_sem:
                 _t = time.perf_counter()
                 try:
                     pipeline_input = await asyncio.to_thread(
-                        convert_to_pdf, prepared_path, mime, lo_server
+                        convert_to_pdf,
+                        file_path=prepared_path,
+                        mime=mime,
+                        server=lo_server,
                     )
                 except Exception as e:
                     if artifact_ctx is not None:
                         await artifact_ctx.save(e, t_active=t_active)
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Office to PDF conversion error ({mime}): {e}",
+                        detail=f"{'Spreadsheet' if fallback_to_pdf else 'Office'} to PDF conversion error ({mime}): {e}",
                     )
                 t_active += time.perf_counter() - _t
+
+            # Save spreadsheet fallback artifacts if configured
+            if fallback_to_pdf and settings.save_table_conversion_artifacts:
+                await asyncio.to_thread(
+                    save_table_conversion_artifacts,
+                    input_path=prepared_path,
+                    pdf_path=pipeline_input,
+                    artifacts_dir=settings.table_conversion_artifacts_dir,
+                    raw_mime=mime,
+                )
         else:
             # Direct pipeline: .pdf, .png, .jpg, .bmp
             pipeline_input = prepared_path
@@ -371,8 +431,8 @@ async def _process_document(
         artifact_ctx.partial_md = md_raw
     try:
         ocrs, md_full = await asyncio.gather(
-            asyncio.to_thread(extract_raw_ocr, md_raw),
-            asyncio.to_thread(prune_tables, md_raw),
+            asyncio.to_thread(extract_raw_ocr, md_with_html=md_raw),
+            asyncio.to_thread(prune_tables, md_with_html=md_raw),
         )
     except Exception as e:
         if artifact_ctx is not None:
@@ -397,7 +457,7 @@ async def _process_document(
                 img.close()
         _t = time.perf_counter()
         imgs_b64: dict[str, str] = await asyncio.to_thread(
-            batch_pil_to_b64, imgs_accepted
+            batch_pil_to_b64, images_dict=imgs_accepted
         )
         t_active += time.perf_counter() - _t
         gc.collect()
@@ -441,7 +501,9 @@ async def _process_document(
 
     # ── Phase 6 : reformat Markdown (inject descriptions + OCR into figures) ──
     _t = time.perf_counter()
-    md_full = await asyncio.to_thread(reformat_md, md_full, descriptions, ocrs)
+    md_full = await asyncio.to_thread(
+        reformat_md, md=md_full, descriptions_dict=descriptions, ocr_dict=ocrs
+    )
     t_active += time.perf_counter() - _t
 
     return (
@@ -465,7 +527,7 @@ async def _process_document(
     dependencies=[Security(verify_api_key)],
     response_model=ProcessedDocument,
 )
-async def paddleocr_process(
+async def foil_process(
     request: Request,
     file_content: Annotated[bytes, Body(media_type="application/octet-stream")],
     image_description_model_name: Optional[str] = Query(None),
@@ -503,7 +565,7 @@ async def paddleocr_process(
         200: {"content": {"application/zstd": {}}, "description": "tar.zst archive"}
     },
 )
-async def paddleocr_process_download(
+async def foil_process_download(
     request: Request,
     file_content: Annotated[bytes, Body(media_type="application/octet-stream")],
     image_description_model_name: Optional[str] = Query(None),
@@ -531,7 +593,12 @@ async def paddleocr_process_download(
         artifact_ctx,
     )
     archive = await asyncio.to_thread(
-        build_tar_zst, page_content, imgs_b64, metadata, mime_ext, raw_mime
+        build_tar_zst,
+        page_content=page_content,
+        imgs_b64=imgs_b64,
+        metadata=metadata,
+        mime_ext=mime_ext,
+        raw_mime=raw_mime,
     )
     return Response(
         content=archive,

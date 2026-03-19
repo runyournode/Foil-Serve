@@ -20,6 +20,39 @@ except importlib.metadata.PackageNotFoundError:
     _APP_VERSION = "unknown"
 
 
+def _safe_mime(raw_mime: str) -> str:
+    """Replace characters not safe in directory names."""
+    return raw_mime.replace("/", "-").replace("+", "-").replace(":", "-")
+
+
+def _make_artifact_dir(
+    base_dir: Path | str,
+    raw_mime: str,
+    input_path: Path | None = None,
+) -> tuple[Path, str | None]:
+    """Create a timestamped artifact subdirectory and return it with the full SHA-256.
+
+    Directory name pattern: ``<yy-mm-dd_hh-mm>_<safe-mime>_<hash8>``
+    (hash part omitted when *input_path* is None or missing from disk).
+
+    Returns:
+        (subdir, file_sha256) — *file_sha256* is ``None`` when no file is available.
+    """
+    timestamp = datetime.now().strftime("%y-%m-%d_%H-%M")
+    safe_mime = _safe_mime(raw_mime)
+    file_sha256: str | None = None
+
+    if input_path is not None and input_path.exists():
+        file_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+        dirname = f"{timestamp}_{safe_mime}_{file_sha256[:8]}"
+    else:
+        dirname = f"{timestamp}_{safe_mime}"
+
+    subdir = Path(base_dir) / dirname
+    subdir.mkdir(parents=True, exist_ok=True)
+    return subdir, file_sha256
+
+
 @dataclass
 class ArtifactContext:
     """
@@ -83,7 +116,7 @@ def save_failed_artifacts(
     All internal errors are silently logged to avoid masking the original exception.
 
     Directory structure:
-      <artifacts_dir>/<yy-mm-dd_hh-mm>_<safe-mime>/
+      <artifacts_dir>/<yy-mm-dd_hh-mm>_<safe-mime>[_<hash8>]/
         input_file.<ext>      — copy of the input file (if still on disk)
         converted.pdf         — intermediate PDF (if conversion happened)
         partial_output.md     — last Markdown state (if available)
@@ -91,17 +124,11 @@ def save_failed_artifacts(
         trace.txt             — full exception traceback
     """
     try:
-        timestamp = datetime.now().strftime("%y-%m-%d_%H-%M")
-        # Replace characters not safe in directory names
-        safe_mime = raw_mime.replace("/", "-").replace("+", "-").replace(":", "-")
-        subdir = artifacts_dir / f"{timestamp}_{safe_mime}"
-        subdir.mkdir(parents=True, exist_ok=True)
+        subdir, file_sha256 = _make_artifact_dir(artifacts_dir, raw_mime, prepared_path)
 
         # Copy input file (if it is still on disk — inside tmpdir)
-        file_sha256: str | None = None
         if prepared_path is not None and prepared_path.exists():
             shutil.copy2(prepared_path, subdir / prepared_path.name)
-            file_sha256 = hashlib.sha256(prepared_path.read_bytes()).hexdigest()
 
         # Copy intermediate PDF (if produced before the error)
         if converted_pdf is not None and converted_pdf.exists():
@@ -170,3 +197,53 @@ def save_failed_artifacts(
 
     except Exception as save_exc:
         logger.error(f"Failed to save debug artifacts: {save_exc}")
+
+
+def save_cell_error_artifacts(
+    input_path: Path,
+    md_with_errors: str,
+    md_final: str | None,
+    artifacts_dir: str,
+    raw_mime: str = "unknown",
+) -> None:
+    """Save debug artifacts when spreadsheet cell errors are detected.
+
+    Directory structure:
+      <artifacts_dir>/<yy-mm-dd_hh-mm>_<safe-mime>_<hash8>/
+        <original_filename>       — copy of the input spreadsheet
+        md_with_errors.md         — Markdown with short error labels (#ref, #n/a, ...)
+        md_final.md               — final Markdown after masking (only if mask_errors=true)
+    """
+    try:
+        out_dir, _ = _make_artifact_dir(artifacts_dir, raw_mime, input_path)
+        shutil.copy2(input_path, out_dir / input_path.name)
+        (out_dir / "md_with_errors.md").write_text(md_with_errors, encoding="utf-8")
+        if md_final is not None:
+            (out_dir / "md_final.md").write_text(md_final, encoding="utf-8")
+        logger.info("Cell error artifacts saved to %s", out_dir)
+    except Exception as e:
+        logger.error("Failed to save cell error artifacts: %s", e)
+
+
+def save_table_conversion_artifacts(
+    input_path: Path,
+    pdf_path: Path,
+    artifacts_dir: str,
+    raw_mime: str = "unknown",
+) -> None:
+    """
+    Save input spreadsheet and generated PDF when a sparse spreadsheet
+    triggers fallback to PDF+OCR conversion.
+
+    Directory structure:
+      <artifacts_dir>/<yy-mm-dd_hh-mm>_<safe-mime>_<hash8>/
+        <original_filename>   — copy of the input spreadsheet
+        <stem>.pdf            — generated PDF
+    """
+    try:
+        subdir, _ = _make_artifact_dir(artifacts_dir, raw_mime, input_path)
+        shutil.copy2(input_path, subdir / input_path.name)
+        shutil.copy2(pdf_path, subdir / pdf_path.name)
+        logger.info("Table conversion artifacts saved to %s", subdir)
+    except Exception as e:
+        logger.error("Failed to save table conversion artifacts: %s", e)

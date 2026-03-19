@@ -8,10 +8,8 @@ from typing import Literal
 
 import chardet
 import magic
-import pandas as pd
 import zstandard
 from PIL.Image import Image, open as pil_open
-from tabulate import tabulate
 
 from schemas import Metadata
 
@@ -145,12 +143,12 @@ def check_zip_uncompressed_size(path: Path, max_bytes: int) -> None:
                         )
 
 
-def image_to_pdf(tiff_path: Path, output_dir: Path) -> Path:
+def image_to_pdf(path: Path, output_dir: Path) -> Path:
     """
     Convert an image file to PDF using Pillow. Supports multi-page formats (e.g. TIFF)
     and formats not natively supported by the Paddle pipeline (e.g. WebP).
     """
-    img = pil_open(tiff_path)
+    img = pil_open(path)
     pages: list[Image] = []
     try:
         while True:
@@ -165,46 +163,6 @@ def image_to_pdf(tiff_path: Path, output_dir: Path) -> Path:
     for p in pages:
         p.close()
     return pdf_path
-
-
-def excel2txt(path: Path) -> str:
-    """Convert all sheets of an Excel / ODS file to Markdown tables."""
-    # odfpy is required for ODS support (engine='odf')
-    engine = "odf" if path.suffix.lower() == ".ods" else None
-    try:
-        sheets = pd.read_excel(
-            path, sheet_name=None, dtype=str, keep_default_na=False, engine=engine
-        )
-        txt = ""
-        for sheet_name, df in sheets.items():
-            cols = df.columns
-            col_dic = {}
-            for col in cols:
-                if isinstance(col, str):
-                    if col.startswith("Unnamed: "):
-                        col_dic[col] = ""
-                    else:
-                        col_dic[col] = (
-                            col.replace("\n", " ").replace("\r", " ").replace("  ", " ")
-                        )
-            df = df.rename(columns=col_dic)
-            df = df.map(
-                lambda x: (
-                    x.replace("\n", " ").replace("\r", " ").replace("  ", " ")
-                    if isinstance(x, str)
-                    else x
-                )
-            )
-            txt += f"\n## {sheet_name}\n\n"
-            txt += (
-                tabulate(df, headers="keys", tablefmt="pipe", showindex=False) + "\n\n"
-            )
-    except Exception as e:
-        logger.error(
-            f"Error during spreadsheet {path.suffix.lower()} -> MarkDown conversion: {e}"
-        )
-        raise e
-    return txt
 
 
 # -----------------------------------
@@ -226,14 +184,14 @@ def build_tar_zst(
         page_content.md     — Markdown output
         metadata.json       — Metadata fields (timing, etc.)
         mime.txt            — Raw MIME type and mapped extension (one per line)
-        imgs/<name>         — Extracted images as JPEG files (paths match markdown references)
+        imgs/<name>         — Extracted images as JPEG files (paths match Markdown references)
     """
     tar_buf = io.BytesIO()
 
-    def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    def _add(_tar: tarfile.TarFile, name: str, data: bytes) -> None:
         info = tarfile.TarInfo(name=name)
         info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+        _tar.addfile(info, io.BytesIO(data))
 
     with tarfile.open(fileobj=tar_buf, mode="w") as tar:
         _add(tar, "page_content.md", page_content.encode())

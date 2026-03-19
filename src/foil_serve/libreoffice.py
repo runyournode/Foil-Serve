@@ -4,7 +4,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -14,78 +13,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 _SOFFICE_PID_FILE = Path("/tmp/foil-serve_soffice.pid")
-
-
-def _build_uno_script(file_path: Path, out_dir: Path, port: int) -> str:
-    """
-    This script is passed to the Python host system that will communicate with
-    the LibreOffice headless server we spwaned thanks to the Uno lib.
-    We need a perfect match beetween LibreOffice <-> Uno lib <-> Python.
-    If you installed LibreOffice from your distribution repo it should be fine.
-    (Our venv Python is almost guaranteed to be incompatible).
-    We have to do this since a simple call to `libreoffice --headless --convert-to pdf ...`
-    cannot ACCEPT REVISIONS and the output PDF could be very messy.
-    """
-    return f"""
-import uno
-from com.sun.star.beans import PropertyValue
-
-def convert():
-    localContext = uno.getComponentContext()
-    resolver = localContext.ServiceManager.createInstanceWithContext(
-        "com.sun.star.bridge.UnoUrlResolver", localContext
-    )
-
-    ctx = resolver.resolve(
-        "uno:socket,host=localhost,port={port};urp;StarOffice.ComponentContext"
-    )
-    smgr = ctx.ServiceManager
-    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
-
-    file_url = uno.systemPathToFileUrl("{file_path.resolve().as_posix()}")
-    out_url  = uno.systemPathToFileUrl(
-        "{(out_dir / (file_path.stem + ".pdf")).resolve().as_posix()}"
-    )
-
-    # Ouvrir le document
-    hidden = PropertyValue()
-    hidden.Name = "Hidden"
-    hidden.Value = True
-    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
-
-    # Accepter toutes les révisions (Writer uniquement)
-    if doc.supportsService("com.sun.star.text.TextDocument"):
-        try:
-            doc.setPropertyValue("RecordRedlineChanges", False)
-            doc.setPropertyValue("ShowRedlineChanges", False)
-        except:
-            pass
-        dispatcher = smgr.createInstanceWithContext(
-            "com.sun.star.frame.DispatchHelper", ctx
-        )
-        dispatcher.executeDispatch(
-            doc.getCurrentController().getFrame(),
-            ".uno:AcceptAllTrackedChanges", "", 0, ()
-        )
-
-    # Exporter en PDF
-    pdf_filter = PropertyValue()
-    pdf_filter.Name = "FilterName"
-
-    if doc.supportsService("com.sun.star.text.TextDocument"):
-        pdf_filter.Value = "writer_pdf_Export"
-    elif doc.supportsService("com.sun.star.presentation.PresentationDocument"):
-        pdf_filter.Value = "impress_pdf_Export"
-    elif doc.supportsService("com.sun.star.sheet.SpreadsheetDocument"):
-        pdf_filter.Value = "calc_pdf_Export"
-    else:
-        pdf_filter.Value = "writer_pdf_Export"
-
-    doc.storeToURL(out_url, (pdf_filter,))
-    doc.close(True)
-
-convert()
-"""
 
 
 class LibreOfficeServer:
@@ -103,6 +30,7 @@ class LibreOfficeServer:
     def __init__(self) -> None:
         self._process: subprocess.Popen | None = None
         self._port: int | None = None
+        self._lock = threading.Lock()
 
     @staticmethod
     def _find_free_port() -> int:
@@ -219,47 +147,176 @@ class LibreOfficeServer:
         self.start()
 
     def _ensure_running(self) -> None:
-        """Restart soffice if it has crashed."""
-        if self._process is None or self._process.poll() is not None:
-            self._restart()
+        """Restart soffice if it has crashed. Thread-safe: the lock prevents
+        concurrent restart attempts when multiple threads detect a crash."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._restart()
 
-    def convert(self, file_path: Path) -> None:
-        """Run the UNO conversion script against the persistent soffice server."""
-        self._ensure_running()
-        assert (
-            self._port is not None
-        )  # guaranteed by start() which _ensure_running() calls
-
-        out_dir = file_path.parent
-        uno_script = _build_uno_script(file_path, out_dir, self._port)
-        with tempfile.NamedTemporaryFile(
-            prefix="foilserve_UnoScript_", suffix=".py", delete=False
-        ) as f:
-            script_path = Path(f.name)
-            script_path.write_text(uno_script)
+    @staticmethod
+    def _run_uno_script(uno_script: str, label: str = "UNO") -> None:
+        """Execute a UNO Python script via the system Python, piped through stdin."""
         try:
             result = subprocess.run(
                 # Use the system Python (/usr/bin/python3) rather than "python3"
-                # which could resolves to the venv Python via PATH.
-                ["/usr/bin/python3", script_path.as_posix()],
+                # which could resolve to the venv Python via PATH.
+                ["/usr/bin/python3"],
+                input=uno_script,
                 capture_output=True,
                 text=True,
                 check=True,
             )
             if result.stdout:
-                logger.debug("UNO stdout: %s", result.stdout.strip())
+                logger.debug("%s stdout: %s", label, result.stdout.strip())
             if result.stderr:
-                logger.warning("UNO stderr: %s", result.stderr.strip())
+                logger.warning("%s stderr: %s", label, result.stderr.strip())
         except subprocess.CalledProcessError as e:
             logger.error(
-                "UNO script failed (exit code %d):\n  stdout: %s\n  stderr: %s",
+                "%s script failed (exit code %d):\n  stdout: %s\n  stderr: %s",
+                label,
                 e.returncode,
                 (e.output or "").strip(),
                 (e.stderr or "").strip(),
             )
             raise
-        finally:
-            script_path.unlink(missing_ok=True)
+
+    def _build_uno_script_general(self, file_path: Path, output_pdf: Path) -> str:
+        """
+        Build a UNO Python script for general document conversion (Writer, Impress, etc.).
+
+        This script is passed to the system Python that communicates with the
+        LibreOffice headless server via the Uno bridge.
+        We need a perfect match between LibreOffice <-> Uno lib <-> Python.
+        If you installed LibreOffice from your distribution repo it should be fine.
+        (Our venv Python is almost guaranteed to be incompatible).
+        We have to do this since a simple call to `libreoffice --headless --convert-to pdf ...`
+        cannot ACCEPT REVISIONS and the output PDF could be very messy.
+        """
+        return f"""
+import uno
+from com.sun.star.beans import PropertyValue
+
+def convert():
+    localContext = uno.getComponentContext()
+    resolver = localContext.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", localContext
+    )
+
+    ctx = resolver.resolve(
+        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+    )
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    file_url = uno.systemPathToFileUrl("{file_path.resolve().as_posix()}")
+    out_url  = uno.systemPathToFileUrl("{output_pdf.resolve().as_posix()}")
+
+    # Ouvrir le document
+    hidden = PropertyValue()
+    hidden.Name = "Hidden"
+    hidden.Value = True
+    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+
+    # Accepter toutes les révisions (Writer uniquement)
+    if doc.supportsService("com.sun.star.text.TextDocument"):
+        try:
+            doc.setPropertyValue("RecordRedlineChanges", False)
+            doc.setPropertyValue("ShowRedlineChanges", False)
+        except:
+            pass
+        dispatcher = smgr.createInstanceWithContext(
+            "com.sun.star.frame.DispatchHelper", ctx
+        )
+        dispatcher.executeDispatch(
+            doc.getCurrentController().getFrame(),
+            ".uno:AcceptAllTrackedChanges", "", 0, ()
+        )
+
+    # Exporter en PDF
+    pdf_filter = PropertyValue()
+    pdf_filter.Name = "FilterName"
+
+    if doc.supportsService("com.sun.star.text.TextDocument"):
+        pdf_filter.Value = "writer_pdf_Export"
+    elif doc.supportsService("com.sun.star.presentation.PresentationDocument"):
+        pdf_filter.Value = "impress_pdf_Export"
+    elif doc.supportsService("com.sun.star.sheet.SpreadsheetDocument"):
+        pdf_filter.Value = "calc_pdf_Export"
+    else:
+        pdf_filter.Value = "writer_pdf_Export"
+
+    doc.storeToURL(out_url, (pdf_filter,))
+    doc.close(True)
+
+convert()
+"""
+
+    def _build_uno_script_spreadsheet(self, file_path: Path, output_pdf: Path) -> str:
+        """
+        Build a UNO Python script for spreadsheet conversion: sets each sheet to
+        A3 landscape with fit-to-page-width before exporting to PDF.
+        This avoids tiny text on sheets with many columns.
+        """
+        return f"""
+import uno
+from com.sun.star.beans import PropertyValue
+
+def convert():
+    localContext = uno.getComponentContext()
+    resolver = localContext.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", localContext
+    )
+
+    ctx = resolver.resolve(
+        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+    )
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    file_url = uno.systemPathToFileUrl("{file_path.resolve().as_posix()}")
+    out_url  = uno.systemPathToFileUrl("{output_pdf.resolve().as_posix()}")
+
+    hidden = PropertyValue()
+    hidden.Name = "Hidden"
+    hidden.Value = True
+    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+
+    # Set each sheet to A3 landscape, fit all columns to 1 page width
+    sheets = doc.getSheets()
+    page_styles = doc.getStyleFamilies().getByName("PageStyles")
+    for i in range(sheets.getCount()):
+        sheet = sheets.getByIndex(i)
+        style_name = sheet.PageStyle
+        style = page_styles.getByName(style_name)
+        style.IsLandscape = True
+        style.Width = 42000    # A3 width in 1/100 mm
+        style.Height = 29700   # A3 height in 1/100 mm
+        style.ScaleToPagesX = 1  # fit all columns to 1 page width
+        style.ScaleToPagesY = 0  # unlimited pages vertically
+
+    pdf_filter = PropertyValue()
+    pdf_filter.Name = "FilterName"
+    pdf_filter.Value = "calc_pdf_Export"
+
+    doc.storeToURL(out_url, (pdf_filter,))
+    doc.close(True)
+
+convert()
+"""
+
+    def convert_general(self, file_path: Path, output_pdf: Path) -> None:
+        """Convert a document (Writer, Impress, etc.) to PDF via UNO."""
+        self._ensure_running()
+        assert self._port is not None
+        script = self._build_uno_script_general(file_path, output_pdf)
+        self._run_uno_script(script, label="UNO general")
+
+    def convert_spreadsheet(self, file_path: Path, output_pdf: Path) -> None:
+        """Convert a spreadsheet to PDF via UNO (A3 landscape, fit-to-width)."""
+        self._ensure_running()
+        assert self._port is not None
+        script = self._build_uno_script_spreadsheet(file_path, output_pdf)
+        self._run_uno_script(script, label="UNO spreadsheet")
 
     def stop(self) -> None:
         """Terminate soffice and remove the PID file."""
@@ -278,7 +335,9 @@ class LibreOfficeServer:
 
 def convert_to_pdf(
     file_path: Path,
-    mime: Literal[".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"],
+    mime: Literal[
+        ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
+    ],
     server: LibreOfficeServer,
 ) -> Path:
     """
@@ -287,14 +346,17 @@ def convert_to_pdf(
     """
     generated_pdf = file_path.with_suffix(".pdf")
 
-    if mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
-        # We may want to add a .xls and .xlsx if we decided pandas did not
-        # extract enougth data from the file (e.g., a silly spreadsheet containing
-        # only text boxes and images but no actual data in cells ...)
-        if not file_path.exists():
-            raise FileNotFoundError(str(file_path))
+    if not file_path.exists():
+        raise FileNotFoundError(str(file_path))
+
+    if mime in (".xls", ".xlsx", ".ods"):
         try:
-            server.convert(file_path)
+            server.convert_spreadsheet(file_path, generated_pdf)
+        except Exception as e:
+            raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
+    elif mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
+        try:
+            server.convert_general(file_path, generated_pdf)
         except Exception as e:
             raise RuntimeError(f"LibreOffice error: {e}") from e
     else:
@@ -306,16 +368,3 @@ def convert_to_pdf(
         raise RuntimeError("PDF conversion failed: no output file was created")
 
     return generated_pdf
-
-
-# Fallback using direct headless LibreOffice (documents are converted in revision mode)
-# def office2pdf_libreoffice(file_path: Path):
-#     subprocess.run(
-#         args=[
-#             'libreoffice', '--headless',
-#             '--convert-to', 'pdf',
-#             '--outdir', file_path.parent.as_posix(),
-#             file_path.as_posix()
-#         ],
-#         check=True
-#     )
