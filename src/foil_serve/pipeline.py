@@ -43,13 +43,21 @@ def _init_worker(config_path: str) -> None:
     logger.info(f"[WORKER: pid={os.getpid()}] Pipeline initialized")
 
 
-def _worker_predict(file_path: str) -> tuple[str, dict[str, Image], float]:
+def _worker_predict(
+    file_path: str, use_ocr_for_image_block: bool = True
+) -> tuple[str, dict[str, Image], float]:
     """
     Worker process entry point — only pipeline.predict() and image extraction.
 
     Pre-processing (MIME detection, LibreOffice conversion) and post-processing
     (extract_raw_ocr, prune_tables) are handled in the main process via asyncio.to_thread,
     so they don't consume maxtasksperchild slots and can run in parallel across requests.
+
+    Parameters
+    ----------
+    use_ocr_for_image_block : bool
+        Passed to pipeline.predict(). When False, the pipeline skips OCR
+        inside image blocks (performance optimization when OCR output is not needed).
     """
     t0_worker = time.perf_counter()
     mds: list[str] = []
@@ -60,7 +68,7 @@ def _worker_predict(file_path: str) -> tuple[str, dict[str, Image], float]:
     # to vLLM, which triggers a race condition in vLLM's block allocator (400 "Already
     # borrowed"). The error is transient: retrying the full predict() call usually
     # succeeds because vLLM has finished settling its block state by then.
-    # Preferred fix: set max-num-seqs: 1 in the vLLM config (serialises requests
+    # Preferred fix: set max-num-seqs: 1 in the vLLM config (serializes requests
     # server-side without touching this code). Enable this block only as a fallback.
     #
     # _ALREADY_BORROWED_MAX_RETRIES = 3
@@ -88,7 +96,9 @@ def _worker_predict(file_path: str) -> tuple[str, dict[str, Image], float]:
     assert (
         _worker_pipeline is not None
     )  # set by _init_worker before the pool submits any task
-    output = _worker_pipeline.predict(file_path)
+    output = _worker_pipeline.predict(
+        file_path, use_ocr_for_image_block=use_ocr_for_image_block
+    )
     ctx = (
         contextlib.closing(output)
         if isinstance(output, Generator)
@@ -179,7 +189,9 @@ class PaddlePipelineWrapper:
             maxtasksperchild=self.MAXTASKS,
         )
 
-    async def run(self, file_path: str) -> tuple[str, dict[str, Image], float]:
+    async def run(
+        self, file_path: str, use_ocr_for_image_block: bool = True
+    ) -> tuple[str, dict[str, Image], float]:
         """
         Runs pipeline.predict() in the dedicated worker process for the given file path.
 
@@ -190,10 +202,16 @@ class PaddlePipelineWrapper:
         The worker is automatically recycled after MAXTASKS calls (maxtasksperchild):
         the OS reclaims all native memory, the new worker reloads the model via _init_worker.
 
+        Parameters
+        ----------
+        file_path: str
+        use_ocr_for_image_block : bool
+            When False, the pipeline skips OCR inside image blocks.
+
         Returns
         -------
         md_raw : str
-            Raw markdown from paddle (pages joined, before prune_tables).
+            Raw Markdown from paddle (pages joined, before prune_tables).
         imgs : dict[str, Image]
             Extracted images as PIL Images {name: PIL.Image}.
         """
@@ -208,7 +226,7 @@ class PaddlePipelineWrapper:
 
         self._pool.apply_async(
             _worker_predict,
-            args=(file_path,),
+            args=(file_path, use_ocr_for_image_block),
             callback=_on_success,
             error_callback=_on_error,
         )

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_file: str | None = None
 
+    # OCR output control
+    output_paddle_ocr: bool
+    output_paddle_ocr_no_img_desc: bool
+
     # Spreadsheet processing
     excel_output_format: Literal["human", "llm"] = "llm"
     excel_mask_cell_errors: bool

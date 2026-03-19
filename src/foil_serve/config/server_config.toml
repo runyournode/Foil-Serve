@@ -86,6 +86,22 @@ excel_min_output_ratio = 0.01
 
 
 # -------------------------------------------------------------------
+# OCR output control in Images  (OCR performed by paddle)           -
+# -------------------------------------------------------------------
+# When a VLM image description IS requested:
+# true  → keep <ocr> tags in the final Markdown alongside <figcaption>.
+# false → only <figcaption> (VLM description) is emitted; OCR is still
+#         used internally as context for the VLM prompt.
+output_paddle_ocr = false
+
+# When NO VLM image description is requested:
+# true  → keep <ocr> tags in the final Markdown.
+# false → no <ocr> tags; also skips the OCR-on-images step in the
+#         Paddle pipeline (performance optimization).
+output_paddle_ocr_no_img_desc = true
+
+
+# -------------------------------------------------------------------
 # Miscellaneous                                                     -
 # -------------------------------------------------------------------
 

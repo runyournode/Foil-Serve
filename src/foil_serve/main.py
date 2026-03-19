@@ -409,12 +409,19 @@ async def _process_document(
             artifact_ctx.converted_pdf = pipeline_input
 
         # ── Phase 3 : pipeline.predict() — serialized in dedicated worker ────
+        # Determine whether the pipeline should run OCR on image blocks.
+        # OCR is needed when: (a) VLM description is requested (OCR feeds the VLM prompt),
+        # or (b) OCR output is requested in the final Markdown without VLM.
+        has_vlm = image_description_model_name is not None and client is not None
+        need_image_ocr = has_vlm or settings.output_paddle_ocr_no_img_desc
+
         md_raw: str
         imgs: dict[str, Image]
         pipeline_duration: float
         try:
             md_raw, imgs, pipeline_duration = await wrapper.run(
-                pipeline_input.as_posix()
+                pipeline_input.as_posix(),
+                use_ocr_for_image_block=need_image_ocr,
             )
         except Exception as e:
             if artifact_ctx is not None:
@@ -430,10 +437,14 @@ async def _process_document(
     if artifact_ctx is not None:
         artifact_ctx.partial_md = md_raw
     try:
-        ocrs, md_full = await asyncio.gather(
-            asyncio.to_thread(extract_raw_ocr, md_with_html=md_raw),
-            asyncio.to_thread(prune_tables, md_with_html=md_raw),
-        )
+        if need_image_ocr:
+            ocrs, md_full = await asyncio.gather(
+                asyncio.to_thread(extract_raw_ocr, md_with_html=md_raw),
+                asyncio.to_thread(prune_tables, md_with_html=md_raw),
+            )
+        else:
+            ocrs: dict[str, str] = {}
+            md_full = await asyncio.to_thread(prune_tables, md_with_html=md_raw)
     except Exception as e:
         if artifact_ctx is not None:
             await artifact_ctx.save(e, t_active=t_active)
@@ -500,9 +511,18 @@ async def _process_document(
         total_description_time: int = 0
 
     # ── Phase 6 : reformat Markdown (inject descriptions + OCR into figures) ──
+    # Decide whether to include <ocr> tags in the final output
+    include_ocr = (
+        (has_vlm and settings.output_paddle_ocr)
+        or (not has_vlm and settings.output_paddle_ocr_no_img_desc)
+    )
     _t = time.perf_counter()
     md_full = await asyncio.to_thread(
-        reformat_md, md=md_full, descriptions_dict=descriptions, ocr_dict=ocrs
+        reformat_md,
+        md=md_full,
+        descriptions_dict=descriptions,
+        ocr_dict=ocrs,
+        include_ocr=include_ocr,
     )
     t_active += time.perf_counter() - _t
 

@@ -56,9 +56,11 @@ def reformat_md(
     md: str,
     descriptions_dict: dict[str, str] | None,
     ocr_dict: dict[str, str],
+    include_ocr: bool = True,
 ) -> str:
     """
-    Reformat the md: simplify the img div, add ocr and desc in <figure>
+    Reformat the md: simplify the img div, add ocr and desc in <figure>.
+    If include_ocr is False, <ocr> tags are omitted from the output.
     """
     pattern = re.compile(
         r'<div[^>]*>\s*<img src="([^"]+)"[^>]*>\s*(.*?)\s*</div>', re.DOTALL
@@ -66,7 +68,6 @@ def reformat_md(
 
     def replacement_logic(match):
         img_src = match.group(1)
-        ocr_val = ocr_dict.get(img_src, "").strip()
         if descriptions_dict is not None:
             desc_val = descriptions_dict.get(
                 img_src, "Too small for description."
@@ -74,12 +75,16 @@ def reformat_md(
         else:  # image_description_model = None -> dict is None
             desc_val = ""
 
-        return (
-            f"<figure>\n"
-            f'<img src="{img_src}">\n'
-            f"<figcaption>  \n{desc_val}  \n</figcaption>\n"
-            f"<ocr>  \n{ocr_val}  \n</ocr>\n"
-            f"</figure>"
-        )
+        parts = [
+            "<figure>\n",
+            f'<img src="{img_src}">\n',
+        ]
+        if desc_val:
+            parts.append(f"<figcaption>  \n{desc_val}  \n</figcaption>\n")
+        if include_ocr:
+            ocr_val = ocr_dict.get(img_src, "").strip()
+            parts.append(f"<ocr>  \n{ocr_val}  \n</ocr>\n")
+        parts.append("</figure>")
+        return "".join(parts)
 
     return pattern.sub(replacement_logic, md)
