@@ -18,13 +18,15 @@ PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting at
 
 | Format | Conversion | Post-processing |
 |---|---|---|
-| `.txt`, `.json`, `.csv`, `.xml` | Pass-through (returned as-is) | — |
+| `.txt`, `.json`, `.csv`, `.xml` | Pass-through (smart encoding detection) | — |
 | `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML table simplification, optional VLM image description |
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
-| `.xls`, `.xlsx`, `.ods` | Pandas + Tabulate → Markdown tables | — |
+| `.xls`, `.xlsx`, `.ods` | Pandas → LLM-optimized Markdown tables (sparse fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
+
+**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve automatically falls back to PDF+OCR conversion via LibreOffice (A3 landscape, fit-to-width). Output size is capped relative to input size (HTTP 413 if exceeded).
 
 Only MIME types listed in [`utils.mime_def`](src/foil_serve/utils.py) are accepted.
 
@@ -85,7 +87,7 @@ Support for additional formats is welcome — contributions are open 🙌
   apt install -y --no-install-recommends \
       libgl1 \
       libreoffice \
-      libmagic1 \
+      libmagic1t64 \
       fontconfig \
       fonts-dejavu-core \
       fonts-liberation \
@@ -112,8 +114,8 @@ cd src/foil_serve && uv run --no-sync uvicorn main:app --host 0.0.0.0 --port 808
 ### Option 2 — Docker (air-gapped)
 
 A ready-to-use stack (foil-serve + 2× vLLM services) is available in `./docker`.  
-Paddle native models are included in the foil-serve image, but you will still need to download the PaddleOCR-VL-1.5 model for the vllm server.  
-To be released: a smaller image without any model.
+Paddle native models are included in the foil-serve `-offline` image, but you will still need to download the models for the vllm servers (PaddleOCR-VL-1.5 and any model used for image description).  
+
 
 ```bash
 cd docker/
@@ -125,7 +127,7 @@ docker compose up -d
 ## ⚙️ Configuration
 
 - **`pipeline_config.yaml`** — PaddleOCR-VL-1.5 pipeline settings. Update the vLLM URL to point to your model endpoint. Other pipeline settings can be changed at your own risk 😉.
-- **`server_config.toml`** — API keys, VLM model definitions, prompts, and resource limits.
+- **`server_config.toml`** — API keys, VLM model definitions, prompts, resource limits, spreadsheet processing options, and OCR output control.
 
 ### VLM model config (`server_config.toml`)
 
@@ -144,6 +146,17 @@ max_concurrent_requests = 10
 prompt = "default"              # key from [prompts] section or a direct prompt string
 ```
 
+### OCR output control (`server_config.toml`)
+
+Controls whether `<ocr>` tags (Paddle OCR text on images) appear in the final Markdown:
+
+| Setting | Default | Description |
+|---|---|---|
+| `output_paddle_ocr` | `false` | When VLM image description **is** requested: keep `<ocr>` tags alongside `<figcaption>`. |
+| `output_paddle_ocr_no_img_desc` | `true` | When **no** VLM is requested: keep `<ocr>` tags. If `false`, the OCR-on-images pipeline step is skipped entirely (performance optimization). |
+
+When both OCR output and VLM are disabled, `<figcaption>` tags are omitted and the image-block OCR step is skipped, reducing processing time.
+
 ---
 
 ## ⚠️ Known limitations
@@ -152,7 +165,7 @@ prompt = "default"              # key from [prompts] section or a direct prompt 
 If an image-only document contains no text, the Paddle pipeline may produce sparse Markdown (without even referencing the image), causing the VLM description step to be skipped. This server is not recommended for pure image description use cases.
 
 ### Embedded objects in spreadsheets
-Only cell content is extracted from spreadsheet files. Embedded images, charts, and text boxes are ignored.
+Only cell content is extracted from spreadsheet files. Embedded images, charts, and text boxes are ignored. When the extracted cell content is too sparse, foil-serve falls back to PDF+OCR, which may capture some visual elements but with lower fidelity.
 
 ### Upside-down images
 Extracted images may be rotated relative to the original document.
@@ -174,12 +187,7 @@ Running PaddleOCR-VL-1.5 natively proved problematic (*Exception from the 'vlm' 
 The model is instead served via vLLM through an OpenAI-compatible endpoint. This also benefits from faster inference compared to the native Paddle runtime, and greatly reduces wasted time during [worker recycling](#memory-management--worker-recycling).
 
 ### Debug artifact saving
-When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `failed_artifacts_dir` (default `/tmp/paddleocr_failed`):
-
-### Single uvicorn worker
-Foil Serve is not compatible with multiple uvicorn worker (because of the way we spawn and kill the LibreOffice server). 
-This should not be too hard to solve, but I don't expect uvicorn worker to be the bottleneck.
-If extra ressources are available and scaling is required, it would probably be better to try increasing the number of paddle pipeline.
+When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `failed_artifacts_dir` (default `/tmp/foil-serve_failed`):
 
 ```
 <yy-mm-dd_hh-mm>_<mime-type>/
@@ -192,6 +200,16 @@ If extra ressources are available and scaling is required, it would probably be 
 
 This directory is not automatically cleaned up — manage disk space manually.
 
+Additional artifact types can be enabled independently:
+- `save_table_conversion_artifacts`: saves input spreadsheet + generated PDF when sparse fallback triggers.
+- `save_cell_error_artifacts`: saves Markdown before/after error masking when cell errors are detected.
+
+### Single uvicorn worker
+Foil Serve is not compatible with multiple uvicorn worker (because of the way we spawn and kill the LibreOffice server). 
+This should not be too hard to solve, but I don't expect uvicorn worker to be the bottleneck.
+If extra ressources are available and scaling is required, it would probably be better to try increasing the number of paddle pipeline.
+
+
 ---
 
 ## 🙏 Acknowledgements
@@ -199,4 +217,4 @@ This directory is not automatically cleaned up — manage disk space manually.
 foil-serve would not exist without:
 
 - **[PaddleOCR / PaddlePaddle](https://github.com/PaddlePaddle/PaddleOCR)** — the OCR backbone powering document understanding.
-- **[LibreOffice](https://www.libreoffice.org/)** — the quiet workhorse handling Office format conversion. Running headless, doing its job without complaint.
+- **[LibreOffice](https://www.libreoffice.org/)** — handling Office format conversion. Running headless, doing its job without complaint.
