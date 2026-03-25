@@ -24,6 +24,9 @@ save_cell_error_artifacts = false
 cell_error_artifacts_dir = "/tmp/foil-serve_cell_errors"
 
 
+# All settings below are required
+# 'default' are recommanded settings but not set in python code
+
 # -------------------------------------------------------------------
 # Safety & Startup checks                                           -
 # -------------------------------------------------------------------
@@ -78,11 +81,23 @@ excel_mask_cell_errors = true
 excel_max_output_ratio = 5.0
 
 # Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
-# images, shapes only), convert to PDF and process via Paddle OCR instead.
+# images, shapes only), convert to PDF and process via Paddle OCR instead
+# (which mean possible allucinations... ).
+# Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
+excel_pdf_fallback_enabled = true
 # Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
 excel_min_input_for_fallback_mb = 0.5
 # If Markdown output is smaller than this fraction of input size, trigger fallback.
 excel_min_output_ratio = 0.01
+
+# Paper format used when converting spreadsheets to PDF (for the fallback pipeline).
+# Supported values: "A3", "A4", "A2", "Letter", "Legal", "Tabloid"
+excel_pdf_paper_format = "A3"
+
+# Page orientation for spreadsheet → PDF conversion (fallback pipeline).
+# true (default): landscape — better for wide spreadsheets with many columns.
+# false: portrait — better for narrow spreadsheets with few columns.
+excel_pdf_landscape = true
 
 
 # -------------------------------------------------------------------

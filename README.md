@@ -21,12 +21,14 @@ PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting at
 | `.txt`, `.json`, `.csv`, `.xml` | Pass-through (smart encoding detection) | — |
 | `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML table simplification, optional VLM image description |
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
-| `.xls`, `.xlsx`, `.ods` | Pandas → LLM-optimized Markdown tables (sparse fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
+| `.xls`, `.xlsx`, `.ods` | Pandas → LLM-optimized Markdown tables (optional fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
 
-**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve automatically falls back to PDF+OCR conversion via LibreOffice (A3 landscape, fit-to-width). Output size is capped relative to input size (HTTP 413 if exceeded).
+**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled.
+
+**OOXML detection fallback:** some `.docx`, `.xlsx`, and `.pptx` files are misidentified as `application/octet-stream` by libmagic. foil-serve inspects the ZIP structure (`[Content_Types].xml`) to resolve the actual OOXML type automatically.
 
 Only MIME types listed in [`utils.mime_def`](src/foil_serve/utils.py) are accepted.
 
@@ -155,7 +157,7 @@ Controls whether `<ocr>` tags (Paddle OCR text on images) appear in the final Ma
 | `output_paddle_ocr` | `false` | When VLM image description **is** requested: keep `<ocr>` tags alongside `<figcaption>`. |
 | `output_paddle_ocr_no_img_desc` | `true` | When **no** VLM is requested: keep `<ocr>` tags. If `false`, the OCR-on-images pipeline step is skipped entirely (performance optimization). |
 
-When both OCR output and VLM are disabled, `<figcaption>` tags are omitted and the image-block OCR step is skipped, reducing processing time.
+When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and the image-block OCR step is skipped, reducing processing time.
 
 ---
 

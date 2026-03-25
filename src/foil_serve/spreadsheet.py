@@ -16,6 +16,12 @@ from debug import save_cell_error_artifacts
 
 logger = logging.getLogger(__name__)
 
+
+class EmptySpreadsheetError(Exception):
+    """Raised when all sheets in a spreadsheet are empty after stripping."""
+
+    pass
+
 # ---------------------------------------------------------------------------
 #  Excel cell error definitions
 # ---------------------------------------------------------------------------
@@ -100,14 +106,27 @@ def _rename_error_columns(
 
 
 def _strip_empty(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop fully empty columns (header="" and all values="") and fully empty rows."""
-    non_empty_cols = [col for col in df.columns if col != "" or (df[col] != "").any()]
-    df = df[non_empty_cols]
+    """Drop fully empty columns (header="" and all values="") and fully empty rows.
+
+    Uses positional indexing (iloc) to avoid ambiguity when multiple columns
+    share the same empty-string header name.
+    """
+    keep = [
+        i
+        for i, col in enumerate(df.columns)
+        if col != "" or (df.iloc[:, i] != "").any()
+    ]
+    df = df.iloc[:, keep]
     return df[~(df == "").all(axis=1)]
 
 
 def _df_to_md(df: pd.DataFrame, table_format: str) -> str:
-    """Render a DataFrame as a Markdown pipe table."""
+    """Render a DataFrame as a Markdown pipe table.
+
+    Returns an empty string when the DataFrame has no data rows.
+    """
+    if df.empty:
+        return ""
     table = tabulate(df, headers="keys", tablefmt="pipe", showindex=False)
     if table_format == "llm":
         table = _compact_table(table)
@@ -148,6 +167,11 @@ def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") 
         txt_with_errors = ""
 
         for sheet_name, df in sheets.items():
+            # Convert any remaining float NaN (merged cells, formula errors, etc.)
+            # to empty strings — keep_default_na=False doesn't catch all cases.
+            df = df.fillna("")
+            df.columns = [c if isinstance(c, str) else "" for c in df.columns]
+
             # Rename columns: clear "Unnamed: X" headers, normalize whitespace
             col_dic = {}
             for col in df.columns:
@@ -193,9 +217,14 @@ def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") 
                 df = _apply_error_replacement(df, error_map)
 
             df = _strip_empty(df)
+            md = _df_to_md(df, table_format)
+            if md:
+                txt += f"\n## {sheet_name}\n\n{md}\n\n"
 
-            txt += f"\n## {sheet_name}\n\n"
-            txt += _df_to_md(df, table_format) + "\n\n"
+        if not txt.strip():
+            raise EmptySpreadsheetError(
+                f"All {len(sheets)} sheet(s) are empty after stripping"
+            )
 
         if save_artifacts and has_any_errors:
             save_cell_error_artifacts(
@@ -206,6 +235,8 @@ def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") 
                 raw_mime=raw_mime,
             )
 
+    except EmptySpreadsheetError:
+        raise
     except Exception as e:
         logger.error(
             f"Error during spreadsheet {path.suffix.lower()} -> MarkDown conversion: {e}"

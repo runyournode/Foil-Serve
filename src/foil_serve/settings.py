@@ -38,13 +38,16 @@ class Settings(BaseSettings):
     output_paddle_ocr_no_img_desc: bool
 
     # Spreadsheet processing
-    excel_output_format: Literal["human", "llm"] = "llm"
+    excel_output_format: Literal["human", "llm"]
     excel_mask_cell_errors: bool
     save_cell_error_artifacts: bool = False
     cell_error_artifacts_dir: str = "/tmp/foil-serve_cell_errors"
     excel_max_output_ratio: float
+    excel_pdf_fallback_enabled: bool
     excel_min_input_for_fallback_mb: float
     excel_min_output_ratio: float
+    excel_pdf_paper_format: Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]
+    excel_pdf_landscape: bool
 
     model_config = SettingsConfigDict(
         toml_file="config/server_config.toml", extra="ignore"

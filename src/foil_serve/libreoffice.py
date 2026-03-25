@@ -12,6 +12,16 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+# Paper dimensions in 1/100 mm (landscape: width > height)
+PAPER_SIZES: dict[str, tuple[int, int]] = {
+    "A2": (59400, 42000),
+    "A3": (42000, 29700),
+    "A4": (29700, 21000),
+    "Letter": (27940, 21590),
+    "Legal": (35560, 21590),
+    "Tabloid": (43180, 27940),
+}
+
 _SOFFICE_PID_FILE = Path("/tmp/foil-serve_soffice.pid")
 
 
@@ -251,12 +261,25 @@ def convert():
 convert()
 """
 
-    def _build_uno_script_spreadsheet(self, file_path: Path, output_pdf: Path) -> str:
+    def _build_uno_script_spreadsheet(
+        self,
+        file_path: Path,
+        output_pdf: Path,
+        paper_format: str = "A3",
+        landscape: bool = True,
+    ) -> str:
         """
         Build a UNO Python script for spreadsheet conversion: sets each sheet to
-        A3 landscape with fit-to-page-width before exporting to PDF.
+        the given paper format and orientation with fit-to-page-width before exporting to PDF.
         This avoids tiny text on sheets with many columns.
         """
+        # PAPER_SIZES stores (long_side, short_side)
+        long_side, short_side = PAPER_SIZES[paper_format]
+        if landscape:
+            width, height = long_side, short_side
+        else:
+            width, height = short_side, long_side
+        orientation = "landscape" if landscape else "portrait"
         return f"""
 import uno
 from com.sun.star.beans import PropertyValue
@@ -281,16 +304,16 @@ def convert():
     hidden.Value = True
     doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
 
-    # Set each sheet to A3 landscape, fit all columns to 1 page width
+    # Set each sheet to {paper_format} {orientation}, fit all columns to 1 page width
     sheets = doc.getSheets()
     page_styles = doc.getStyleFamilies().getByName("PageStyles")
     for i in range(sheets.getCount()):
         sheet = sheets.getByIndex(i)
         style_name = sheet.PageStyle
         style = page_styles.getByName(style_name)
-        style.IsLandscape = True
-        style.Width = 42000    # A3 width in 1/100 mm
-        style.Height = 29700   # A3 height in 1/100 mm
+        style.IsLandscape = {landscape}
+        style.Width = {width}    # {paper_format} {orientation} width in 1/100 mm
+        style.Height = {height}   # {paper_format} {orientation} height in 1/100 mm
         style.ScaleToPagesX = 1  # fit all columns to 1 page width
         style.ScaleToPagesY = 0  # unlimited pages vertically
 
@@ -311,11 +334,13 @@ convert()
         script = self._build_uno_script_general(file_path, output_pdf)
         self._run_uno_script(script, label="UNO general")
 
-    def convert_spreadsheet(self, file_path: Path, output_pdf: Path) -> None:
-        """Convert a spreadsheet to PDF via UNO (A3 landscape, fit-to-width)."""
+    def convert_spreadsheet(
+        self, file_path: Path, output_pdf: Path, paper_format: str = "A3"
+    ) -> None:
+        """Convert a spreadsheet to PDF via UNO (landscape, fit-to-width)."""
         self._ensure_running()
         assert self._port is not None
-        script = self._build_uno_script_spreadsheet(file_path, output_pdf)
+        script = self._build_uno_script_spreadsheet(file_path, output_pdf, paper_format)
         self._run_uno_script(script, label="UNO spreadsheet")
 
     def stop(self) -> None:
@@ -339,9 +364,11 @@ def convert_to_pdf(
         ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
     ],
     server: LibreOfficeServer,
+    paper_format: str | None = None,
 ) -> Path:
     """
     Convert an Office document to PDF via LibreOffice UNO (output in same directory as source).
+    For spreadsheets, `paper_format` controls the page size (default "A3").
     Returns the path of the generated PDF.
     """
     generated_pdf = file_path.with_suffix(".pdf")
@@ -351,7 +378,9 @@ def convert_to_pdf(
 
     if mime in (".xls", ".xlsx", ".ods"):
         try:
-            server.convert_spreadsheet(file_path, generated_pdf)
+            server.convert_spreadsheet(
+                file_path, generated_pdf, paper_format=paper_format or "A3"
+            )
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
     elif mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):

@@ -24,7 +24,7 @@ warnings.filterwarnings(
 )
 
 from schemas import ProcessedDocument, Metadata
-from spreadsheet import excel2txt
+from spreadsheet import excel2txt, EmptySpreadsheetError
 from utils import (
     batch_pil_to_b64,
     build_tar_zst,
@@ -267,6 +267,11 @@ async def _process_document(
             _t = time.perf_counter()
             md = await asyncio.to_thread(read_text_smart, path=prepared_path)
             t_active += time.perf_counter() - _t
+            if not md.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"File is empty or contains only whitespace ({mime})",
+                )
             return (
                 md,
                 {},
@@ -291,6 +296,18 @@ async def _process_document(
                         table_format=settings.excel_output_format,
                         raw_mime=mime,
                     )
+                except EmptySpreadsheetError:
+                    if settings.excel_pdf_fallback_enabled:
+                        logger.warning(
+                            "Empty spreadsheet detected (%s) — falling back to PDF+OCR pipeline",
+                            mime,
+                        )
+                        fallback_to_pdf = True
+                    else:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"Spreadsheet is empty (no cell data found) and PDF fallback is disabled ({mime})",
+                        )
                 except Exception as e:
                     if artifact_ctx is not None:
                         await artifact_ctx.save(e, t_active=t_active)
@@ -300,36 +317,39 @@ async def _process_document(
                     )
                 t_active += time.perf_counter() - _t
 
-            md_bytes = len(md.encode("utf-8"))
+            if not fallback_to_pdf:
+                md_bytes = len(md.encode("utf-8"))
 
-            # Guard: reject if output is disproportionately large (bloated / NaN-filled)
-            if md_bytes > _file_size * settings.excel_max_output_ratio:
-                ratio = md_bytes / _file_size
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Spreadsheet output too large: {md_bytes / 1e6:.0f} MB markdown "
-                        f"from {_file_size / 1e6:.0f} MB input "
-                        f"(ratio {ratio:.1f}x, max {settings.excel_max_output_ratio}x)"
-                    ),
-                )
+                # Guard: reject if output is disproportionately large (bloated / NaN-filled)
+                if md_bytes > _file_size * settings.excel_max_output_ratio:
+                    ratio = md_bytes / _file_size
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Spreadsheet output too large: {md_bytes / 1e6:.0f} MB markdown "
+                            f"from {_file_size / 1e6:.0f} MB input "
+                            f"(ratio {ratio:.1f}x, max {settings.excel_max_output_ratio}x)"
+                        ),
+                    )
 
-            # Detect sparse spreadsheets (text boxes / images only, no real cell data)
-            if (
-                _file_size >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
-                and md_bytes < _file_size * settings.excel_min_output_ratio
-            ):
-                logger.warning(
-                    "Sparse spreadsheet detected: %d bytes markdown from %d bytes input "
-                    "(ratio %.4f, threshold %.4f) — falling back to PDF+OCR pipeline",
-                    md_bytes,
-                    _file_size,
-                    md_bytes / _file_size,
-                    settings.excel_min_output_ratio,
-                )
-                fallback_to_pdf = True
-                del md
-            else:
+                # Detect sparse spreadsheets (text boxes / images only, no real cell data)
+                if (
+                    settings.excel_pdf_fallback_enabled
+                    and _file_size >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
+                    and md_bytes < _file_size * settings.excel_min_output_ratio
+                ):
+                    logger.warning(
+                        "Sparse spreadsheet detected: %d bytes markdown from %d bytes input "
+                        "(ratio %.4f, threshold %.4f) — falling back to PDF+OCR pipeline",
+                        md_bytes,
+                        _file_size,
+                        md_bytes / _file_size,
+                        settings.excel_min_output_ratio,
+                    )
+                    fallback_to_pdf = True
+                    del md
+
+            if not fallback_to_pdf:
                 return (
                     md,
                     {},
@@ -381,6 +401,7 @@ async def _process_document(
                         file_path=prepared_path,
                         mime=mime,
                         server=lo_server,
+                        paper_format=settings.excel_pdf_paper_format if fallback_to_pdf else None,
                     )
                 except Exception as e:
                     if artifact_ctx is not None:
@@ -525,6 +546,27 @@ async def _process_document(
         include_ocr=include_ocr,
     )
     t_active += time.perf_counter() - _t
+
+    # Guard: never return empty markdown — pipeline produced nothing useful
+    if not md_full.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Processing produced no content ({mime})",
+        )
+
+    # Guard: reject if spreadsheet OCR fallback output is disproportionately large
+    if fallback_to_pdf and settings.excel_max_output_ratio:
+        md_bytes = len(md_full.encode("utf-8"))
+        if md_bytes > _file_size * settings.excel_max_output_ratio:
+            ratio = md_bytes / _file_size
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Spreadsheet OCR fallback output too large: {md_bytes / 1e6:.0f} MB markdown "
+                    f"from {_file_size / 1e6:.0f} MB input "
+                    f"(ratio {ratio:.1f}x, max {settings.excel_max_output_ratio}x)"
+                ),
+            )
 
     return (
         md_full,

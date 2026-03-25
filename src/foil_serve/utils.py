@@ -245,12 +245,44 @@ def read_text_smart(path: Path) -> str:
     raise ValueError(f"Unable to decode file: {path.name}")
 
 
+_OOXML_CONTENT_TYPE_MAP: dict[str, str] = {
+    "wordprocessingml": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "spreadsheetml": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "presentationml": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def _detect_ooxml(path: Path) -> str | None:
+    """Inspect a file's ZIP structure to detect OOXML type.
+
+    Returns the OOXML MIME string if detected, None otherwise.
+    Uses check_zip_uncompressed_size to guard against zip bombs before
+    reading any entry content.
+    """
+    from settings import settings
+
+    try:
+        check_zip_uncompressed_size(
+            path, max_bytes=settings.max_office_file_size_mb * 1024 * 1024
+        )
+        with zipfile.ZipFile(path) as zf:
+            if "[Content_Types].xml" not in zf.namelist():
+                return None
+            ct = zf.read("[Content_Types].xml").decode("utf-8", errors="replace")
+            for keyword, mime_type in _OOXML_CONTENT_TYPE_MAP.items():
+                if keyword in ct:
+                    logger.info(
+                        "OOXML fallback: detected %s from [Content_Types].xml", keyword
+                    )
+                    return mime_type
+    except (zipfile.BadZipFile, ValueError):
+        return None
+    return None
+
+
 def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt, str]:
     """
     Write file content to tmpdir, detect MIME type, rename with proper extension.
-
-    Runs via asyncio.to_thread in the main process — does NOT count toward
-    maxtasksperchild (only pipeline.predict() calls do).
 
     Returns (file_path, mime_ext, raw_mime) where:
       - mime_ext is like '.pdf', '.docx', etc. (a MimeExt literal)
@@ -259,6 +291,13 @@ def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt
     input_file = tmpdir / "input_file.bin"
     input_file.write_bytes(file_content)
     raw_mime: str = magic.from_file(input_file, mime=True)
+
+    # Fallback: some OOXML files (.docx, .xlsx, .pptx) are detected as
+    # application/octet-stream by libmagic.  Inspect the ZIP content types
+    # to resolve the actual OOXML variant.
+    if raw_mime == "application/octet-stream":
+        raw_mime = _detect_ooxml(input_file) or raw_mime
+
     mime = mime_def.get(raw_mime)
     if mime is None:
         raise UnsupportedMimeTypeError(raw_mime)

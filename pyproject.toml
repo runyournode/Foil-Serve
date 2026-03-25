@@ -24,7 +24,8 @@ dependencies = [
 dev = [
   "pandas-stubs~=3.0.0",
   "ty>=0.0.21",
-  "ruff>=0.15.5"
+  "ruff>=0.15.5",
+  "pytest>=9.0.2",
 ]
 
 [tool.uv.sources]

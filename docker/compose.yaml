@@ -37,7 +37,7 @@ services:
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
-    image: docker.io/vllm/vllm-openai:v0.17.1-cu130
+    image: docker.io/vllm/vllm-openai:v0.18.0-cu130
     container_name: foil_vllm-PaddleOCR-VL-1.5
     ipc: host
     expose:
@@ -72,7 +72,7 @@ services:
               capabilities: [ gpu ]
 
   # Soft Req : mistralai/ministral-3-3b
-  foil-serve_vllm-ministral-3-3b:
+  foil_vllm-ministral-3-3b:
     image: docker.io/vllm/vllm-openai:v0.17.1-cu130
     container_name: foil_vllm-ministral-3-3b
     ipc: host
