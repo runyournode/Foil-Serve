@@ -14,5 +14,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Docker runtime files
-docker/mount_runtime/
+# Docker runtime files (ignore contents but allow .gitkeep exceptions)
+docker/mount_runtime/**
+!docker/mount_runtime/foil_serve/
+!docker/mount_runtime/foil_serve/logs/
+!docker/mount_runtime/foil_serve/logs/.gitkeep
