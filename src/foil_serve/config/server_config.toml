@@ -1,27 +1,34 @@
 # -------------------------------------------------------------------
-# Logging                                                           -
-# (There is no clearing mechanism — manage disk space manually.)    -
+# Logging & artifacts                                               -
+# All paths below default to /var/log/foil/. This directory must    -
+# exist and be writable by the application user.                    -
+# Docker: created by the Dockerfile.                                -
+# Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
+# (No clearing mechanism — manage disk space manually.)             -
 # -------------------------------------------------------------------
-log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
-log_file = "/tmp/foil-serve.log"   # optional: log to file
+log_level = "DEBUG"         # DEBUG | INFO | WARNING | ERROR
+libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
+log_file = "/var/log/foil/foil.log"  # Comment to disable logging to file
+
+# Base directory for debug artifacts. Subdirectories are created automatically.
+artifact_dir = "/var/log/foil/artifacts"
 
 # Save input files and debug artifacts for any failed processing request.
-# A timestamped subdirectory is created under `failed_artifacts_dir` for each failure,
-# containing: input file, intermediate PDF (if any), partial Markdown, meta.txt, trace.txt.
+# A timestamped subdirectory is created under `artifact_dir/failed_artifacts_subdir`.
 save_failed_artifacts = true
-failed_artifacts_dir = "/tmp/foil-serve_failed"
+failed_artifacts_subdir = "failed"
 
 # Save artifacts (input spreadsheet + generated PDF) when a sparse spreadsheet
 # triggers fallback to PDF+OCR conversion.
 save_table_conversion_artifacts = false
-table_conversion_artifacts_dir = "/tmp/foil-serve_xls2pdf"
+table_conversion_artifacts_subdir = "xls2pdf"
 
 # Save artifacts when spreadsheet cells contain errors (#REF!, #N/A, nan, etc.).
 # A timestamped subdirectory is created containing: input file,
 # md with short error labels (before masking), and final md (after masking).
 # Only triggers when at least one error cell is detected.
 save_cell_error_artifacts = false
-cell_error_artifacts_dir = "/tmp/foil-serve_cell_errors"
+cell_error_artifacts_subdir = "cell_errors"
 
 
 # All settings below are required
@@ -40,7 +47,7 @@ app_api_keys = [
 
 # Check if all vlm_models declared below are properly reachable on server start-up.
 # If any VLM is not reachable, server will not start
-check_vlm_endpoints = true
+check_vlm_endpoints = false
 
 # Maximum accepted file size in MB, checked BEFORE writing to disk.
 # Applies to all file types.
@@ -59,6 +66,12 @@ max_office_file_size_mb = 100
 # used, as a forged value would allow a zip bomb to bypass the check.
 # For .xls (OLE2 binary, not ZIP): only the on-disk size is checked.
 max_excel_file_size_mb = 50
+
+# Maximum allowed decompressed size for ZIP-based files (xlsx, docx, pptx, ods, odt, odp).
+# Phase 1: checked against the ZIP central directory declared sizes (fast, no decompression).
+# If the declared size exceeds this limit, the file is rejected immediately.
+# Phase 2: actual decompression is checked against 1.25× the declared size to detect zip bombs
+max_unzip_size_mb = 2048
 
 # -------------------------------------------------------------------
 # Spreadsheet processing                                            -
@@ -119,6 +132,11 @@ output_paddle_ocr_no_img_desc = true
 # -------------------------------------------------------------------
 # Miscellaneous                                                     -
 # -------------------------------------------------------------------
+
+# Directory for temporary files created during request processing.
+# Each request gets a short-lived subdirectory that is cleaned up automatically.
+# Use "/dev/shm" for pure in-memory I/O (ensure sufficient --shm-size in Docker).
+temp_dir = "/tmp/foil-runtime"
 
 # Minimum image size to be included in the response (in pixels)
 # If image image_description_model_name is requested, `[[vlm_models]].min_size` takes precedence over this value

@@ -119,27 +119,41 @@ def check_file_size(size_bytes: int, limit_mb: int, label: str) -> None:
 
 def check_zip_uncompressed_size(path: Path, max_bytes: int) -> None:
     """
-    Guard against zip bomb attacks by reading the actual decompressed byte stream.
+    Two-phase zip bomb guard for ZIP-based formats (.xlsx, .ods, .docx, .pptx, .odt, .odp).
 
-    Applies to any ZIP-based format: .xlsx, .ods, .docx, .pptx, .odt, .odp.
-    The ZIP central directory 'file_size' field is attacker-controlled and cannot be
-    trusted — only measuring the real deflate output is reliable. This function reads
-    every compressed entry in full and counts the decompressed bytes, raising ValueError
-    if the total exceeds max_bytes.
+    Phase 1 — Declared size (instant, no decompression):
+        Sum of file_size from the ZIP central directory. If it exceeds max_bytes,
+        reject immediately. This catches oversized legitimate files at near-zero cost.
 
-    Cost: one full decompression pass (~50-100 ms for a 50 MB limit). The file will
-    be decompressed again by the consumer (pandas / LibreOffice).
+    Phase 2 — Actual decompression (catches forged headers):
+        Decompress every entry by chunks. If the real decompressed total exceeds
+        1.25× the declared total, raise a zip bomb error. This detects archives
+        where the declared size has been forged to bypass Phase 1.
     """
-    total = 0
     with zipfile.ZipFile(path) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+
+        # Phase 1: declared size from central directory
+        declared_total = sum(i.file_size for i in infos)
+        if declared_total > max_bytes:
+            raise ValueError(
+                f"ZIP archive ({path.suffix.lower()}) declared uncompressed size "
+                f"{declared_total / 1024**2:.1f} MB exceeds "
+                f"{max_bytes // 1024**2} MB limit"
+            )
+
+        # Phase 2: actual decompression — detect forged declared sizes
+        bomb_threshold = int(declared_total * 1.25)
+        real_total = 0
+        for info in infos:
             with zf.open(info) as f:
                 while chunk := f.read(65536):
-                    total += len(chunk)
-                    if total > max_bytes:
+                    real_total += len(chunk)
+                    if real_total > bomb_threshold:
                         raise ValueError(
-                            f"File ({path.suffix.lower()} exceeds {max_bytes // (1024 * 1024)} MB when decompressed "
-                            f"(zip bomb protection)"
+                            f"ZIP archive ({path.suffix.lower()}) actual decompressed size "
+                            f"exceeds 1.25x declared size "
+                            f"({declared_total / 1024**2:.1f} MB) — zip bomb detected"
                         )
 
 
@@ -245,37 +259,33 @@ def read_text_smart(path: Path) -> str:
     raise ValueError(f"Unable to decode file: {path.name}")
 
 
-_OOXML_CONTENT_TYPE_MAP: dict[str, str] = {
-    "wordprocessingml": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "spreadsheetml": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "presentationml": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+_OOXML_DIR_PREFIX_MAP: dict[str, str] = {
+    "word/": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xl/": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt/": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
 def _detect_ooxml(path: Path) -> str | None:
-    """Inspect a file's ZIP structure to detect OOXML type.
+    """Detect OOXML type from ZIP central directory only (no decompression).
 
-    Returns the OOXML MIME string if detected, None otherwise.
-    Uses check_zip_uncompressed_size to guard against zip bombs before
-    reading any entry content.
+    Checks for [Content_Types].xml (OOXML marker) and known directory
+    prefixes (word/, xl/, ppt/) in the ZIP namelist. No entry content is
+    read, so this is safe to call before zip bomb checks.
     """
-    from settings import settings
-
     try:
-        check_zip_uncompressed_size(
-            path, max_bytes=settings.max_office_file_size_mb * 1024 * 1024
-        )
         with zipfile.ZipFile(path) as zf:
-            if "[Content_Types].xml" not in zf.namelist():
+            names = zf.namelist()
+            if "[Content_Types].xml" not in names:
                 return None
-            ct = zf.read("[Content_Types].xml").decode("utf-8", errors="replace")
-            for keyword, mime_type in _OOXML_CONTENT_TYPE_MAP.items():
-                if keyword in ct:
+            for prefix, mime_type in _OOXML_DIR_PREFIX_MAP.items():
+                if any(n.startswith(prefix) for n in names):
                     logger.info(
-                        "OOXML fallback: detected %s from [Content_Types].xml", keyword
+                        "OOXML fallback: detected %s from ZIP namelist",
+                        prefix.rstrip("/"),
                     )
                     return mime_type
-    except (zipfile.BadZipFile, ValueError):
+    except zipfile.BadZipFile:
         return None
     return None
 

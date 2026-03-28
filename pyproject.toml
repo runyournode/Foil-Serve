@@ -3,6 +3,8 @@ name = "foil_serve"
 version = "0.1.0"
 description = "Serveur de conversion de fichier en md basé sur PaddleOCR"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "paddleocr[doc-parser]==3.4.0",

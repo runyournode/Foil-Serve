@@ -26,7 +26,7 @@ PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting at
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
 
-**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled.
+**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled.
 
 **OOXML detection fallback:** some `.docx`, `.xlsx`, and `.pptx` files are misidentified as `application/octet-stream` by libmagic. foil-serve inspects the ZIP structure (`[Content_Types].xml`) to resolve the actual OOXML type automatically.
 
@@ -189,7 +189,7 @@ Running PaddleOCR-VL-1.5 natively proved problematic (*Exception from the 'vlm' 
 The model is instead served via vLLM through an OpenAI-compatible endpoint. This also benefits from faster inference compared to the native Paddle runtime, and greatly reduces wasted time during [worker recycling](#memory-management--worker-recycling).
 
 ### Debug artifact saving
-When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `failed_artifacts_dir` (default `/tmp/foil-serve_failed`):
+When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `failed_artifacts_dir` (default `/foil-log/failed`):
 
 ```
 <yy-mm-dd_hh-mm>_<mime-type>/

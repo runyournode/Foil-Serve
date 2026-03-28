@@ -11,7 +11,7 @@ from PIL.Image import Image
 from paddleocr import PaddleOCRVL
 from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLResult
 
-from settings import settings
+from settings import settings, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +28,8 @@ def _init_worker(config_path: str) -> None:
     global _worker_pipeline
     # os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"
 
-    # Worker is a spawned process — configure file logging independently
-    if settings.log_file:
-        root = logging.getLogger()
-        root.setLevel(logging.getLevelName(settings.log_level))
-        if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
-            fh = logging.FileHandler(settings.log_file)
-            fh.setFormatter(
-                logging.Formatter("%(asctime)s %(levelname)-8s %(name)s - %(message)s")
-            )
-            root.addHandler(fh)
+    # Worker is a spawned process — configure logging independently
+    setup_logging()
 
     _worker_pipeline = PaddleOCRVL(paddlex_config=config_path)
     logger.info(f"[WORKER: pid={os.getpid()}] Pipeline initialized")

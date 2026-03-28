@@ -42,52 +42,27 @@ from pipeline import PaddlePipelineWrapper
 from vlm import describe_image_sem
 from postprocessing import extract_raw_ocr, prune_tables, reformat_md
 from security import verify_api_key
-from settings import validate_endpoint, settings, vlm_registry, AsyncOpenAIWithInfo
+from settings import validate_endpoint, settings, vlm_registry, AsyncOpenAIWithInfo, setup_logging, align_uvicorn_logging
 
 
-def _setup_logging() -> logging.FileHandler | None:
-    level = logging.getLevelName(settings.log_level)
-
-    root = logging.getLogger()
-    root.setLevel(level)
-
-    # Add StreamHandler only if none exists yet (avoids duplicates on --reload)
-    if not any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        for h in root.handlers
-    ):
-        sh = logging.StreamHandler()
-        sh.setFormatter(logging.Formatter("%(levelname)-8s %(name)s - %(message)s"))
-        root.addHandler(sh)
-
-    fh = None
-    if settings.log_file and not any(
-        isinstance(h, logging.FileHandler) for h in root.handlers
-    ):
-        fh = logging.FileHandler(settings.log_file)
-        fh.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)-8s %(name)s - %(message)s")
-        )
-        root.addHandler(fh)
-
-    # Silence noisy libraries
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    return fh
-
-
-_log_file_handler = _setup_logging()
+_log_file_handler = setup_logging()
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # ── Forward uvicorn logs to file (uvicorn uses propagate=False) ───────────
-    if _log_file_handler:
-        for _name in ("uvicorn", "uvicorn.access"):
-            _uvicorn_logger = logging.getLogger(_name)
-            if _log_file_handler not in _uvicorn_logger.handlers:
-                _uvicorn_logger.addHandler(_log_file_handler)
+    align_uvicorn_logging(_log_file_handler)
+
+    # ── Ensure runtime directories exist ─────────────────────────────────────
+    Path(settings.temp_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        Path(settings.artifact_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(
+            f"Cannot create artifact directory '{settings.artifact_dir}': {e}. "
+            f"Create it with: sudo mkdir -p {settings.artifact_dir} && sudo chown $(whoami) {settings.artifact_dir}"
+        ) from e
 
     # ── VLM endpoints check ───────────────────────────────────────────────────
     if settings.check_vlm_endpoints:
@@ -107,7 +82,7 @@ async def lifespan(_app: FastAPI):
     _app.state.excel_sem = asyncio.Semaphore(settings.max_concurrent_excel)
 
     # ── LibreOffice persistent server ─────────────────────────────────────────
-    libreoffice_server = LibreOfficeServer()
+    libreoffice_server = LibreOfficeServer(runtime_dir=settings.temp_dir)
     await asyncio.to_thread(libreoffice_server.start)
     _app.state.libreoffice_server = libreoffice_server
 
@@ -171,7 +146,6 @@ async def _process_document(
     image_description_model_name: Optional[str],
     client: Optional[AsyncOpenAIWithInfo],
     t0_wall: float,
-    artifact_ctx: ArtifactContext | None,
 ) -> tuple[str, dict[str, str], Metadata, str, str]:
     """
     Core document processing pipeline shared by JSON and download endpoints.
@@ -184,6 +158,15 @@ async def _process_document(
     mime_ext     : str             — file extension mapped from MIME (.pdf, .docx, …)
     raw_mime     : str             — raw MIME type string from libmagic
     """
+    artifact_ctx = (
+        ArtifactContext(
+            artifacts_dir=Path(settings.artifact_dir) / settings.failed_artifacts_subdir,
+            t0_wall=t0_wall,
+            image_description_model_name=image_description_model_name,
+        )
+        if settings.save_failed_artifacts
+        else None
+    )
     t_active = 0.0
     wrapper: PaddlePipelineWrapper = request.app.state.pipeline_wrapper
 
@@ -196,7 +179,7 @@ async def _process_document(
         raise HTTPException(status_code=413, detail=str(e))
 
     timestamp = datetime.now().strftime("%m-%d_%H-%M")
-    with tempfile.TemporaryDirectory(prefix=f"foil-serve_{timestamp}") as tmpdir_str:
+    with tempfile.TemporaryDirectory(prefix=f"foil-serve_{timestamp}_", dir=settings.temp_dir) as tmpdir_str:
         tmpdir = Path(tmpdir_str)
 
         # ── Phase 1 : write file + detect MIME (thread, fast) ────────────────
@@ -231,26 +214,24 @@ async def _process_document(
                 check_file_size(
                     _file_size, settings.max_office_file_size_mb, "Office file"
                 )
-                # ZIP-based formats (.docx, .pptx, .odt, .odp): check decompressed size
-                # to prevent zip bomb attacks before handing off to LibreOffice.
+                # ZIP-based formats (.docx, .pptx, .odt, .odp): two-phase zip bomb check
                 if mime in (".docx", ".pptx", ".odt", ".odp"):
                     await asyncio.to_thread(
                         check_zip_uncompressed_size,
                         path=prepared_path,
-                        max_bytes=settings.max_office_file_size_mb * 1024 * 1024,
+                        max_bytes=settings.max_unzip_size_mb * 1024**2,
                     )
             elif mime in (".xls", ".xlsx", ".ods"):
                 # Check on-disk (compressed) size — reliable for all spreadsheet formats
                 check_file_size(
                     _file_size, settings.max_excel_file_size_mb, "Spreadsheet file"
                 )
-                # ZIP-based formats (.xlsx, .ods): check actual decompressed size to prevent zip bombs.
-                # The ZIP central directory 'file_size' field is not used — it is attacker-controlled.
+                # ZIP-based formats (.xlsx, .ods): two-phase zip bomb check
                 if mime in (".xlsx", ".ods"):
                     await asyncio.to_thread(
                         check_zip_uncompressed_size,
                         path=prepared_path,
-                        max_bytes=settings.max_excel_file_size_mb * 1024 * 1024,
+                        max_bytes=settings.max_unzip_size_mb * 1024**2,
                     )
             elif mime in (".txt", ".json", ".csv", ".xml"):
                 pass
@@ -295,6 +276,7 @@ async def _process_document(
                         path=prepared_path,
                         table_format=settings.excel_output_format,
                         raw_mime=mime,
+                        lo_server=request.app.state.libreoffice_server,
                     )
                 except EmptySpreadsheetError:
                     if settings.excel_pdf_fallback_enabled:
@@ -400,7 +382,7 @@ async def _process_document(
                         convert_to_pdf,
                         file_path=prepared_path,
                         mime=mime,
-                        server=lo_server,
+                        lo_server=lo_server,
                         paper_format=settings.excel_pdf_paper_format if fallback_to_pdf else None,
                     )
                 except Exception as e:
@@ -418,7 +400,7 @@ async def _process_document(
                     save_table_conversion_artifacts,
                     input_path=prepared_path,
                     pdf_path=pipeline_input,
-                    artifacts_dir=settings.table_conversion_artifacts_dir,
+                    artifacts_dir=Path(settings.artifact_dir) / settings.table_conversion_artifacts_subdir,
                     raw_mime=mime,
                 )
         else:
@@ -596,23 +578,12 @@ async def foil_process(
     client: Annotated[AsyncOpenAIWithInfo | None, Depends(validate_endpoint)] = None,
 ):
     t0_wall = time.perf_counter()
-    artifact_ctx = (
-        ArtifactContext(
-            artifacts_dir=Path(settings.failed_artifacts_dir),
-            t0_wall=t0_wall,
-            image_description_model_name=image_description_model_name,
-        )
-        if settings.save_failed_artifacts
-        else None
-    )
-
     page_content, imgs_b64, metadata, _mime_ext, _raw_mime = await _process_document(
         request,
         file_content,
         image_description_model_name,
         client,
         t0_wall,
-        artifact_ctx,
     )
     return ProcessedDocument(
         page_content=page_content, images=imgs_b64, metadata=metadata
@@ -636,23 +607,12 @@ async def foil_process_download(
     """Process a document and return a downloadable .tar.zst archive containing
     the Markdown output, images, metadata and MIME information."""
     t0_wall = time.perf_counter()
-    artifact_ctx = (
-        ArtifactContext(
-            artifacts_dir=Path(settings.failed_artifacts_dir),
-            t0_wall=t0_wall,
-            image_description_model_name=image_description_model_name,
-        )
-        if settings.save_failed_artifacts
-        else None
-    )
-
     page_content, imgs_b64, metadata, mime_ext, raw_mime = await _process_document(
         request,
         file_content,
         image_description_model_name,
         client,
         t0_wall,
-        artifact_ctx,
     )
     archive = await asyncio.to_thread(
         build_tar_zst,

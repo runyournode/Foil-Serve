@@ -9,11 +9,13 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from settings import PaperFormat
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 # Paper dimensions in 1/100 mm (landscape: width > height)
-PAPER_SIZES: dict[str, tuple[int, int]] = {
+PAPER_SIZES: dict[PaperFormat, tuple[int, int]] = {
     "A2": (59400, 42000),
     "A3": (42000, 29700),
     "A4": (29700, 21000),
@@ -21,9 +23,6 @@ PAPER_SIZES: dict[str, tuple[int, int]] = {
     "Legal": (35560, 21590),
     "Tabloid": (43180, 27940),
 }
-
-_SOFFICE_PID_FILE = Path("/tmp/foil-serve_soffice.pid")
-
 
 class LibreOfficeServer:
     """
@@ -33,14 +32,15 @@ class LibreOfficeServer:
     avoiding the ~3s spawn overhead on every document. If soffice crashes during
     a conversion, it is automatically restarted before retrying.
 
-    PID persistence: the soffice PID is written to _SOFFICE_PID_FILE so that
-    stale processes from previous app crashes are cleaned up at next startup.
+    PID persistence: the soffice PID is written to a file inside `runtime_dir`
+    so that stale processes from previous app crashes are cleaned up at next startup.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, runtime_dir: str = "/tmp/foil-runtime") -> None:
         self._process: subprocess.Popen | None = None
         self._port: int | None = None
         self._lock = threading.Lock()
+        self._pid_file = Path(runtime_dir) / "soffice.pid"
 
     @staticmethod
     def _find_free_port() -> int:
@@ -63,13 +63,12 @@ class LibreOfficeServer:
         except OSError:
             return False
 
-    @staticmethod
-    def _cleanup_stale_processes() -> None:
+    def _cleanup_stale_processes(self) -> None:
         """Kill stale soffice processes from previous app runs using the PID file."""
-        if not _SOFFICE_PID_FILE.exists():
+        if not self._pid_file.exists():
             return
         try:
-            pid = int(_SOFFICE_PID_FILE.read_text().strip())
+            pid = int(self._pid_file.read_text().strip())
             if not LibreOfficeServer._is_soffice_process(pid):
                 logger.warning(
                     f"PID {pid} from PID file is not a soffice process — skipping kill"
@@ -84,7 +83,7 @@ class LibreOfficeServer:
         except (ValueError, OSError):
             pass
         finally:
-            _SOFFICE_PID_FILE.unlink(missing_ok=True)
+            self._pid_file.unlink(missing_ok=True)
 
     @staticmethod
     def _drain_stderr(process: subprocess.Popen) -> None:
@@ -138,7 +137,7 @@ class LibreOfficeServer:
         ).start()
 
         # Persist PID so a future crash recovery can clean it up
-        _SOFFICE_PID_FILE.write_text(str(self._process.pid))
+        self._pid_file.write_text(str(self._process.pid))
         logger.info(f"soffice started (pid={self._process.pid}, port={self._port})")
 
         self._wait_ready()
@@ -153,7 +152,7 @@ class LibreOfficeServer:
                 self._process.terminate()
         except Exception:
             pass
-        _SOFFICE_PID_FILE.unlink(missing_ok=True)
+        self._pid_file.unlink(missing_ok=True)
         self.start()
 
     def _ensure_running(self) -> None:
@@ -265,7 +264,7 @@ convert()
         self,
         file_path: Path,
         output_pdf: Path,
-        paper_format: str = "A3",
+        paper_format: PaperFormat = "A3",
         landscape: bool = True,
     ) -> str:
         """
@@ -327,6 +326,50 @@ def convert():
 convert()
 """
 
+    def _build_uno_script_xls_to_xlsx(self, file_path: Path, output_xlsx: Path) -> str:
+        """Build a UNO script to convert a legacy .xls to .xlsx (handles old encryption with empty password)."""
+        return f"""
+import uno
+from com.sun.star.beans import PropertyValue
+
+def convert():
+    localContext = uno.getComponentContext()
+    resolver = localContext.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", localContext
+    )
+
+    ctx = resolver.resolve(
+        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+    )
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    file_url = uno.systemPathToFileUrl("{file_path.resolve().as_posix()}")
+    out_url  = uno.systemPathToFileUrl("{output_xlsx.resolve().as_posix()}")
+
+    hidden = PropertyValue()
+    hidden.Name = "Hidden"
+    hidden.Value = True
+
+    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+
+    xlsx_filter = PropertyValue()
+    xlsx_filter.Name = "FilterName"
+    xlsx_filter.Value = "Calc MS Excel 2007 XML"
+
+    doc.storeToURL(out_url, (xlsx_filter,))
+    doc.close(True)
+
+convert()
+"""
+
+    def convert_xls_to_xlsx(self, file_path: Path, output_xlsx: Path) -> None:
+        """Convert a legacy .xls to .xlsx via UNO (handles old encryption with empty password)."""
+        self._ensure_running()
+        assert self._port is not None
+        script = self._build_uno_script_xls_to_xlsx(file_path, output_xlsx)
+        self._run_uno_script(script, label="UNO xls→xlsx")
+
     def convert_general(self, file_path: Path, output_pdf: Path) -> None:
         """Convert a document (Writer, Impress, etc.) to PDF via UNO."""
         self._ensure_running()
@@ -335,7 +378,7 @@ convert()
         self._run_uno_script(script, label="UNO general")
 
     def convert_spreadsheet(
-        self, file_path: Path, output_pdf: Path, paper_format: str = "A3"
+        self, file_path: Path, output_pdf: Path, paper_format: PaperFormat = "A3"
     ) -> None:
         """Convert a spreadsheet to PDF via UNO (landscape, fit-to-width)."""
         self._ensure_running()
@@ -354,7 +397,7 @@ convert()
                 self._process.kill()
             finally:
                 self._process = None
-        _SOFFICE_PID_FILE.unlink(missing_ok=True)
+        self._pid_file.unlink(missing_ok=True)
         logger.info("soffice stopped")
 
 
@@ -363,8 +406,8 @@ def convert_to_pdf(
     mime: Literal[
         ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
     ],
-    server: LibreOfficeServer,
-    paper_format: str | None = None,
+    lo_server: LibreOfficeServer,
+    paper_format: PaperFormat | None = None,
 ) -> Path:
     """
     Convert an Office document to PDF via LibreOffice UNO (output in same directory as source).
@@ -378,14 +421,14 @@ def convert_to_pdf(
 
     if mime in (".xls", ".xlsx", ".ods"):
         try:
-            server.convert_spreadsheet(
+            lo_server.convert_spreadsheet(
                 file_path, generated_pdf, paper_format=paper_format or "A3"
             )
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
     elif mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
         try:
-            server.convert_general(file_path, generated_pdf)
+            lo_server.convert_general(file_path, generated_pdf)
         except Exception as e:
             raise RuntimeError(f"LibreOffice error: {e}") from e
     else:

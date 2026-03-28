@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Dowload models
 FROM alpine:3.20 AS models_fetcher
 
-ENV HOME=/home/paddleocr
+ENV HOME=/home/foil
 
 RUN apk add --no-cache wget tar
 
@@ -70,23 +70,24 @@ RUN --mount=type=cache,target=/model_cache \
 # ---------------------------------
 FROM python:3.13.12-slim-trixie AS base
 
-LABEL org.opencontainers.image.title="PaddleOCR-VL Server"
-LABEL org.opencontainers.image.description="FastAPI server for document-to-markdown conversion based on PaddleOCR VL 1.5"
+LABEL org.opencontainers.image.title="foil-serve"
+LABEL org.opencontainers.image.description="FastAPI server for document-to-markdown conversion using PaddleOCR VL 1.5"
 LABEL org.opencontainers.image.authors="runyournode"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-LABEL com.paddleocr.cuda.version="13.0"
-LABEL com.paddleocr.engine="PaddlePaddle GPU 3.3.0"
-LABEL feature.libreoffice="true"
+LABEL com.foil.cuda.version="13.0"
+LABEL com.foil.engine="PaddlePaddle GPU 3.3.0"
+LABEL com.foil.feature.libreoffice="true"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV HOME=/home/paddleocr
+ENV HOME=/home/foil
 ENV PATH="/app/.venv/bin:${PATH}"
 
-RUN groupadd -g 1000 paddleocr \
-    && useradd -m -s /bin/bash -u 1000 -g 1000 paddleocr
-WORKDIR /home/paddleocr
+RUN groupadd -g 1000 foil \
+    && useradd -m -s /bin/bash -u 1000 -g 1000 foil
+WORKDIR /home/foil
 
 # ---------------------------------
 # Installation dépendances (libreoffice, python)
@@ -108,10 +109,14 @@ RUN apt update \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=uv_fetcher --chown=paddleocr /app/.venv /app/.venv
-COPY --chown=paddleocr src/foil_serve /app/
+# Default log location
+RUN mkdir -p /var/log/foil && chown foil:foil /var/log/foil
 
-USER paddleocr
+# Venv and src
+COPY --from=uv_fetcher --chown=foil /app/.venv /app/.venv
+COPY --chown=foil src/foil_serve /app/
+
+USER foil
 WORKDIR /app
 
 ENTRYPOINT ["uvicorn", "main:app"]
@@ -120,7 +125,7 @@ CMD ["--host", "0.0.0.0", "--port", "8080"]
 ENV APP_PORT=8080
 HEALTHCHECK --interval=120s --timeout=15s --start-period=60s \
   CMD python3 -c "import urllib.request, os; \
-      port = os.getenv('APP_PORT', '8080'); \
+      port = os.getenv('APP_PORT'); \
       urllib.request.urlopen(f'http://localhost:{port}/health', timeout=15)" || exit 1
 
 
@@ -128,12 +133,12 @@ HEALTHCHECK --interval=120s --timeout=15s --start-period=60s \
 # Light: no bundled models (downloaded at runtime via vLLM/PaddleOCR) (save ~ 200 MB compared to -offline)
 # ---------------------------------
 FROM base AS light
-LABEL feature.offline-ready="false"
+LABEL com.foil.feature.offline-ready="false"
 
 
 # ---------------------------------
 # Offline: models bundled in the image
 # ---------------------------------
 FROM base AS offline
-LABEL feature.offline-ready="true"
-COPY --from=models_fetcher --chown=paddleocr ${HOME}/.paddlex ${HOME}/.paddlex
+LABEL com.foil.feature.offline-ready="true"
+COPY --from=models_fetcher --chown=foil ${HOME}/.paddlex ${HOME}/.paddlex

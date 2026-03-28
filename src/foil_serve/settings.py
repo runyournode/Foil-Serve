@@ -1,6 +1,7 @@
 from typing import List, Annotated, Dict, Literal
 from enum import StrEnum
 import asyncio
+import logging
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
@@ -9,6 +10,10 @@ from fastapi import HTTPException, Query
 from openai import AsyncOpenAI
 
 from schemas import VLMModelConfig
+
+
+ExcelOutputFormat = Literal["human", "llm"]
+PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]
 
 
 class Settings(BaseSettings):
@@ -26,27 +31,31 @@ class Settings(BaseSettings):
     max_image_file_size_mb: int
     max_office_file_size_mb: int
     max_excel_file_size_mb: int
-    save_failed_artifacts: bool = False
-    failed_artifacts_dir: str = "/tmp/paddleocr_failed"
-    save_table_conversion_artifacts: bool = False
-    table_conversion_artifacts_dir: str = "/tmp/foil-serve_xls2pdf"
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    max_unzip_size_mb: int
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
+    libs_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
     log_file: str | None = None
+    artifact_dir: str = "/var/log/foil/artifacts"
+    save_failed_artifacts: bool = False
+    failed_artifacts_subdir: str = "failed"
+    save_table_conversion_artifacts: bool = False
+    table_conversion_artifacts_subdir: str = "xls2pdf"
+    temp_dir: str = "/tmp/foil-runtime"
 
     # OCR output control
     output_paddle_ocr: bool
     output_paddle_ocr_no_img_desc: bool
 
     # Spreadsheet processing
-    excel_output_format: Literal["human", "llm"]
+    excel_output_format: ExcelOutputFormat
     excel_mask_cell_errors: bool
     save_cell_error_artifacts: bool = False
-    cell_error_artifacts_dir: str = "/tmp/foil-serve_cell_errors"
+    cell_error_artifacts_subdir: str = "cell_errors"
     excel_max_output_ratio: float
     excel_pdf_fallback_enabled: bool
     excel_min_input_for_fallback_mb: float
     excel_min_output_ratio: float
-    excel_pdf_paper_format: Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]
+    excel_pdf_paper_format: PaperFormat
     excel_pdf_landscape: bool
 
     model_config = SettingsConfigDict(
@@ -96,6 +105,60 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+_CONSOLE_FMT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+_CONSOLE_DATE_FMT = "%m-%d %H:%M:%S"
+_FILE_FMT = "%(asctime)s,%(msecs)03d | %(levelname)-8s | %(name)s | %(message)s"
+_FILE_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging() -> logging.FileHandler | None:
+    """Configure the root logger. Safe to call from both main and worker processes."""
+    root = logging.getLogger()
+    root.setLevel(logging.getLevelName(settings.log_level))
+
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in root.handlers
+    ):
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter(_CONSOLE_FMT, datefmt=_CONSOLE_DATE_FMT))
+        root.addHandler(sh)
+
+    fh = None
+    if settings.log_file and not any(
+        isinstance(h, logging.FileHandler) for h in root.handlers
+    ):
+        log_path = Path(settings.log_file)
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(settings.log_file)
+        except OSError as e:
+            raise OSError(
+                f"Cannot open log file '{settings.log_file}': {e}. "
+                f"Create the directory with: sudo mkdir -p {log_path.parent} "
+                f"&& sudo chown $(whoami) {log_path.parent}"
+            ) from e
+        fh.setFormatter(logging.Formatter(_FILE_FMT, datefmt=_FILE_DATE_FMT))
+        root.addHandler(fh)
+
+    libs_level = logging.getLevelName(settings.libs_log_level)
+    for lib in ("httpx", "openai", "httpcore"):
+        logging.getLogger(lib).setLevel(libs_level)
+
+    return fh
+
+
+def align_uvicorn_logging(file_handler: logging.FileHandler | None) -> None:
+    """Reformat uvicorn loggers to match our style. Call after uvicorn has started."""
+    console_formatter = logging.Formatter(_CONSOLE_FMT, datefmt=_CONSOLE_DATE_FMT)
+    for name in ("uvicorn", "uvicorn.access"):
+        uv_logger = logging.getLogger(name)
+        for h in uv_logger.handlers:
+            h.setFormatter(console_formatter)
+        if file_handler and file_handler not in uv_logger.handlers:
+            uv_logger.addHandler(file_handler)
 
 # Dynamic loading of vlm config (from .toml) at startup
 vlm_registry: dict[str, VLMModelConfig] = {m.name: m for m in settings.vlm_models}

@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pandas as pd
 from tabulate import tabulate
+from xlrd.biffh import XLRDError
 
-from settings import settings
+from libreoffice import LibreOfficeServer
+
+from settings import ExcelOutputFormat, settings
 from debug import save_cell_error_artifacts
 
 logger = logging.getLogger(__name__)
@@ -54,7 +57,7 @@ _ERROR_TO_EMPTY: dict[str, str] = {k: "" for k in _ERROR_TO_SHORT}
 #  Internal helpers
 # ---------------------------------------------------------------------------
 
-_SEPARATOR_RE = re.compile(r"\|[-:\s]+(?:\|[-:\s]+)+\|")
+_SEPARATOR_RE = re.compile(r"\|[-:\s]+(?:\|[-:\s]+)*\|")
 
 
 def _compact_table(table: str) -> str:
@@ -138,14 +141,14 @@ def _df_to_md(df: pd.DataFrame, table_format: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") -> str:
+def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: str = "unknown") -> str:
     """Convert all sheets of an Excel / ODS file to Markdown tables.
 
     Reads settings from the global settings singleton:
     - ``excel_mask_cell_errors``: mask or shorten error cells.
     - ``save_cell_error_artifacts`` / ``cell_error_artifacts_dir``: artifact saving.
 
-    After error handling, fully empty columns and rows are stripped.
+    After cell error handling, fully empty columns and rows are stripped.
 
     Args:
         path: Path to the spreadsheet file.
@@ -231,11 +234,13 @@ def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") 
                 input_path=path,
                 md_with_errors=txt_with_errors,
                 md_final=txt if mask_errors else None,
-                artifacts_dir=settings.cell_error_artifacts_dir,
+                artifacts_dir=Path(settings.artifact_dir) / settings.cell_error_artifacts_subdir,
                 raw_mime=raw_mime,
             )
 
     except EmptySpreadsheetError:
+        raise
+    except XLRDError:
         raise
     except Exception as e:
         logger.error(
@@ -243,3 +248,34 @@ def excel2txt(path: Path, table_format: str = "llm", raw_mime: str = "unknown") 
         )
         raise e
     return txt
+
+
+def is_encrypted_xls_error(exc: Exception) -> bool:
+    """True if the exception is an xlrd 'Workbook is encrypted' error."""
+    return isinstance(exc, XLRDError) and "encrypted" in str(exc).lower()
+
+
+def excel2txt(
+    path: Path,
+    table_format: ExcelOutputFormat,
+    raw_mime: str,
+    lo_server: LibreOfficeServer,
+) -> str:
+    """Try _excel2txt
+    On legacy-encrypted .xls, try convert via LibreOffice and retry (it could be empty password encrypted).
+
+    Args:
+        path: Path to the spreadsheet file.
+        table_format: "human" or "llm".
+        raw_mime: Detected MIME extension (.xls, .xlsx, .ods).
+        lo_server: LibreOffice server instance for XLS → XLSX conversion.
+    """
+    try:
+        return _excel2txt(path, table_format=table_format, raw_mime=raw_mime)
+    except XLRDError as e:
+        if raw_mime != ".xls" or not is_encrypted_xls_error(e):
+            raise
+        logger.warning("Legacy-encrypted XLS — converting to XLSX via LibreOffice")
+        xlsx_path = path.with_suffix(".xlsx")
+        lo_server.convert_xls_to_xlsx(path, xlsx_path)
+        return _excel2txt(xlsx_path, table_format=table_format, raw_mime=raw_mime)

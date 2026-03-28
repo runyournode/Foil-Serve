@@ -1,16 +1,37 @@
 # -------------------------------------------------------------------
-# Logging                                                           -
+# Logging & artifacts                                               -
+# All paths below default to /var/log/foil/. This directory must    -
+# exist and be writable by the application user.                    -
+# Docker: created by the Dockerfile.                                -
+# Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
+# (No clearing mechanism — manage disk space manually.)             -
 # -------------------------------------------------------------------
 log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
-log_file = "/tmp/foil-serve.log"   # optional: log to file
+log_file = "/var/log/foil/foil.log"
+
+# Base directory for debug artifacts. Subdirectories are created automatically.
+artifact_dir = "/var/log/foil/artifacts"
 
 # Save input files and debug artifacts for any failed processing request.
-# A timestamped subdirectory is created under `failed_artifacts_dir` for each failure,
-# containing: input file, intermediate PDF (if any), partial markdown, meta.txt, trace.txt.
-# There is no clearing mechanism — manage disk space manually.
+# A timestamped subdirectory is created under `artifact_dir/failed_artifacts_subdir`.
 save_failed_artifacts = true
-failed_artifacts_dir = "/tmp/foil-serve_failed"
+failed_artifacts_subdir = "failed"
 
+# Save artifacts (input spreadsheet + generated PDF) when a sparse spreadsheet
+# triggers fallback to PDF+OCR conversion.
+save_table_conversion_artifacts = false
+table_conversion_artifacts_subdir = "xls2pdf"
+
+# Save artifacts when spreadsheet cells contain errors (#REF!, #N/A, nan, etc.).
+# A timestamped subdirectory is created containing: input file,
+# md with short error labels (before masking), and final md (after masking).
+# Only triggers when at least one error cell is detected.
+save_cell_error_artifacts = false
+cell_error_artifacts_subdir = "cell_errors"
+
+
+# All settings below are required
+# 'default' are recommanded settings but not set in python code
 
 # -------------------------------------------------------------------
 # Safety & Startup checks                                           -
@@ -25,7 +46,7 @@ app_api_keys = [
 
 # Check if all vlm_models declared below are properly reachable on server start-up.
 # If any VLM is not reachable, server will not start
-check_vlm_endpoints = true
+check_vlm_endpoints = false
 
 # Maximum accepted file size in MB, checked BEFORE writing to disk.
 # Applies to all file types.
@@ -45,10 +66,76 @@ max_office_file_size_mb = 100
 # For .xls (OLE2 binary, not ZIP): only the on-disk size is checked.
 max_excel_file_size_mb = 50
 
+# Maximum allowed decompressed size for ZIP-based files (xlsx, docx, pptx, ods, odt, odp).
+# Phase 1: checked against the ZIP central directory declared sizes (fast, no decompression).
+# If the declared size exceeds this limit, the file is rejected immediately.
+# Phase 2: actual decompression is checked against 1.25× the declared size to detect zip bombs
+max_unzip_size_mb = 2048
+
+# -------------------------------------------------------------------
+# Spreadsheet processing                                            -
+# -------------------------------------------------------------------
+
+# Table format for Excel/ODS → Markdown conversion.
+# "llm" (default): minimal formatting, reduced tokens (no padding, short separators)
+# "human": aligned columns, full separators (standard tabulate "pipe" format)
+excel_output_format = "llm"
+
+# How to handle Excel cell errors (#REF!, #N/A, #VALUE!, #NAME?, #DIV/0!, #NULL!, #NUM!, nan).
+# true (default): error cells become empty strings before rendering.
+# false: error cells show a short label (e.g. #ref, #n/a, #val, #name, #div, #null, #num).
+# In both cases, fully empty rows and columns are stripped from the output.
+excel_mask_cell_errors = true
+
+# Maximum ratio of output Markdown size to input file size.
+# If exceeded, the request is rejected (HTTP 413).
+# Example: 5.0 means a 10 MB Excel may produce at most 50 MB of Markdown.
+excel_max_output_ratio = 5.0
+
+# Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
+# images, shapes only), convert to PDF and process via Paddle OCR instead
+# (which mean possible allucinations... ).
+# Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
+excel_pdf_fallback_enabled = true
+# Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
+excel_min_input_for_fallback_mb = 0.5
+# If Markdown output is smaller than this fraction of input size, trigger fallback.
+excel_min_output_ratio = 0.01
+
+# Paper format used when converting spreadsheets to PDF (for the fallback pipeline).
+# Supported values: "A3", "A4", "A2", "Letter", "Legal", "Tabloid"
+excel_pdf_paper_format = "A3"
+
+# Page orientation for spreadsheet → PDF conversion (fallback pipeline).
+# true (default): landscape — better for wide spreadsheets with many columns.
+# false: portrait — better for narrow spreadsheets with few columns.
+excel_pdf_landscape = true
+
+
+# -------------------------------------------------------------------
+# OCR output control in Images  (OCR performed by paddle)           -
+# -------------------------------------------------------------------
+# When a VLM image description IS requested:
+# true  → keep <ocr> tags in the final Markdown alongside <figcaption>.
+# false → only <figcaption> (VLM description) is emitted; OCR is still
+#         used internally as context for the VLM prompt.
+output_paddle_ocr = false
+
+# When NO VLM image description is requested:
+# true  → keep <ocr> tags in the final Markdown.
+# false → no <ocr> tags; also skips the OCR-on-images step in the
+#         Paddle pipeline (performance optimization).
+output_paddle_ocr_no_img_desc = true
+
 
 # -------------------------------------------------------------------
 # Miscellaneous                                                     -
 # -------------------------------------------------------------------
+
+# Directory for temporary files created during request processing.
+# Each request gets a short-lived subdirectory that is cleaned up automatically.
+# Use "/dev/shm" for pure in-memory I/O (ensure sufficient --shm-size in Docker).
+temp_dir = "/tmp/foil-runtime"
 
 # Minimum image size to be included in the response (in pixels)
 # If image image_description_model_name is requested, `[[vlm_models]].min_size` takes precedence over this value

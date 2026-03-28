@@ -1,85 +1,73 @@
 services:
   foil_app:
     image: ghcr.io/runyournode/foil-serve:main-offline
-#    build:
-#      context: ..
-#      dockerfile: Dockerfile
     container_name: foil_app
+    gpus: all
     ipc: host
-#    extra_hosts:
-#      - "host.docker.internal:host-gateway"
-    environment:
-      - HF_HUB_OFFLINE=1
-      - APP_PORT=8080 # must match CMD if you override (default: 8080)
     expose:
       - "8081"
     ports:
       - "8081:8080"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - APP_PORT=8080 # must match CMD if you override (default: 8080)
     volumes:
-      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:ro
-      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:ro
-      - ./mount_runtime/foil_serve/foil-serve_failed:/tmp/foil-serve_failed:Z  # [optional] failed conversion artifacts
-      - ./mount_runtime/foil_serve/foil-serve.log:/tmp/foil-serve.log:Z # [optional] log file (touch first is file doesn't exist)
-#    restart: unless-stopped
+      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:Z,ro
+      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:Z,ro
+      # [optional] logs + artifacts (log file, failed/, xls2pdf/, cell_errors/)
+      - ./mount_runtime/foil_serve/logs:/var/log/foil:Z
+    restart: unless-stopped
     depends_on:
       foil_vllm-PaddleOCR-VL-1.5:
         condition: service_healthy
+      # [Optional] other vlm endpoint in the stack
 #      foil_vllm-ministral-3-3b:
 #        condition: service_healthy
-    networks:
-      - foil-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
+
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
     image: docker.io/vllm/vllm-openai:v0.18.0-cu130
     container_name: foil_vllm-PaddleOCR-VL-1.5
+    gpus: all
     ipc: host
     expose:
       - "8000"
-    ports:  # dev only
-      - "8088:8000"
+#    ports:  # dev only
+#      - "8082:8000"
+    networks:
+      - foil-net
     environment:
       - HF_HUB_OFFLINE=1
       - PORT=8000  # must match CMD
     volumes:
-      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5_config.yaml:/config/config.yaml:Z,ro
+      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
     command: ["--port", "8000", "--config", "/config/config.yaml"]
     restart: unless-stopped
-    networks:
-      - foil-net
     healthcheck:
       test: [
         "CMD", "python3", "-c",
-        "import urllib.request, os; port = os.getenv('PORT', '8000'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
       ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 3600s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: [ "0" ]
-              capabilities: [ gpu ]
+      start_period: 300s
+
 
   # Soft Req : mistralai/ministral-3-3b
   foil_vllm-ministral-3-3b:
     image: docker.io/vllm/vllm-openai:v0.17.1-cu130
     container_name: foil_vllm-ministral-3-3b
     ipc: host
+    gpus: all
     expose:
       - "8000"
-    ports: # dev only
-      - "8089:8000"
+#    ports: # dev only
+#      - "8082:8000"
     environment:
       - HF_HUB_OFFLINE=0
       - PORT=8000  # must match CMD
@@ -87,27 +75,30 @@ services:
       - ./mount_config/vllm/Ministral-3-3B-Instruct-2512-AWQ-4bit.yaml:/config/config.yaml:Z,ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
     command: [ "--port", "8000", "--config", "/config/config.yaml" ]
-#    restart: unless-stopped
+    restart: unless-stopped
     networks:
       - foil-net
     healthcheck:
       test: [
         "CMD", "python3", "-c",
-        "import urllib.request, os; port = os.getenv('PORT', '8000'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
       ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 3600s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: [ "0" ]
-              capabilities: [ gpu ]
-
+      start_period: 300s
 
 networks:
   foil-net:
     driver: bridge
+
+
+
+# If you need to finely manage ressources (instreead of `gpus: all`)
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              device_ids: [ "0" ]
+#              capabilities: [ gpu ]
