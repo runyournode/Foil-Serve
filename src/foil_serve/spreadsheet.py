@@ -141,7 +141,7 @@ def _df_to_md(df: pd.DataFrame, table_format: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: str = "unknown") -> str:
+def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: str = "unknown") -> tuple[str, int]:
     """Convert all sheets of an Excel / ODS file to Markdown tables.
 
     Reads settings from the global settings singleton:
@@ -155,6 +155,12 @@ def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: st
         table_format: ``"human"`` for aligned columns (standard tabulate pipe),
                       ``"llm"`` for minimal formatting (reduced tokens).
         raw_mime: Detected MIME type, used in artifact directory names.
+
+    Returns:
+        A tuple of (cleaned_markdown, pre_clean_md_bytes) where pre_clean_md_bytes
+        is the UTF-8 size of the markdown *before* error masking and empty stripping.
+        This pre-clean size is used for the sparse-fallback ratio check so that
+        files heavy with NaN/errors are not incorrectly treated as sparse.
     """
     engine = "odf" if path.suffix.lower() == ".ods" else None
     mask_errors = settings.excel_mask_cell_errors
@@ -168,6 +174,7 @@ def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: st
         has_any_errors = False
         txt = ""
         txt_with_errors = ""
+        txt_pre_clean = ""
 
         for sheet_name, df in sheets.items():
             # Convert any remaining float NaN (merged cells, formula errors, etc.)
@@ -200,6 +207,13 @@ def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: st
             sheet_has_errors = df.map(_is_error_cell).any().any()
             has_any_errors = has_any_errors or sheet_has_errors
 
+            # Capture pre-clean Markdown (before error replacement and empty stripping)
+            # Used for sparse-fallback ratio check: a file full of NANs should not be
+            # mistaken for a sparse file just because the cleaned output is small.
+            pre_clean_md = _df_to_md(df, table_format)
+            if pre_clean_md:
+                txt_pre_clean += f"\n## {sheet_name}\n\n{pre_clean_md}\n\n"
+
             # Artifact: render md with short error labels before masking
             if save_artifacts:
                 df_labeled = (
@@ -224,9 +238,13 @@ def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: st
             if md:
                 txt += f"\n## {sheet_name}\n\n{md}\n\n"
 
-        if not txt.strip():
+        # Raise only when the file is truly empty (no cell data at all, before any
+        # cleaning). If pre_clean has content but txt is empty (e.g. all cells were
+        # error values and mask_errors=True zeroed them out), do NOT fall back to PDF —
+        # the PDF would show the same errors and OCR would reproduce them.
+        if not txt_pre_clean.strip():
             raise EmptySpreadsheetError(
-                f"All {len(sheets)} sheet(s) are empty after stripping"
+                f"All {len(sheets)} sheet(s) contain no cell data"
             )
 
         if save_artifacts and has_any_errors:
@@ -247,7 +265,7 @@ def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: st
             f"Error during spreadsheet {path.suffix.lower()} -> MarkDown conversion: {e}"
         )
         raise e
-    return txt
+    return txt, len(txt_pre_clean.encode("utf-8"))
 
 
 def is_encrypted_xls_error(exc: Exception) -> bool:
@@ -260,7 +278,7 @@ def excel2txt(
     table_format: ExcelOutputFormat,
     raw_mime: str,
     lo_server: LibreOfficeServer,
-) -> str:
+) -> tuple[str, int]:
     """Try _excel2txt
     On legacy-encrypted .xls, try convert via LibreOffice and retry (it could be empty password encrypted).
 
@@ -269,6 +287,9 @@ def excel2txt(
         table_format: "human" or "llm".
         raw_mime: Detected MIME extension (.xls, .xlsx, .ods).
         lo_server: LibreOffice server instance for XLS → XLSX conversion.
+
+    Returns:
+        A tuple of (cleaned_markdown, pre_clean_md_bytes). See _excel2txt for details.
     """
     try:
         return _excel2txt(path, table_format=table_format, raw_mime=raw_mime)

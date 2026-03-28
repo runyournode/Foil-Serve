@@ -44,12 +44,12 @@ def _table_blocks(md: str) -> list[str]:
 
 class TestEmptySheets:
     def test_all_empty_raises(self):
-        with pytest.raises(EmptySpreadsheetError, match=r"3 sheet\(s\) are empty"):
+        with pytest.raises(EmptySpreadsheetError, match=r"3 sheet\(s\) contain no cell data"):
             _excel2txt(FIXTURES / "all_sheets_empty.xlsx")
 
     def test_whitespace_only_does_not_raise(self):
         """Cells with whitespace (' ') are not '' — they survive stripping."""
-        md = _excel2txt(FIXTURES / "whitespace_only_rows.xlsx")
+        md, _ = _excel2txt(FIXTURES / "whitespace_only_rows.xlsx")
         assert "Whitespace" in md
 
 
@@ -59,14 +59,14 @@ class TestEmptySheets:
 
 class TestMixedEmpty:
     def test_mixed_returns_data_sheet(self):
-        md = _excel2txt(FIXTURES / "mixed_empty_and_data.xlsx")
+        md, _ = _excel2txt(FIXTURES / "mixed_empty_and_data.xlsx")
         headers = _sheet_headers(md)
         assert "HasData" in headers
         # "Empty" sheet should NOT appear (no content after stripping)
         assert "Empty" not in headers
 
     def test_many_empty_one_tiny(self):
-        md = _excel2txt(FIXTURES / "many_empty_one_tiny.xlsx")
+        md, _ = _excel2txt(FIXTURES / "many_empty_one_tiny.xlsx")
         headers = _sheet_headers(md)
         assert "Tiny" in headers
         # The 9 empty sheets should not produce headers
@@ -80,7 +80,7 @@ class TestMixedEmpty:
 class TestDuplicateEmptyColumns:
     def test_no_crash(self):
         """Must not raise ValueError about ambiguous Series truth value."""
-        md = _excel2txt(FIXTURES / "duplicate_empty_columns.xlsx")
+        md, _ = _excel2txt(FIXTURES / "duplicate_empty_columns.xlsx")
         assert "ID" in md
         assert "Alice" in md
 
@@ -113,7 +113,7 @@ class TestErrorCells:
     def test_all_error_types_masked(self, monkeypatch):
         """With mask=True, error cells become empty strings."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", True)
-        md = _excel2txt(FIXTURES / "all_error_types.xlsx")
+        md, _ = _excel2txt(FIXTURES / "all_error_types.xlsx")
         # No raw error strings or short labels should appear
         for err in ("#REF!", "#N/A", "#VALUE!", "#NAME?", "#DIV/0!", "#NULL!", "#NUM!"):
             assert err not in md
@@ -123,7 +123,7 @@ class TestErrorCells:
     def test_all_error_types_short_labels(self, monkeypatch):
         """With mask=False, error cells get short labels."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", False)
-        md = _excel2txt(FIXTURES / "all_error_types.xlsx")
+        md, _ = _excel2txt(FIXTURES / "all_error_types.xlsx")
         # Raw error strings should not appear
         for err in ("#REF!", "#N/A", "#VALUE!", "#NAME?", "#DIV/0!", "#NULL!", "#NUM!"):
             assert err not in md
@@ -134,13 +134,13 @@ class TestErrorCells:
     def test_error_headers_masked(self, monkeypatch):
         """With mask=True, error column headers become empty strings."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", True)
-        md = _excel2txt(FIXTURES / "all_error_types.xlsx")
+        md, _ = _excel2txt(FIXTURES / "all_error_types.xlsx")
         assert "#REF!" not in md
 
     def test_error_headers_short_labels(self, monkeypatch):
         """With mask=False, error column headers become short labels."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", False)
-        md = _excel2txt(FIXTURES / "all_error_types.xlsx")
+        md, _ = _excel2txt(FIXTURES / "all_error_types.xlsx")
         assert "#REF!" not in md
         # Header is now the short label
         assert "#ref" in md
@@ -151,13 +151,13 @@ class TestErrorCells:
         _rename_error_columns only runs when sheet_has_errors is True (data cells).
         The error_headers fixture has clean data → headers stay as-is.
         """
-        md = _excel2txt(FIXTURES / "error_headers.xlsx")
+        md, _ = _excel2txt(FIXTURES / "error_headers.xlsx")
         assert "Normal" in md
         # Headers keep their original error values (no data errors to trigger rename)
         assert "#REF!" in md
 
     def test_multi_sheet_mixed_errors(self):
-        md = _excel2txt(FIXTURES / "multi_sheet_mixed_errors.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_sheet_mixed_errors.xlsx")
         headers = _sheet_headers(md)
         assert "Clean" in headers
         assert "Broken" in headers
@@ -172,22 +172,25 @@ class TestErrorCells:
 
 class TestNanFlood:
     def test_nan_flood_masked(self, monkeypatch):
-        """500×20 cells of 'nan' → all masked to '', sheets become empty."""
+        """500×20 cells of 'nan' → masked to '' → cleaned md empty, but pre_clean has content.
+        No EmptySpreadsheetError should be raised (file has real structure, PDF fallback would
+        reproduce the same NANs via OCR). The cleaned md is empty; main.py returns 422 instead."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", True)
-        with pytest.raises(EmptySpreadsheetError):
-            _excel2txt(FIXTURES / "nan_flood.xlsx")
+        md, pre_clean_bytes = _excel2txt(FIXTURES / "nan_flood.xlsx")
+        assert not md.strip(), "cleaned md should be empty after masking all NANs"
+        assert pre_clean_bytes > 0, "pre_clean should reflect the NAN-filled content"
 
     def test_nan_flood_short_labels(self, monkeypatch):
         """With mask disabled, 'nan' cells become '#nan' short labels."""
         monkeypatch.setattr(settings, "excel_mask_cell_errors", False)
-        md = _excel2txt(FIXTURES / "nan_flood.xlsx", table_format="llm")
+        md, _ = _excel2txt(FIXTURES / "nan_flood.xlsx", table_format="llm")
         assert "#nan" in md
         # Raw 'nan' string should not appear as-is
         assert "|nan|" not in md
 
     def test_float_nan_from_merged_cells(self):
         """Float NaN (from merged cells, missing formulas) must not leak as 'nan'."""
-        md = _excel2txt(FIXTURES / "float_nan_merged.xlsx")
+        md, _ = _excel2txt(FIXTURES / "float_nan_merged.xlsx")
         assert "nan" not in md.lower()
         assert "Data" in md
 
@@ -198,13 +201,13 @@ class TestNanFlood:
 
 class TestContent:
     def test_single_cell(self):
-        md = _excel2txt(FIXTURES / "single_cell.xlsx")
+        md, _ = _excel2txt(FIXTURES / "single_cell.xlsx")
         assert "lonely value" in md
         tables = _table_blocks(md)
         assert len(tables) == 1
 
     def test_wide_table(self):
-        md = _excel2txt(FIXTURES / "wide_100_columns.xlsx")
+        md, _ = _excel2txt(FIXTURES / "wide_100_columns.xlsx")
         tables = _table_blocks(md)
         assert len(tables) == 1
         # Check a few headers exist
@@ -213,7 +216,7 @@ class TestContent:
 
     def test_multiline_normalized(self):
         """Newlines in cells should be normalized to spaces."""
-        md = _excel2txt(FIXTURES / "multiline_and_special_chars.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multiline_and_special_chars.xlsx")
         # Original cell had "Line1\nLine2\nLine3" → should be flattened
         assert "Line1 Line2 Line3" in md
         # CJK content preserved
@@ -250,17 +253,17 @@ class TestDfToMd:
 
 class TestMultiTableIndependent:
     def test_all_sheets_present(self):
-        md = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
         headers = _sheet_headers(md)
         assert headers == ["Employees", "Products", "Orders"]
 
     def test_all_tables_rendered(self):
-        md = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
         tables = _table_blocks(md)
         assert len(tables) == 3
 
     def test_data_integrity_across_sheets(self):
-        md = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_independent.xlsx")
         # Employees data
         assert "Alice" in md
         assert "Engineering" in md
@@ -278,12 +281,12 @@ class TestMultiTableIndependent:
 
 class TestMultiTableVaryingSizes:
     def test_all_sheets_present(self):
-        md = _excel2txt(FIXTURES / "multi_table_varying_sizes.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_varying_sizes.xlsx")
         headers = _sheet_headers(md)
         assert headers == ["Tiny", "Medium", "Small"]
 
     def test_medium_sheet_row_count(self):
-        md = _excel2txt(FIXTURES / "multi_table_varying_sizes.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_varying_sizes.xlsx")
         # Medium sheet has 50 data rows; check first and last
         assert "item_0" in md
         assert "item_49" in md
@@ -295,14 +298,14 @@ class TestMultiTableVaryingSizes:
 
 class TestMultiTableSpecialNames:
     def test_special_names_preserved(self):
-        md = _excel2txt(FIXTURES / "multi_table_special_names.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_special_names.xlsx")
         headers = _sheet_headers(md)
         assert "Q1 2025 (Jan-Mar)" in headers
         assert "Données & Stats" in headers
         assert "Sheet #3 - Notes" in headers
 
     def test_data_in_special_named_sheets(self):
-        md = _excel2txt(FIXTURES / "multi_table_special_names.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_special_names.xlsx")
         assert "12000" in md
         assert "42.5" in md
 
@@ -313,7 +316,7 @@ class TestMultiTableSpecialNames:
 
 class TestMultiTableOverlappingColumns:
     def test_both_years_present(self):
-        md = _excel2txt(FIXTURES / "multi_table_overlapping_columns.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_overlapping_columns.xlsx")
         headers = _sheet_headers(md)
         assert "2024" in headers
         assert "2025" in headers
@@ -321,7 +324,7 @@ class TestMultiTableOverlappingColumns:
 
     def test_distinct_data_per_sheet(self):
         """Same column names but different data per sheet."""
-        md = _excel2txt(FIXTURES / "multi_table_overlapping_columns.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_overlapping_columns.xlsx")
         # 2024 sheet: Bob fails
         assert "Fail" in md
         # Summary sheet: pass rate
@@ -334,7 +337,7 @@ class TestMultiTableOverlappingColumns:
 
 class TestMultiTableSparse:
     def test_only_data_sheets_appear(self):
-        md = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
         headers = _sheet_headers(md)
         assert "Data1" in headers
         assert "Data2" in headers
@@ -345,13 +348,13 @@ class TestMultiTableSparse:
         assert "EmptyC" not in headers
 
     def test_correct_table_count(self):
-        md = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
         tables = _table_blocks(md)
         assert len(tables) == 3
 
     def test_sheet_order_preserved(self):
         """Data sheets keep their original order despite empty sheets between them."""
-        md = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
+        md, _ = _excel2txt(FIXTURES / "multi_table_sparse.xlsx")
         headers = _sheet_headers(md)
         assert headers == ["Data1", "Data2", "Data3"]
 
@@ -364,7 +367,7 @@ class TestExcel2TxtWrapper:
     def test_delegates_to_internal(self):
         """excel2txt returns the same result as _excel2txt for a normal file."""
         lo_server = MagicMock()
-        md = excel2txt(
+        md, _ = excel2txt(
             FIXTURES / "multi_table_independent.xlsx",
             table_format="llm",
             raw_mime=".xlsx",

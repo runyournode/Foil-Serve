@@ -271,7 +271,7 @@ async def _process_document(
             async with request.app.state.excel_sem:
                 _t = time.perf_counter()
                 try:
-                    md = await asyncio.to_thread(
+                    md, pre_clean_md_bytes = await asyncio.to_thread(
                         excel2txt,
                         path=prepared_path,
                         table_format=settings.excel_output_format,
@@ -314,24 +314,36 @@ async def _process_document(
                         ),
                     )
 
-                # Detect sparse spreadsheets (text boxes / images only, no real cell data)
+                # Detect sparse spreadsheets (text boxes / images only, no real cell data).
+                # Use pre-clean Markdown size (before error masking and empty-row stripping)
+                # so that files heavy with NaN/errors are not incorrectly treated as sparse:
+                # a NaN-filled file has real cell data and should not fall back to PDF+OCR.
                 if (
                     settings.excel_pdf_fallback_enabled
                     and _file_size >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
-                    and md_bytes < _file_size * settings.excel_min_output_ratio
+                    and pre_clean_md_bytes < _file_size * settings.excel_min_output_ratio
                 ):
                     logger.warning(
-                        "Sparse spreadsheet detected: %d bytes markdown from %d bytes input "
+                        "Sparse spreadsheet detected: %d bytes pre-clean markdown from %d bytes input "
                         "(ratio %.4f, threshold %.4f) — falling back to PDF+OCR pipeline",
-                        md_bytes,
+                        pre_clean_md_bytes,
                         _file_size,
-                        md_bytes / _file_size,
+                        pre_clean_md_bytes / _file_size,
                         settings.excel_min_output_ratio,
                     )
                     fallback_to_pdf = True
                     del md
 
             if not fallback_to_pdf:
+                if not md.strip():
+                    # Pre-clean had content (no EmptySpreadsheetError) but cleaning
+                    # erased everything (e.g. all cells were errors and mask_errors=True).
+                    # Falling back to PDF would reproduce the same errors via OCR — return
+                    # 422 instead so the caller knows the file yielded no usable content.
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Spreadsheet produced no content after cell-error masking ({mime})",
+                    )
                 return (
                     md,
                     {},
