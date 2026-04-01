@@ -82,9 +82,15 @@ Support for additional formats is welcome — contributions are open 🙌
 ### Requirements
 
 - NVIDIA GPU with CUDA 13.0 (may work on other devices but untested)
-- Python 3.13
-- [uv](https://github.com/astral-sh/uv) for dependency management
-- System packages (for Ubuntu 22.04):
+
+- **PaddleOCR-VL-1.5** served via an OpenAI-compatible endpoint (vLLM recommended — see `./docker`)
+
+### Option 1 — Native (tested on Ubuntu)
+
+#### Install system dependancies:
+  - Python 3.13 (can be automatically installed by uv )
+- [uv](https://github.com/astral-sh/uv) for python dependency management
+- System packages (for Ubuntu 24.04):
   ```bash
   apt install -y --no-install-recommends \
       libgl1 \
@@ -96,21 +102,21 @@ Support for additional formats is welcome — contributions are open 🙌
       fonts-noto-cjk \
       fonts-wqy-microhei \
       fonts-freefont-ttf
+  # On Ubuntu <= 22.04 use 'libmagic1' instead of 'libmagic1t64'
+  # Not tested on non-Debian based linux.
   ```
-- **PaddleOCR-VL-1.5** served via an OpenAI-compatible endpoint (vLLM recommended — see `./docker`)
-
-### Option 1 — Native (tested on Ubuntu)
-
+#### Install and run the app:
 ```bash
 uv sync --no-dev
+
+# Make sure the user running the app can write to the log/artifact files (defaults are /var/log/foil/)
+# sudo mkdir -p /var/log/foil && sudo chown <user> /var/log/foil
 
 uv run --no-sync src/foil_serve/main.py  # default listening on 0.0.0.0:8081
 # or
 cd src/foil_serve && uv run --no-sync uvicorn main:app --host 0.0.0.0 --port 8081
 
 ```
-
-
 `uvicorn` is included in the project dependencies — no separate installation needed.
 
 ### Option 2 — Docker (air-gapped)
@@ -118,7 +124,7 @@ cd src/foil_serve && uv run --no-sync uvicorn main:app --host 0.0.0.0 --port 808
 A ready-to-use stack (foil-serve + 2× vLLM services) is available in `./docker`.  
 Paddle native models are included in the foil-serve `-offline` image, but you will still need to download the models for the vllm servers (PaddleOCR-VL-1.5 and any model used for image description).  
 
-
+#### Run the docker stack
 ```bash
 cd docker/
 docker compose up -d

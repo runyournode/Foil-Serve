@@ -6,8 +6,9 @@
 # Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
 # (No clearing mechanism — manage disk space manually.)             -
 # -------------------------------------------------------------------
-log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
-log_file = "/var/log/foil/foil.log"
+log_level = "DEBUG"         # DEBUG | INFO | WARNING | ERROR
+libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
+log_file = "/var/log/foil/foil.log"  # Comment to disable logging to file
 
 # Base directory for debug artifacts. Subdirectories are created automatically.
 artifact_dir = "/var/log/foil/artifacts"
