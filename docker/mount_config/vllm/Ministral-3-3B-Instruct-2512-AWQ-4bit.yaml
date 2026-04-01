@@ -11,7 +11,7 @@ max-model-len: 10000
 max-num-batched-tokens: 10000
 #enable-auto-tool-choice: True
 
-gpu-memory-utilization: 0.65
+gpu-memory-utilization: 0.45
 
 
 

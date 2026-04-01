@@ -184,6 +184,7 @@ class AsyncOpenAIWithInfo(AsyncOpenAI):
         temperature: float,
         max_output_tokens: int,
         max_input_ocr_length: int,
+        extra_body: dict | None,
         *args,
         **kwargs,
     ) -> None:
@@ -192,6 +193,7 @@ class AsyncOpenAIWithInfo(AsyncOpenAI):
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.max_input_ocr_length = max_input_ocr_length
+        self.extra_body = extra_body
         super().__init__(*args, **kwargs)
 
 
@@ -213,6 +215,7 @@ def get_vlm_client(model_name: str) -> AsyncOpenAIWithInfo:
         temperature=cfg.temperature,
         max_output_tokens=cfg.max_output_tokens,
         max_input_ocr_length=cfg.max_input_ocr_length,
+        extra_body=cfg.extra_body,
         api_key=cfg.endpoint_api_key,
         base_url=str(cfg.url),
     )

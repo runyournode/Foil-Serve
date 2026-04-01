@@ -152,6 +152,7 @@ max_input_ocr_length = 700      # max chars of OCR text injected into the VLM pr
 min_size = [64, 64]             # minimum image dimensions to process (pixels)
 max_concurrent_requests = 10
 prompt = "default"              # key from [prompts] section or a direct prompt string
+extra_body = {chat_template_kwargs = {enable_thinking = false}} # optional extra body parameter (e.g. disable thinking on vllm)
 ```
 
 ### OCR output control (`server_config.toml`)

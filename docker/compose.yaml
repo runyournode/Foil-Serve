@@ -35,8 +35,8 @@ services:
     ipc: host
     expose:
       - "8000"
-#    ports:  # dev only
-#      - "8082:8000"
+    ports:  # dev only
+      - "8088:8000"
     networks:
       - foil-net
     environment:

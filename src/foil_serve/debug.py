@@ -203,7 +203,7 @@ def save_cell_error_artifacts(
     input_path: Path,
     md_with_errors: str,
     md_final: str | None,
-    artifacts_dir: str,
+    artifacts_dir: Path,
     raw_mime: str = "unknown",
 ) -> None:
     """Save debug artifacts when spreadsheet cell errors are detected.
@@ -228,7 +228,7 @@ def save_cell_error_artifacts(
 def save_table_conversion_artifacts(
     input_path: Path,
     pdf_path: Path,
-    artifacts_dir: str,
+    artifacts_dir: Path,
     raw_mime: str = "unknown",
 ) -> None:
     """

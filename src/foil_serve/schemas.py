@@ -17,6 +17,7 @@ class VLMModelConfig(BaseModel):
     max_input_ocr_length: int = (
         700  # Max chars of OCR text injected into the VLM prompt
     )
+    extra_body: dict | None = None  # Provider-specific extra parameters passed as-is to the API call (e.g thinking level)
 
 
 class Metadata(BaseModel):

@@ -177,6 +177,11 @@ max_concurrent_excel = 5
 # endpoint_api_key = <Optional api key | None>
 # endpoint_name = <exact model name to pass to the openai endpoint">
 # prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
+# extra_body = <Optional provider-specific parameters forwarded as-is to the API call | unset>
+#   Examples:
+#     vLLM / Qwen3 thinking:      extra_body = {chat_template_kwargs = {enable_thinking = true}}
+#     OpenRouter thinking:         extra_body = {reasoning = {effort = "high"}}
+#     OpenAI o-series (workaround): extra_body = {reasoning_effort = "high"}  # prefer top-level if supported
 
 [[vlm_models]]
 enabled = false
@@ -191,6 +196,19 @@ endpoint_name = "mistralai/ministral-3-3b"
 endpoint_api_key = 'changeme'
 prompt = "default"
 
+[[vlm_models]]
+enabled = false
+max_concurrent_requests = 20
+name = "qwen3.5-27b"
+min_size = [64, 64]
+temperature = 0.0
+max_output_tokens = 4000
+max_input_ocr_length = 700
+url = "http://192.168.1.10:1234/v1"
+endpoint_name = "Qwen3/Qwen3.5-27B"
+endpoint_api_key = 'changeme'
+prompt = "default"
+extra_body = {chat_template_kwargs = {enable_thinking = false}}
 
 [[vlm_models]]
 enabled = false

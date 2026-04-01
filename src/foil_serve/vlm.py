@@ -62,6 +62,7 @@ async def describe_image(
             messages=[message],
             temperature=client.temperature,
             max_completion_tokens=client.max_output_tokens,
+            extra_body=client.extra_body,
         )
 
         description = response.choices[0].message.content
