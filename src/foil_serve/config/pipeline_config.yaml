@@ -67,7 +67,7 @@ SubModules:
 #      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
       backend: vllm-server
       max_concurrency: 256 # added to mitigate `RuntimeError: Exception from the 'vlm' worker: Error code: 400 - {'error': {'message': 'Already borrowed', 'type': 'BadRequestError', 'param': None, 'code': 400}}`
-      server_url: http://localhost:8088/v1  # en localhost
+      server_url: http://localhost:8000/v1  # en localhost
 #      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # pour docker
 
 SubPipelines:

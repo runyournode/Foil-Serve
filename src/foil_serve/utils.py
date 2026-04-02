@@ -81,7 +81,7 @@ mime_def: dict[str, MimeExt | None] = {
     "text/csv": ".csv",
     "text/xml": ".xml",
     "application/xml": ".xml",
-    # "application/html": ".html",  # not implemented
+    # "application/html" "text/html": ".html",  # not implemented
     # Empty file
     "inode/x-empty": None,
 }
@@ -376,7 +376,7 @@ def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt
     if raw_mime == "application/octet-stream":
         raw_mime = _detect_ooxml(input_file) or raw_mime
 
-    if raw_mime == "application/html":
+    if raw_mime in ["application/html", "text/html"]:
         raw_mime = _detect_md(input_file) or raw_mime
 
     mime = mime_def.get(raw_mime)
