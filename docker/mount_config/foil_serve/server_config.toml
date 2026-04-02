@@ -47,7 +47,7 @@ app_api_keys = [
 
 # Check if all vlm_models declared below are properly reachable on server start-up.
 # If any VLM is not reachable, server will not start
-check_vlm_endpoints = false
+check_vlm_endpoints = true
 
 # Maximum accepted file size in MB, checked BEFORE writing to disk.
 # Applies to all file types.
@@ -179,13 +179,13 @@ max_concurrent_excel = 5
 # prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
 
 [[vlm_models]]
-enabled = false
+enabled = true
 max_concurrent_requests = 20
 name = "ministral-3-3b"
 temperature = 0.0
 max_output_tokens = 5000
-url = "http://paddle_vllm-ministral-3-3b:8000/v1"
-endpoint_name = "ministral-3-3b"
+url = "http://foil_vllm-ministral-3-3b:8000/v1"
+endpoint_name = "mistralai/ministral-3-3b"
 endpoint_api_key = 'none'
 prompt = "default"
 
