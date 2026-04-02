@@ -1,6 +1,7 @@
 import io
 import base64
 import logging
+import re
 import tarfile
 import zipfile
 from pathlib import Path
@@ -48,6 +49,7 @@ MimeExt = Literal[
     ".json",
     ".csv",
     ".xml",
+    ".md",
 ]
 
 # Maps MIME type strings to file extensions.
@@ -74,10 +76,12 @@ mime_def: dict[str, MimeExt | None] = {
     "image/tiff": ".tiff",
     # Plain text — returned as-is without pipeline
     "text/plain": ".txt",
+    "text/markdown": ".md",
     "application/json": ".json",
     "text/csv": ".csv",
     "text/xml": ".xml",
     "application/xml": ".xml",
+    # "application/html": ".html",  # not implemented
     # Empty file
     "inode/x-empty": None,
 }
@@ -290,6 +294,70 @@ def _detect_ooxml(path: Path) -> str | None:
     return None
 
 
+
+
+def _detect_md(path: Path) -> str | None:
+    """
+    Distinguish Markdown files containing HTML tables from real HTML pages.
+
+    Some OCR/conversion backends produce Markdown with embedded HTML tables
+    which libmagic misdetects as 'application/html'. This function returns
+    'text/markdown' if the file looks like Markdown, or None to leave the
+    MIME type unchanged.
+    """
+    # Patterns for _detect_md
+    # <!DOCTYPE html> is always within the first bytes of a conforming HTML document.
+    _HTML_DOCTYPE_RE = re.compile(r"<!DOCTYPE\s+html", re.IGNORECASE)
+    # Individual root HTML tags
+    _HTML_ROOT_TAGS = [
+        re.compile(r"<html[\s>]", re.IGNORECASE),
+        re.compile(r"<head[\s>]", re.IGNORECASE),
+        re.compile(r"<body[\s>]", re.IGNORECASE),
+    ]
+    # Markdown structural elements unlikely to appear in plain HTML prose.
+    _MD_STRUCTURE_RE = re.compile(
+        r"^#{1,6}\s+\S"  # ATX headers:    # Title
+        r"|^[ \t]*[*+-]\s+\S"  # Unordered list: - item
+        r"|^[ \t]*\d+\.\s+\S"  # Ordered list:   1. item
+        r"|!?\[[^\]]+\]\([^)]+\)",  # Links/images:   [text](url)  ![alt](url)
+        re.MULTILINE,
+    )
+    # Fenced code blocks — stripped before MD analysis to avoid false positives
+    # when a document contains HTML snippets inside ``` blocks.
+    _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+    try:
+        # read_text_smart handles encoding detection (UTF-8, chardet, fallbacks).
+        # Analyse up to 512 KB — robust against documents with lengthy prose
+        # before their first structural marker. Safe if file is smaller: str
+        # slicing beyond length simply returns the full string.
+        sample = read_text_smart(path)[:524288]
+    except (OSError, ValueError):
+        return None
+
+    # Strip fenced code blocks first so that HTML snippets inside ``` blocks
+    # (e.g. tutorials, comments) do not interfere with either check below.
+    sample_no_code = _CODE_FENCE_RE.sub("", sample)
+
+    # Hard rule: real HTML document markers outside of code blocks always win.
+    # <!DOCTYPE html> is always at the very start of a real HTML document.
+    # For root tags (<html>, <head>, <body>), we require at least two to be
+    # present: each can appear individually in Markdown prose, but their
+    # co-occurrence strongly indicates a real HTML page.
+    is_html_page = _HTML_DOCTYPE_RE.search(sample_no_code[:1024]) or (
+        sum(bool(p.search(sample_no_code)) for p in _HTML_ROOT_TAGS) >= 2
+    )
+    if is_html_page:
+        return None
+
+    # Any Markdown structural element → treat as Markdown.
+    if _MD_STRUCTURE_RE.search(sample_no_code):
+        return "text/markdown"
+
+    return None
+
+
 def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt, str]:
     """
     Write file content to tmpdir, detect MIME type, rename with proper extension.
@@ -307,6 +375,9 @@ def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt
     # to resolve the actual OOXML variant.
     if raw_mime == "application/octet-stream":
         raw_mime = _detect_ooxml(input_file) or raw_mime
+
+    if raw_mime == "application/html":
+        raw_mime = _detect_md(input_file) or raw_mime
 
     mime = mime_def.get(raw_mime)
     if mime is None:

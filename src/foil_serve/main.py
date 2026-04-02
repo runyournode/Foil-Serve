@@ -233,7 +233,7 @@ async def _process_document(
                         path=prepared_path,
                         max_bytes=settings.max_unzip_size_mb * 1024**2,
                     )
-            elif mime in (".txt", ".json", ".csv", ".xml"):
+            elif mime in (".txt", ".json", ".csv", ".xml", ".md"):
                 pass
             else:
                 raise NotImplementedError(
@@ -244,7 +244,7 @@ async def _process_document(
             raise HTTPException(status_code=413, detail=str(e))
 
         # Short-circuit: plain text — no pipeline needed
-        if mime in (".txt", ".json", ".csv", ".xml"):
+        if mime in (".txt", ".json", ".csv", ".xml", ".md"):
             _t = time.perf_counter()
             md = await asyncio.to_thread(read_text_smart, path=prepared_path)
             t_active += time.perf_counter() - _t
