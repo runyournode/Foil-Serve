@@ -40,7 +40,8 @@ from debug import ArtifactContext, save_table_conversion_artifacts
 from libreoffice import LibreOfficeServer, convert_to_pdf
 from pipeline import PaddlePipelineWrapper
 from vlm import describe_image_sem
-from postprocessing import extract_raw_ocr, prune_tables, reformat_md
+from postprocessing import extract_raw_ocr, reformat_md
+from table_utils import prune_tables
 from security import verify_api_key
 from settings import validate_endpoint, settings, vlm_registry, AsyncOpenAIWithInfo, setup_logging, align_uvicorn_logging
 
@@ -274,7 +275,7 @@ async def _process_document(
                     md, pre_clean_md_bytes = await asyncio.to_thread(
                         excel2txt,
                         path=prepared_path,
-                        table_format=settings.excel_output_format,
+                        table_format=settings.table_output_format,
                         raw_mime=mime,
                         lo_server=request.app.state.libreoffice_server,
                     )
@@ -455,11 +456,11 @@ async def _process_document(
         if need_image_ocr:
             ocrs, md_full = await asyncio.gather(
                 asyncio.to_thread(extract_raw_ocr, md_with_html=md_raw),
-                asyncio.to_thread(prune_tables, md_with_html=md_raw),
+                asyncio.to_thread(prune_tables, md_with_html=md_raw, table_format=settings.table_output_format),
             )
         else:
             ocrs: dict[str, str] = {}
-            md_full = await asyncio.to_thread(prune_tables, md_with_html=md_raw)
+            md_full = await asyncio.to_thread(prune_tables, md_with_html=md_raw, table_format=settings.table_output_format)
     except Exception as e:
         if artifact_ctx is not None:
             await artifact_ctx.save(e, t_active=t_active)
@@ -541,7 +542,7 @@ async def _process_document(
     )
     t_active += time.perf_counter() - _t
 
-    # Guard: never return empty markdown — pipeline produced nothing useful
+    # Guard: never return empty Markdown — pipeline produced nothing useful
     if not md_full.strip():
         raise HTTPException(
             status_code=422,

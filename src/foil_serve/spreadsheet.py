@@ -14,7 +14,8 @@ from xlrd.biffh import XLRDError
 
 from libreoffice import LibreOfficeServer
 
-from settings import ExcelOutputFormat, settings
+from settings import TableOutputFormat, settings
+from table_utils import _compact_table
 from debug import save_cell_error_artifacts
 
 logger = logging.getLogger(__name__)
@@ -56,27 +57,6 @@ _ERROR_TO_EMPTY: dict[str, str] = {k: "" for k in _ERROR_TO_SHORT}
 # ---------------------------------------------------------------------------
 #  Internal helpers
 # ---------------------------------------------------------------------------
-
-_SEPARATOR_RE = re.compile(r"\|[-:\s]+(?:\|[-:\s]+)*\|")
-
-
-def _compact_table(table: str) -> str:
-    """Reduce a tabulate pipe table to minimal tokens for LLM consumption.
-
-    - Strip padding spaces inside cells: ``| value  |`` → ``|value|``
-    - Shorten separator lines: ``|:------|:------|`` → ``|---|---|``
-    """
-    lines: list[str] = []
-    for line in table.splitlines():
-        if _SEPARATOR_RE.fullmatch(line.strip()):
-            n_cols = line.count("|") - 1
-            lines.append("|" + "|".join(["---"] * n_cols) + "|")
-        else:
-            parts = line.split("|")
-            parts = [p.strip() for p in parts]
-            lines.append("|".join(parts))
-    return "\n".join(lines)
-
 
 def _is_error_cell(val: object) -> bool:
     """True if a cell value is an Excel error or stringified NaN."""
@@ -141,7 +121,7 @@ def _df_to_md(df: pd.DataFrame, table_format: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _excel2txt(path: Path, table_format: ExcelOutputFormat = "llm", raw_mime: str = "unknown") -> tuple[str, int]:
+def _excel2txt(path: Path, table_format: TableOutputFormat = "llm", raw_mime: str = "unknown") -> tuple[str, int]:
     """Convert all sheets of an Excel / ODS file to Markdown tables.
 
     Reads settings from the global settings singleton:
@@ -275,7 +255,7 @@ def is_encrypted_xls_error(exc: Exception) -> bool:
 
 def excel2txt(
     path: Path,
-    table_format: ExcelOutputFormat,
+    table_format: TableOutputFormat,
     raw_mime: str,
     lo_server: LibreOfficeServer,
 ) -> tuple[str, int]:

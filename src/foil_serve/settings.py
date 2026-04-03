@@ -12,7 +12,8 @@ from openai import AsyncOpenAI
 from schemas import VLMModelConfig
 
 
-ExcelOutputFormat = Literal["human", "llm"]
+# Controls rendering format for all pure-MD tables (Excel sheets and HTML tables from the OCR pipeline).
+TableOutputFormat = Literal["human", "llm"]
 PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]
 
 
@@ -47,7 +48,7 @@ class Settings(BaseSettings):
     output_paddle_ocr_no_img_desc: bool
 
     # Spreadsheet processing
-    excel_output_format: ExcelOutputFormat
+    table_output_format: TableOutputFormat
     excel_mask_cell_errors: bool
     save_cell_error_artifacts: bool = False
     cell_error_artifacts_subdir: str = "cell_errors"

@@ -11,22 +11,30 @@
 ### 🖼️ External VLM image description
 Extracted figures can be described by any OpenAI-compatible VLM of your choice. The description is injected directly into the Markdown inside a proper `<figcaption>` tag, keeping the output clean and semantically structured.
 
-### 📊 HTML table simplification
-PaddleOCR outputs verbose HTML tables. foil-serve strips redundant formatting attributes and flattens the structure — reducing token count by 3–5 × without losing semantic content. This matters when feeding documents into a RAG pipeline or an LLM with limited context.
+### 📊 HTML table simplification and Markdown conversion
+PaddleOCR outputs verbose HTML tables. foil-serve post-processes each table in two steps:
+
+1. **Clean** — strip redundant formatting attributes and normalize whitespace (3–5× token reduction).
+2. **Convert to Markdown** — if the table structure is simple enough (no merged cells, no nested tables, no multi-level header, consistent column count), it is rendered as a plain Markdown pipe table. Complex tables that cannot be represented without semantic loss stay as cleaned HTML.
+
+The output format for Markdown tables is controlled by `table_output_format` in `server_config.toml` (`"llm"` compact or `"human"` aligned — same setting as for spreadsheet tables).
 
 ### 📁 Extended input format support
 
 | Format | Conversion | Post-processing |
 |---|---|---|
-| `.txt`, `.json`, `.csv`, `.xml` | Pass-through (smart encoding detection) | — |
-| `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML table simplification, optional VLM image description |
-| `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
-| `.xls`, `.xlsx`, `.ods` | Pandas → LLM-optimized Markdown tables (optional fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
-| `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML table simplification, optional VLM image description |
+| `.txt`, `.json`, `.csv`, `.xml`, `.md` | Pass-through (smart encoding detection) | — |
+| `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML tables → Markdown or simplified HTML, optional VLM image description |
+| `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
+| `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables (optional fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
+| `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
+
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
 
-**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled.
+**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled. The Markdown table format (`table_output_format`: `"llm"` compact or `"human"` aligned) applies to both spreadsheet tables and HTML tables converted from the OCR pipeline.
+
+**Markdown files with HTML tables:** some Markdown files (e.g. outputs from other conversion tools) contain embedded HTML tables and are misdetected as `text/html` by libmagic. foil-serve applies a heuristic (`_detect_md`) to distinguish these from real HTML pages: if no HTML document root markers (`<!DOCTYPE html>`, `<html>`, `<head>`, `<body>`) are found but Markdown structural elements are present (headings, lists, links), the file is treated as Markdown and passed through unchanged. Real HTML pages remain unsupported and are rejected with HTTP 422.
 
 **OOXML detection fallback:** some `.docx`, `.xlsx`, and `.pptx` files are misidentified as `application/octet-stream` by libmagic. foil-serve inspects the ZIP structure (`[Content_Types].xml`) to resolve the actual OOXML type automatically.
 

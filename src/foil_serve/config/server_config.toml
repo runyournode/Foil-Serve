@@ -77,10 +77,10 @@ max_unzip_size_mb = 2048
 # Spreadsheet processing                                            -
 # -------------------------------------------------------------------
 
-# Table format for Excel/ODS → Markdown conversion.
+# Table format for all pure-MD table rendering (Excel/ODS sheets and HTML tables from the OCR pipeline).
 # "llm" (default): minimal formatting, reduced tokens (no padding, short separators)
 # "human": aligned columns, full separators (standard tabulate "pipe" format)
-excel_output_format = "llm"
+table_output_format = "llm"
 
 # How to handle Excel cell errors (#REF!, #N/A, #VALUE!, #NAME?, #DIV/0!, #NULL!, #NUM!, nan).
 # true (default): error cells become empty strings before rendering.
