@@ -30,6 +30,11 @@ dev = [
   "pytest>=9.0.2",
 ]
 
+[tool.uv]
+constraint-dependencies = [
+    "starlette>=1.0.1",  # CVE-2026-48710 (pulled by FastAPI)
+]
+
 [tool.uv.sources]
 paddlepaddle-gpu = { index = "paddle-cu130" }
 #paddlepaddle = { index = "paddle-cpu" }
