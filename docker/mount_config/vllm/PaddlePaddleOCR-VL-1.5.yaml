@@ -6,7 +6,7 @@ trust-remote-code: True  # keep true even if vllm says it's ignored
 #max-num-batched-tokens: 16384  # default
 
 # ---non default - dev-only---
-limit_mm_per_prompt: {modality: 1}
+limit_mm_per_prompt: {image: 1}
 max_num_seqs : 10
 # max_waiting_queue_length: xx  # not implemented/released yet
 
@@ -16,4 +16,4 @@ max-model-len: 16384
 
 no-enable-prefix-caching: True
 mm-processor-cache-gb: 0
-gpu-memory-utilization: 0.25
+gpu-memory-utilization: 0.35

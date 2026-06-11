@@ -51,7 +51,7 @@ check_vlm_endpoints = false
 
 # Maximum accepted file size in MB, checked BEFORE writing to disk.
 # Applies to all file types.
-max_file_size_mb = 200
+max_file_size_mb = 250
 
 # Per-type size limits (checked after MIME detection).
 # Each is independent from max_file_size_mb; both are enforced.
@@ -310,7 +310,7 @@ prompt = "default"
 # check_on_startup = <Optional check the processor /health at server start-up; server will not start on failure | false>
 
 [[external_processors]]
-enabled = false
+enabled = true
 name = "video"
 url = "http://localhost:8090"
 endpoint_api_key = "changeme"

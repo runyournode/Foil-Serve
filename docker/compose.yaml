@@ -32,14 +32,14 @@ services:
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
-    image: docker.io/vllm/vllm-openai:v0.18.0-cu130
+    image: docker.io/vllm/vllm-openai:v0.22.1
     container_name: foil_vllm-PaddleOCR-VL-1.5
     gpus: all
     ipc: host
     expose:
       - "8000"
     ports:  # dev only
-      - "8088:8000"
+      - "8000:8000"
     networks:
       - foil-net
     environment:
@@ -48,6 +48,7 @@ services:
     volumes:
       - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
     command: ["--port", "8000", "--config", "/config/config.yaml"]
     restart: unless-stopped
     healthcheck:
@@ -63,7 +64,7 @@ services:
 
   # Soft Req : mistralai/ministral-3-3b
   foil_vllm-ministral-3-3b:
-    image: docker.io/vllm/vllm-openai:v0.18.0-cu130
+    image: docker.io/vllm/vllm-openai:v0.22.1
     container_name: foil_vllm-ministral-3-3b
     ipc: host
     gpus: all
@@ -79,6 +80,7 @@ services:
     volumes:
       - ./mount_config/vllm/Ministral-3-3B-Instruct-2512-AWQ-4bit.yaml:/config/config.yaml:Z,ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
     command: [ "--port", "8000", "--config", "/config/config.yaml" ]
     restart: unless-stopped
     healthcheck:

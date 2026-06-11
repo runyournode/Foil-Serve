@@ -3,19 +3,19 @@ pipeline_name: PaddleOCR-VL-1.5
 
 batch_size: 1  # adapt to vram
 
-use_queues: True  # à conserver pour un traitement async
+use_queues: True  # keep for async processing
 
 
-use_ocr_for_image_block: True  # Ajoute un ocr basique en plus dans les images
+use_ocr_for_image_block: True  # Adds basic OCR in addition to images
 
 use_doc_preprocessor: True
 use_layout_detection: True
-use_chart_recognition: False  # garder False : l'analyse de paddle n'est pas parfaite, et empêche d'extraire l'image (donc pas img descr par vlm)
+use_chart_recognition: False  # keep False: paddle analysis is not perfect, and prevents image extraction (so no img descr by vlm)
 use_seal_recognition: False
 format_block_content: False
-merge_layout_blocks: True  # a priori permet de rassembler les header, footer sans duplication de texte
+merge_layout_blocks: True  # seems to merge header, footer without text duplication
 markdown_ignore_labels:
-  - number  # num de page (a priori)
+  - number  # page number (presumably)
 #  - footnote
 #  - header
 #  - header_image
@@ -67,15 +67,15 @@ SubModules:
 #      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
       backend: vllm-server
       max_concurrency: 256 # added to mitigate `RuntimeError: Exception from the 'vlm' worker: Error code: 400 - {'error': {'message': 'Already borrowed', 'type': 'BadRequestError', 'param': None, 'code': 400}}`
-      server_url: http://localhost:8000/v1  # en localhost
-#      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # pour docker
+      server_url: http://localhost:8000/v1  # on localhost
+#      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # if vlm in docker
 
 SubPipelines:
   DocPreprocessor:
     pipeline_name: doc_preprocessor
     batch_size: 8
     use_doc_orientation_classify: True
-    use_doc_unwarping: False  # default = True (mais déforme trop et crop les images)
+    use_doc_unwarping: False  # default = True (but distorts too much and crops images)
     SubModules:
       DocOrientationClassify:
         module_name: doc_text_orientation

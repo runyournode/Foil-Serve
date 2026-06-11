@@ -99,13 +99,13 @@ POST /v1/process or /v1/process/download (file upload)
 
 **`src/foil_serve/schemas.py`** — Pydantic models: `ProcessedDocument`, `Metadata` (API response), `VLMModelConfig` (internal config). See *Gateway Integration* for the `Metadata` contract.
 
-**`src/foil_serve/settings.py`** — TOML config loader (Pydantic v2), dynamic VLM registry, `AsyncOpenAIWithInfo` (OpenAI client extended with model metadata), `validate_endpoint()` FastAPI dependency. Defines `ExcelOutputFormat = Literal["human", "llm"]` and `PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]`.
+**`src/foil_serve/settings.py`** — TOML config loader (Pydantic v2), dynamic VLM registry, `AsyncOpenAIWithInfo` (OpenAI client extended with model metadata), `validate_endpoint()` FastAPI dependency. Defines `TableOutputFormat = Literal["human", "llm"]` and `PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]`.
 
 **`src/foil_serve/config/server_config.toml`** — Runtime configuration: API keys, VLM model definitions, prompts, pipeline reload settings, spreadsheet processing options (output format, error handling, PDF fallback), artifact saving, OCR output control, concurrency limits.
 
 **`src/foil_serve/config/pipeline_config.yaml`** — PaddleOCR-VL-1.5 pipeline config (batch sizes, thresholds, vLLM URL).
 
-**`docker/compose.yaml`** — 3 services: `paddle_app` (port 8081), vLLM for PaddleOCR-VL-1.5 (port 8088), vLLM for Ministral-3B (port 8089).
+**`docker/compose.yaml`** — 3 services: `foil_app` (port 8081), vLLM for PaddleOCR-VL-1.5 (port 8088, dev only), vLLM for Ministral-3-3B (internal to the docker network, no published port).
 
 ### Memory Management Strategy
 PaddleOCR is not thread-safe and leaks GPU/CPU memory. The current solution:
@@ -138,7 +138,7 @@ VLM endpoints are defined in `server_config.toml` under `[[vlm_models]]`. Each m
 
 ### Spreadsheet Configuration
 Key settings in `server_config.toml`:
-- `excel_output_format`: `"human"` (aligned tables) or `"llm"` (compact, minimal formatting)
+- `table_output_format`: `"human"` (aligned tables) or `"llm"` (compact, minimal formatting) — applies to all pure-MD table rendering (Excel/ODS sheets and HTML tables from the OCR pipeline)
 - `excel_mask_cell_errors`: mask error cells (#REF!, #N/A, etc.) with empty string (true) or label (false)
 - `excel_pdf_fallback_enabled`: fall back to PDF+OCR for empty or sparse spreadsheets
 - `excel_min_input_for_fallback_mb`: minimum file size to trigger sparse fallback check
