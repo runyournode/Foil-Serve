@@ -1,0 +1,60 @@
+name: GitHub Release
+
+# Runs on the same tag push that triggers the Docker and PyPI workflows,
+# and creates the GitHub release associated with that tag.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to create releases
+
+    steps:
+      # Full history is needed so release notes can diff against the previous tag
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # GitHub's --generate-notes only lists merged PRs; commits pushed directly
+      # to main would produce empty notes. Build a commit-based changelog instead,
+      # covering everything since the previous tag (or the full history for the
+      # first tag).
+      - name: Build release notes from commit log
+        run: |
+          prev_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [[ -n "$prev_tag" ]]; then
+            range="$prev_tag..$GITHUB_REF_NAME"
+          else
+            range="$GITHUB_REF_NAME"
+          fi
+          {
+            echo "## Commits"
+            echo
+            git log --no-merges --pretty=format:"- %s (%h)" "$range"
+            echo
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --verify-tag: fail instead of silently creating a new tag if it doesn't exist
+          # --generate-notes is kept on top of --notes-file: GitHub appends the
+          # "Full Changelog" compare link (and merged PRs, if any) after our notes
+          # Tags with a pre-release suffix (e.g. v0.2.0-rc1) are marked as pre-release
+          prerelease_flag=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --notes-file release-notes.md \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            $prerelease_flag
