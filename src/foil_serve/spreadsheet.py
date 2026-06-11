@@ -26,6 +26,7 @@ class EmptySpreadsheetError(Exception):
 
     pass
 
+
 # ---------------------------------------------------------------------------
 #  Excel cell error definitions
 # ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ _ERROR_TO_EMPTY: dict[str, str] = {k: "" for k in _ERROR_TO_SHORT}
 # ---------------------------------------------------------------------------
 #  Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_error_cell(val: object) -> bool:
     """True if a cell value is an Excel error or stringified NaN."""
@@ -121,7 +123,9 @@ def _df_to_md(df: pd.DataFrame, table_format: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _excel2txt(path: Path, table_format: TableOutputFormat = "llm", raw_mime: str = "unknown") -> tuple[str, int]:
+def _excel2txt(
+    path: Path, table_format: TableOutputFormat = "llm", raw_mime: str = "unknown"
+) -> tuple[str, int]:
     """Convert all sheets of an Excel / ODS file to Markdown tables.
 
     Reads settings from the global settings singleton:
@@ -232,7 +236,8 @@ def _excel2txt(path: Path, table_format: TableOutputFormat = "llm", raw_mime: st
                 input_path=path,
                 md_with_errors=txt_with_errors,
                 md_final=txt if mask_errors else None,
-                artifacts_dir=Path(settings.artifact_dir) / settings.cell_error_artifacts_subdir,
+                artifacts_dir=Path(settings.artifact_dir)
+                / settings.cell_error_artifacts_subdir,
                 raw_mime=raw_mime,
             )
 

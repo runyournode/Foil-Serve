@@ -188,6 +188,7 @@ def align_uvicorn_logging(file_handler: logging.FileHandler | None) -> None:
         if file_handler and file_handler not in uv_logger.handlers:
             uv_logger.addHandler(file_handler)
 
+
 # Dynamic loading of vlm config (from .toml) at startup
 vlm_registry: dict[str, VLMModelConfig] = {m.name: m for m in settings.vlm_models}
 

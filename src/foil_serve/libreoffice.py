@@ -24,6 +24,7 @@ PAPER_SIZES: dict[PaperFormat, tuple[int, int]] = {
     "Tabloid": (43180, 27940),
 }
 
+
 class LibreOfficeServer:
     """
     Manages a persistent LibreOffice UNO server for Office-to-PDF conversion.

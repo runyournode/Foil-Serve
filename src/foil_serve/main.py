@@ -50,7 +50,15 @@ from vlm import describe_image_sem
 from postprocessing import extract_raw_ocr, reformat_md
 from table_utils import prune_tables
 from security import verify_api_key
-from settings import validate_endpoint, settings, vlm_registry, external_registry, AsyncOpenAIWithInfo, setup_logging, align_uvicorn_logging
+from settings import (
+    validate_endpoint,
+    settings,
+    vlm_registry,
+    external_registry,
+    AsyncOpenAIWithInfo,
+    setup_logging,
+    align_uvicorn_logging,
+)
 from utils import is_native_mime_ext, mime_def
 
 
@@ -161,7 +169,7 @@ app = FastAPIOffline(
 <div align="center">
   <h3>Document → Markdown conversion server, built on PaddleOCR — with meaningful extras.</h3>
   <p><b>Supported formats:</b> {" : ".join(x.split(".")[1].upper() for x in MimeExt.__args__)}</p>
-  {f'<p><b>External formats:</b> {" : ".join(sorted(set(ext.lstrip(".").upper() for ext in _EXTERNAL_MIME_EXT.values())))} (delegated to external processors)</p>' if _EXTERNAL_MIME_EXT else ""}
+  {f"<p><b>External formats:</b> {' : '.join(sorted(set(ext.lstrip('.').upper() for ext in _EXTERNAL_MIME_EXT.values())))} (delegated to external processors)</p>" if _EXTERNAL_MIME_EXT else ""}
   <p><b>Extras:</b></p>
   <p>
     - Extracted figures can be described by any OpenAI-compatible VLM — description injected as &lt;figcaption&gt; in the Markdown output.<br>
@@ -197,7 +205,8 @@ async def _process_document(
     """
     artifact_ctx = (
         ArtifactContext(
-            artifacts_dir=Path(settings.artifact_dir) / settings.failed_artifacts_subdir,
+            artifacts_dir=Path(settings.artifact_dir)
+            / settings.failed_artifacts_subdir,
             t0_wall=t0_wall,
             image_description_model_name=image_description_model_name,
         )
@@ -216,7 +225,9 @@ async def _process_document(
         raise HTTPException(status_code=413, detail=str(e))
 
     timestamp = datetime.now().strftime("%m-%d_%H-%M")
-    with tempfile.TemporaryDirectory(prefix=f"foil-serve_{timestamp}_", dir=settings.temp_dir) as tmpdir_str:
+    with tempfile.TemporaryDirectory(
+        prefix=f"foil-serve_{timestamp}_", dir=settings.temp_dir
+    ) as tmpdir_str:
         tmpdir = Path(tmpdir_str)
 
         # ── Phase 1 : write file + detect MIME (thread, fast) ────────────────
@@ -418,8 +429,10 @@ async def _process_document(
                 # a NaN-filled file has real cell data and should not fall back to PDF+OCR.
                 if (
                     settings.excel_pdf_fallback_enabled
-                    and _file_size >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
-                    and pre_clean_md_bytes < _file_size * settings.excel_min_output_ratio
+                    and _file_size
+                    >= settings.excel_min_input_for_fallback_mb * 1024 * 1024
+                    and pre_clean_md_bytes
+                    < _file_size * settings.excel_min_output_ratio
                 ):
                     logger.warning(
                         "Sparse spreadsheet detected: %d bytes pre-clean markdown from %d bytes input "
@@ -493,7 +506,9 @@ async def _process_document(
                         file_path=prepared_path,
                         mime=mime,
                         lo_server=lo_server,
-                        paper_format=settings.excel_pdf_paper_format if fallback_to_pdf else None,
+                        paper_format=settings.excel_pdf_paper_format
+                        if fallback_to_pdf
+                        else None,
                     )
                 except Exception as e:
                     if artifact_ctx is not None:
@@ -510,7 +525,8 @@ async def _process_document(
                     save_table_conversion_artifacts,
                     input_path=prepared_path,
                     pdf_path=pipeline_input,
-                    artifacts_dir=Path(settings.artifact_dir) / settings.table_conversion_artifacts_subdir,
+                    artifacts_dir=Path(settings.artifact_dir)
+                    / settings.table_conversion_artifacts_subdir,
                     raw_mime=mime,
                 )
         else:
@@ -553,11 +569,19 @@ async def _process_document(
         if need_image_ocr:
             ocrs, md_full = await asyncio.gather(
                 asyncio.to_thread(extract_raw_ocr, md_with_html=md_raw),
-                asyncio.to_thread(prune_tables, md_with_html=md_raw, table_format=settings.table_output_format),
+                asyncio.to_thread(
+                    prune_tables,
+                    md_with_html=md_raw,
+                    table_format=settings.table_output_format,
+                ),
             )
         else:
             ocrs: dict[str, str] = {}
-            md_full = await asyncio.to_thread(prune_tables, md_with_html=md_raw, table_format=settings.table_output_format)
+            md_full = await asyncio.to_thread(
+                prune_tables,
+                md_with_html=md_raw,
+                table_format=settings.table_output_format,
+            )
     except Exception as e:
         if artifact_ctx is not None:
             await artifact_ctx.save(e, t_active=t_active)
@@ -625,9 +649,8 @@ async def _process_document(
 
     # ── Phase 6 : reformat Markdown (inject descriptions + OCR into figures) ──
     # Decide whether to include <ocr> tags in the final output
-    include_ocr = (
-        (has_vlm and settings.output_paddle_ocr)
-        or (not has_vlm and settings.output_paddle_ocr_no_img_desc)
+    include_ocr = (has_vlm and settings.output_paddle_ocr) or (
+        not has_vlm and settings.output_paddle_ocr_no_img_desc
     )
     _t = time.perf_counter()
     md_full = await asyncio.to_thread(
@@ -722,9 +745,7 @@ async def foil_process_md(
         client,
         t0_wall,
     )
-    return ProcessedDocument(
-        page_content=page_content, images={}, metadata=None
-    )
+    return ProcessedDocument(page_content=page_content, images={}, metadata=None)
 
 
 @app.post(

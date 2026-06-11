@@ -7,7 +7,13 @@ import pytest
 
 from unittest.mock import MagicMock
 
-from spreadsheet import _excel2txt, excel2txt, EmptySpreadsheetError, _strip_empty, _df_to_md
+from spreadsheet import (
+    _excel2txt,
+    excel2txt,
+    EmptySpreadsheetError,
+    _strip_empty,
+    _df_to_md,
+)
 from settings import settings
 import pandas as pd
 
@@ -17,6 +23,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # ---------------------------------------------------------------------------
 #  Helper
 # ---------------------------------------------------------------------------
+
 
 def _sheet_headers(md: str) -> list[str]:
     """Extract ## sheet headers from markdown output."""
@@ -42,9 +49,12 @@ def _table_blocks(md: str) -> list[str]:
 #  1. All sheets empty → EmptySpreadsheetError
 # ===================================================================
 
+
 class TestEmptySheets:
     def test_all_empty_raises(self):
-        with pytest.raises(EmptySpreadsheetError, match=r"3 sheet\(s\) contain no cell data"):
+        with pytest.raises(
+            EmptySpreadsheetError, match=r"3 sheet\(s\) contain no cell data"
+        ):
             _excel2txt(FIXTURES / "all_sheets_empty.xlsx")
 
     def test_whitespace_only_does_not_raise(self):
@@ -56,6 +66,7 @@ class TestEmptySheets:
 # ===================================================================
 #  2. Mixed empty + data → should succeed, only non-empty sheets
 # ===================================================================
+
 
 class TestMixedEmpty:
     def test_mixed_returns_data_sheet(self):
@@ -76,6 +87,7 @@ class TestMixedEmpty:
 # ===================================================================
 #  3. Duplicate empty-name columns (iloc bug fix)
 # ===================================================================
+
 
 class TestDuplicateEmptyColumns:
     def test_no_crash(self):
@@ -108,6 +120,7 @@ class TestDuplicateEmptyColumns:
 # ===================================================================
 #  4. Error handling (mask vs short labels)
 # ===================================================================
+
 
 class TestErrorCells:
     def test_all_error_types_masked(self, monkeypatch):
@@ -170,6 +183,7 @@ class TestErrorCells:
 #  5. NaN flood
 # ===================================================================
 
+
 class TestNanFlood:
     def test_nan_flood_masked(self, monkeypatch):
         """500×20 cells of 'nan' → masked to '' → cleaned md empty, but pre_clean has content.
@@ -199,6 +213,7 @@ class TestNanFlood:
 #  6. Content correctness
 # ===================================================================
 
+
 class TestContent:
     def test_single_cell(self):
         md, _ = _excel2txt(FIXTURES / "single_cell.xlsx")
@@ -227,6 +242,7 @@ class TestContent:
 #  7. _df_to_md empty DataFrame
 # ===================================================================
 
+
 class TestDfToMd:
     def test_empty_df_returns_empty_string(self):
         df = pd.DataFrame(columns=["A", "B"])
@@ -250,6 +266,7 @@ class TestDfToMd:
 # ===================================================================
 #  8. Multiple tables (sheets) — independent schemas
 # ===================================================================
+
 
 class TestMultiTableIndependent:
     def test_all_sheets_present(self):
@@ -279,6 +296,7 @@ class TestMultiTableIndependent:
 #  9. Multiple sheets with varying sizes
 # ===================================================================
 
+
 class TestMultiTableVaryingSizes:
     def test_all_sheets_present(self):
         md, _ = _excel2txt(FIXTURES / "multi_table_varying_sizes.xlsx")
@@ -295,6 +313,7 @@ class TestMultiTableVaryingSizes:
 # ===================================================================
 # 10. Sheet names with special characters
 # ===================================================================
+
 
 class TestMultiTableSpecialNames:
     def test_special_names_preserved(self):
@@ -313,6 +332,7 @@ class TestMultiTableSpecialNames:
 # ===================================================================
 # 11. Overlapping column names across sheets
 # ===================================================================
+
 
 class TestMultiTableOverlappingColumns:
     def test_both_years_present(self):
@@ -334,6 +354,7 @@ class TestMultiTableOverlappingColumns:
 # ===================================================================
 # 12. Sparse multi-table — empty sheets interspersed
 # ===================================================================
+
 
 class TestMultiTableSparse:
     def test_only_data_sheets_appear(self):
@@ -362,6 +383,7 @@ class TestMultiTableSparse:
 # ===================================================================
 # 13. Public excel2txt wrapper
 # ===================================================================
+
 
 class TestExcel2TxtWrapper:
     def test_delegates_to_internal(self):

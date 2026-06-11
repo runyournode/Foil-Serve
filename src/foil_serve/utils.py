@@ -301,8 +301,6 @@ def _detect_ooxml(path: Path) -> str | None:
     return None
 
 
-
-
 def _detect_md(path: Path) -> str | None:
     """
     Distinguish Markdown files containing HTML tables from real HTML pages.
@@ -332,7 +330,6 @@ def _detect_md(path: Path) -> str | None:
     # Fenced code blocks — stripped before MD analysis to avoid false positives
     # when a document contains HTML snippets inside ``` blocks.
     _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-
 
     try:
         # read_text_smart handles encoding detection (UTF-8, chardet, fallbacks).
