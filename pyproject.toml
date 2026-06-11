@@ -9,7 +9,7 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "paddleocr[doc-parser]==3.4.0",
     "paddlepaddle-gpu==3.3.0",
-    "fastapi[standard-no-fastapi-cloud-cli]==0.135.1",
+    "fastapi[standard-no-fastapi-cloud-cli]==0.136.3",
     "fastapi-offline",
     "httpx>=0.28.1",
     "python-magic>=0.4.27",
