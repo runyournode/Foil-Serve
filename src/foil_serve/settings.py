@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 from fastapi import HTTPException, Query
 from openai import AsyncOpenAI
 
-from schemas import VLMModelConfig
+from schemas import ExternalProcessorConfig, VLMModelConfig
 
 
 # Controls rendering format for all pure-MD tables (Excel sheets and HTML tables from the OCR pipeline).
@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     image_min_size: tuple[int, int]
     prompts: Dict[str, str] = Field(default_factory=dict)
     vlm_models: List[VLMModelConfig] = Field(default_factory=list)
+    external_processors: List[ExternalProcessorConfig] = Field(default_factory=list)
     max_tasks_between_pipeline_reload: int
     max_concurrent_libreoffice: int
     max_concurrent_excel: int
@@ -84,6 +85,32 @@ class Settings(BaseSettings):
         for model in self.vlm_models:
             if model.prompt in self.prompts:
                 model.prompt = self.prompts[model.prompt]
+        return self
+
+    @model_validator(mode="after")
+    def keep_enabled_external_processors__check_unique(self) -> "Settings":
+        """
+        Filter out disabled external processors, then reject duplicate names
+        (each name maps to one semaphore) and duplicate MIME claims (each MIME
+        type must route to exactly one processor).
+        """
+        self.external_processors = [p for p in self.external_processors if p.enabled]
+
+        names: set[str] = set()
+        claimed_mimes: dict[str, str] = {}
+        for proc in self.external_processors:
+            if proc.name in names:
+                raise ValueError(
+                    f"Invalid `server_config.toml`: duplicate external processor name '{proc.name}'."
+                )
+            names.add(proc.name)
+            for mime_type in proc.mime_types:
+                if mime_type in claimed_mimes:
+                    raise ValueError(
+                        f"Invalid `server_config.toml`: MIME type '{mime_type}' is claimed by both "
+                        f"external processors '{claimed_mimes[mime_type]}' and '{proc.name}'."
+                    )
+                claimed_mimes[mime_type] = proc.name
         return self
 
     # Enable toml file since pydantic v2
@@ -163,6 +190,14 @@ def align_uvicorn_logging(file_handler: logging.FileHandler | None) -> None:
 
 # Dynamic loading of vlm config (from .toml) at startup
 vlm_registry: dict[str, VLMModelConfig] = {m.name: m for m in settings.vlm_models}
+
+# Dynamic loading of external processors (from .toml) at startup: MIME type → processor.
+# A MIME type present here takes precedence over native handling.
+external_registry: dict[str, ExternalProcessorConfig] = {
+    mime_type: proc
+    for proc in settings.external_processors
+    for mime_type in proc.mime_types
+}
 
 # Enum of the client allowed vlm (used for FastAPI doc),
 VLMModelEnum = StrEnum("VLMModelEnum", list(vlm_registry.keys()))

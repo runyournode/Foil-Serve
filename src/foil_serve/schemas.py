@@ -1,4 +1,22 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl
+
+
+class ExternalProcessorConfig(BaseModel):
+    """Used internally — external foil-compatible processing backend (e.g. video)"""
+
+    name: str  # identifier used in logs, semaphores and /health checks
+    enabled: bool
+    url: HttpUrl  # base URL of the external server
+    process_route: str = "/v1/process"  # processing route on the external server
+    health_route: str = "/health"  # health-check route on the external server
+    endpoint_api_key: str | None = None  # sent as `Authorization: Bearer <key>`
+    mime_types: list[str]  # MIME types routed to this processor (e.g. "video/mp4")
+    max_concurrent_requests: int
+    timeout_s: float = 600.0  # total HTTP timeout per attempt
+    max_retries: int = 2  # extra attempts after the first one (transient errors only)
+    retry_backoff_s: float = 1.0  # base delay; doubles after each failed attempt
+    max_file_size_mb: int
+    check_on_startup: bool = False  # ping the processor /health during lifespan
 
 
 class VLMModelConfig(BaseModel):
@@ -24,6 +42,10 @@ class Metadata(BaseModel):
     """
     Metadata returned by the server
     """
+
+    # Pydantic class-level config (not a data field, never serialized):
+    # external processors may return arbitrary extra metadata fields — keep them
+    model_config = ConfigDict(extra="allow")
 
     active_conversion_time_no_img_desc: int  # accumulated active (CPU/GPU) time for document-to-markdown conversion, excluding semaphore waits and VLM image description
     img_desc_time: int = 0  # total 'cpu' time for image description  (doesn't take into account concurency or waiting semaphore)

@@ -7,12 +7,22 @@ pipeline (prune_tables).
 import re
 import logging
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from tabulate import tabulate
 
 logger = logging.getLogger(__name__)
 
 _SEPARATOR_RE = re.compile(r"\|[-:\s]+(?:\|[-:\s]+)*\|")
+
+
+def _span_value(cell: Tag, attr: str) -> int:
+    """Return the integer value of a colspan/rowspan attribute (1 if absent)."""
+    value = cell.get(attr)
+    if value is None:
+        return 1
+    if not isinstance(value, str):
+        raise ValueError(f"non-string {attr} attribute: {value!r}")
+    return int(value)
 
 
 def _compact_table(table: str) -> str:
@@ -33,7 +43,9 @@ def _compact_table(table: str) -> str:
     return "\n".join(lines)
 
 
-def _render_md_table(headers: list[str], rows: list[list[str]], table_format: str) -> str:
+def _render_md_table(
+    headers: list[str], rows: list[list[str]], table_format: str
+) -> str:
     """Render a 2D table as a Markdown pipe table.
 
     Args:
@@ -94,9 +106,9 @@ def try_html_table_to_md(html_table: str, table_format: str) -> str | None:
     # Reject merged cells
     for cell in table.find_all(["td", "th"]):
         try:
-            if int(cell.get("colspan", 1)) > 1 or int(cell.get("rowspan", 1)) > 1:
+            if _span_value(cell, "colspan") > 1 or _span_value(cell, "rowspan") > 1:
                 return None
-        except (ValueError, TypeError):
+        except ValueError:
             return None
 
     # Reject multi-row thead (hierarchical header — semantics cannot be preserved in MD)
@@ -109,12 +121,13 @@ def try_html_table_to_md(html_table: str, table_format: str) -> str | None:
         return None
 
     # Split into header row and data rows
-    if thead:
-        header_tr = thead.find("tr")
-        data_trs = [tr for tr in all_trs if tr is not header_tr]
-    else:
+    header_tr = thead.find("tr") if thead else None
+    if header_tr is None:
+        # No thead, or an empty <thead> — first row acts as header
         header_tr = all_trs[0]
         data_trs = list(all_trs[1:])
+    else:
+        data_trs = [tr for tr in all_trs if tr is not header_tr]
 
     def cell_text(cell) -> str:
         return cell.get_text(strip=True).replace("|", "\\|")

@@ -286,6 +286,51 @@ prompt = "default"
 
 
 # -------------------------------------------------------------------
+# External processors (e.g. video → markdown backend)               -
+# -------------------------------------------------------------------
+# MIME types listed in `mime_types` are delegated to a remote server exposing
+# the same API as foil-serve (POST /v1/process, GET /health).
+# Each MIME type may be claimed by at most one enabled processor.
+# If a MIME type is also supported natively, the external processor takes
+# precedence (a warning is logged at start-up).
+#
+# [[external_processors]]
+# enabled = <true | false>
+# name = <"identifier used in logs and /health?external_processor_name=...">
+# url = <"base url of the external server">
+# process_route = <Optional processing route on the external server | "/v1/process">
+# health_route = <Optional health-check route on the external server | "/health">
+# endpoint_api_key = <Optional api key, sent as `Authorization: Bearer <key>` | None>
+# mime_types = <list of MIME types routed to this processor>
+# max_concurrent_requests = <int — semaphore size; extra requests queue without blocking the event loop>
+# timeout_s = <Optional total HTTP timeout per attempt, in seconds | 600.0>
+# max_retries = <Optional extra attempts after the first one — transient errors only (timeouts, connection errors, HTTP 5xx); HTTP 4xx are never retried | 2>
+# retry_backoff_s = <Optional base delay between attempts, doubles after each retry | 1.0>
+# max_file_size_mb = <int — per-type size limit, like max_pdf_file_size_mb>
+# check_on_startup = <Optional check the processor /health at server start-up; server will not start on failure | false>
+
+[[external_processors]]
+enabled = false
+name = "video"
+url = "http://localhost:8090"
+endpoint_api_key = "changeme"
+mime_types = [
+    "video/mp4",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/webm",
+    "video/x-msvideo",
+    "video/mpeg",
+]
+max_concurrent_requests = 2
+timeout_s = 600.0
+max_retries = 2
+retry_backoff_s = 1.0
+max_file_size_mb = 500
+check_on_startup = false
+
+
+# -------------------------------------------------------------------
 # Prompt definition for image description                           -
 # -------------------------------------------------------------------
 

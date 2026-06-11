@@ -10,6 +10,7 @@ from typing import Annotated, Optional
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi_offline import FastAPIOffline
 from fastapi import FastAPI, Body, Depends, Query, Security, Request, HTTPException
 from fastapi.responses import Response
@@ -37,18 +38,31 @@ from utils import (
     MimeExt,
 )
 from debug import ArtifactContext, save_table_conversion_artifacts
+from external import (
+    check_external_processor,
+    external_mime_ext,
+    merge_external_metadata,
+    process_external,
+)
 from libreoffice import LibreOfficeServer, convert_to_pdf
 from pipeline import PaddlePipelineWrapper
 from vlm import describe_image_sem
 from postprocessing import extract_raw_ocr, reformat_md
 from table_utils import prune_tables
 from security import verify_api_key
-from settings import validate_endpoint, settings, vlm_registry, AsyncOpenAIWithInfo, setup_logging, align_uvicorn_logging
+from settings import validate_endpoint, settings, vlm_registry, external_registry, AsyncOpenAIWithInfo, setup_logging, align_uvicorn_logging
+from utils import is_native_mime_ext, mime_def
 
 
 _log_file_handler = setup_logging()
 
 logger = logging.getLogger(__name__)
+
+# Extensions for MIME types routed to external processors (e.g. {"video/mp4": ".mp4"}).
+# Static after startup — external_registry is loaded once from server_config.toml.
+_EXTERNAL_MIME_EXT: dict[str, str] = {
+    raw_mime: external_mime_ext(raw_mime) for raw_mime in external_registry
+}
 
 
 @asynccontextmanager
@@ -81,6 +95,26 @@ async def lifespan(_app: FastAPI):
     # so the event loop stays free → /health always responds, /process queues without rejecting.
     _app.state.libreoffice_sem = asyncio.Semaphore(settings.max_concurrent_libreoffice)
     _app.state.excel_sem = asyncio.Semaphore(settings.max_concurrent_excel)
+
+    # ── External processors (e.g. video) ──────────────────────────────────────
+    # Shared async HTTP client (connection pooling); per-request timeouts come
+    # from each processor config, so no default timeout is set here.
+    _app.state.external_http_client = httpx.AsyncClient()
+    _app.state.external_sem = {
+        proc.name: asyncio.Semaphore(proc.max_concurrent_requests)
+        for proc in settings.external_processors
+    }
+    for raw_mime in external_registry:
+        if raw_mime in mime_def:
+            logger.warning(
+                f"MIME type '{raw_mime}' is natively supported but claimed by external "
+                f"processor '{external_registry[raw_mime].name}' — external processing takes precedence."
+            )
+    for proc in settings.external_processors:
+        if proc.check_on_startup:
+            # Raises RuntimeError (and aborts startup) if the processor is unreachable
+            await check_external_processor(_app.state.external_http_client, proc)
+            logger.info(f"External processor '{proc.name}' health check passed.")
 
     # ── LibreOffice persistent server ─────────────────────────────────────────
     libreoffice_server = LibreOfficeServer(runtime_dir=settings.temp_dir)
@@ -118,6 +152,7 @@ async def lifespan(_app: FastAPI):
     # ── Clean shutdown ────────────────────────────────────────────────────────
     pipeline_wrapper.shutdown(wait=True)
     libreoffice_server.stop()
+    await _app.state.external_http_client.aclose()
 
 
 app = FastAPIOffline(
@@ -126,6 +161,7 @@ app = FastAPIOffline(
 <div align="center">
   <h3>Document → Markdown conversion server, built on PaddleOCR — with meaningful extras.</h3>
   <p><b>Supported formats:</b> {" : ".join(x.split(".")[1].upper() for x in MimeExt.__args__)}</p>
+  {f'<p><b>External formats:</b> {" : ".join(sorted(set(ext.lstrip(".").upper() for ext in _EXTERNAL_MIME_EXT.values())))} (delegated to external processors)</p>' if _EXTERNAL_MIME_EXT else ""}
   <p><b>Extras:</b></p>
   <p>
     - Extracted figures can be described by any OpenAI-compatible VLM — description injected as &lt;figcaption&gt; in the Markdown output.<br>
@@ -187,7 +223,10 @@ async def _process_document(
         _t = time.perf_counter()
         try:
             prepared_path, mime, raw_mime = await asyncio.to_thread(
-                prepare_input_file, file_content=file_content, tmpdir=tmpdir
+                prepare_input_file,
+                file_content=file_content,
+                tmpdir=tmpdir,
+                extra_mimes=_EXTERNAL_MIME_EXT,
             )
         except UnsupportedMimeTypeError as e:
             if artifact_ctx is not None:
@@ -199,7 +238,65 @@ async def _process_document(
             artifact_ctx.raw_mime = raw_mime
             artifact_ctx.prepared_path = prepared_path
         t_active += time.perf_counter() - _t
+
+        # ── External processor branch (e.g. video) ────────────────────────────
+        # MIME types claimed in [[external_processors]] are delegated to a remote
+        # foil-compatible server. The HTTP call is fully async (event loop stays
+        # free) and concurrency is bounded by a per-processor semaphore whose
+        # wait time is excluded from active time.
+        ext_cfg = external_registry.get(raw_mime)
+        if ext_cfg is not None:
+            try:
+                _t = time.perf_counter()
+                check_file_size(
+                    len(file_content),
+                    ext_cfg.max_file_size_mb,
+                    f"{ext_cfg.name.capitalize()} file",
+                )
+                t_active += time.perf_counter() - _t
+            except ValueError as e:
+                raise HTTPException(status_code=413, detail=str(e))
+
+            async with request.app.state.external_sem[ext_cfg.name]:
+                _t = time.perf_counter()
+                try:
+                    page_content, ext_imgs_b64, ext_metadata = await process_external(
+                        http_client=request.app.state.external_http_client,
+                        cfg=ext_cfg,
+                        file_content=file_content,
+                        raw_mime=raw_mime,
+                    )
+                except HTTPException as e:
+                    if artifact_ctx is not None:
+                        await artifact_ctx.save(e, t_active=t_active)
+                    raise
+                t_active += time.perf_counter() - _t
+
+            if not page_content.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"External processor '{ext_cfg.name}' produced no content ({mime})",
+                )
+            return (
+                page_content,
+                ext_imgs_b64,
+                merge_external_metadata(
+                    external_metadata=ext_metadata,
+                    active_time_s=t_active,
+                    wall_clock_s=time.perf_counter() - t0_wall,
+                ),
+                mime,
+                raw_mime,
+            )
+
         del file_content
+
+        # Externally-routed MIME types returned above — anything left must be a
+        # native type. Runtime guard that also narrows `mime` to MimeExt.
+        if not is_native_mime_ext(mime):
+            raise HTTPException(
+                status_code=415, detail=f"File type not supported: {raw_mime}"
+            )
 
         # ── Type-specific size checks (after MIME detection) ──────────────────
         try:
@@ -591,7 +688,7 @@ async def foil_process(
     client: Annotated[AsyncOpenAIWithInfo | None, Depends(validate_endpoint)] = None,
 ):
     t0_wall = time.perf_counter()
-    page_content, imgs_b64, metadata, _mime_ext, _raw_mime = await _process_document(
+    page_content, imgs_b64, metadata, _, _ = await _process_document(
         request,
         file_content,
         image_description_model_name,
@@ -600,6 +697,33 @@ async def foil_process(
     )
     return ProcessedDocument(
         page_content=page_content, images=imgs_b64, metadata=metadata
+    )
+
+
+@app.post(
+    "/v1/md/process",
+    dependencies=[Security(verify_api_key)],
+    response_model=ProcessedDocument,
+)
+async def foil_process_md(
+    request: Request,
+    file_content: Annotated[bytes, Body(media_type="application/octet-stream")],
+    image_description_model_name: Optional[str] = Query(None),
+    client: Annotated[AsyncOpenAIWithInfo | None, Depends(validate_endpoint)] = None,
+):
+    """
+    Only
+    """
+    t0_wall = time.perf_counter()
+    page_content, _, _, _, _ = await _process_document(
+        request,
+        file_content,
+        image_description_model_name,
+        client,
+        t0_wall,
+    )
+    return ProcessedDocument(
+        page_content=page_content, images={}, metadata=None
     )
 
 
@@ -653,10 +777,15 @@ def list_models():
 
 
 @app.get("/health")
-async def health_check(image_description_model_name: Optional[str] = Query(None)):
+async def health_check(
+    request: Request,
+    image_description_model_name: Optional[str] = Query(None),
+    external_processor_name: Optional[str] = Query(None),
+):
     """
     Check if server is up (doesn't check if vllm serving PaddleOCR-VL-1.5 is reachable).
-    Optionally also check if vlm endpoints are available.
+    Optionally also check if vlm endpoints and/or external processors are available
+    (both query params support the special value "all").
     """
     if image_description_model_name:
         try:
@@ -673,6 +802,30 @@ async def health_check(image_description_model_name: Optional[str] = Query(None)
                     "status": "error",
                     "message": str(e),
                     "failed_at": image_description_model_name,
+                },
+            )
+    if external_processor_name:
+        processors = {p.name: p for p in settings.external_processors}
+        try:
+            if external_processor_name == "all":
+                targets = list(processors.values())
+            else:
+                if external_processor_name not in processors:
+                    raise ValueError(
+                        f"external_processor_name: '{external_processor_name}' is not configured."
+                    )
+                targets = [processors[external_processor_name]]
+            for proc in targets:
+                await check_external_processor(
+                    request.app.state.external_http_client, proc
+                )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "status": "error",
+                    "message": str(e),
+                    "failed_at": external_processor_name,
                 },
             )
     return {"status": "ok"}

@@ -47,7 +47,7 @@ uv run pytest tests/         # Run all tests
 | `POST` | `/v1/process` | API key | Process file → JSON (`ProcessedDocument`) |
 | `POST` | `/v1/process/download` | API key | Process file → tar.zst archive (markdown + images + metadata.json) |
 | `GET` | `/v1/vlm_models` | API key | List available VLM model names |
-| `GET` | `/health` | none | Health check (optional VLM endpoint check via `image_description_model_name` query param, supports `"all"`) |
+| `GET` | `/health` | none | Health check (optional VLM endpoint check via `image_description_model_name` query param and external processor check via `external_processor_name`; both support `"all"`) |
 
 All authenticated endpoints use HTTP Bearer token (`Authorization: Bearer <key>`), validated by `security.py`.
 
@@ -56,6 +56,9 @@ All authenticated endpoints use HTTP Bearer token (`Authorization: Bearer <key>`
 POST /v1/process or /v1/process/download (file upload)
   → File size checks (global + type-specific, zip bomb detection for ZIP-based formats)
   → Phase 1: prepare_input_file() — write to tmpdir, MIME detection
+      → MIME claimed by [[external_processors]] (e.g. video/mp4): async POST to the
+        external foil-compatible server (per-processor semaphore + timeout/retry),
+        merge returned metadata with foil timing → return immediately
       → .txt/.json/.csv/.xml: read_text_smart() (auto-detect encoding) → return immediately
       → .xls/.xlsx/.ods: excel_sem → excel2txt()
           → EmptySpreadsheetError → fallback to PDF+OCR (if enabled)
@@ -86,6 +89,8 @@ POST /v1/process or /v1/process/download (file upload)
 
 **`src/foil_serve/postprocessing.py`** — `prune_tables()`: HTML table simplification (3–5x size reduction). `extract_raw_ocr()`: extracts per-image OCR text from raw Paddle markdown. `reformat_md()`: injects VLM descriptions and OCR into figure blocks (accepts `include_ocr` flag).
 
+**`src/foil_serve/external.py`** — Async client for external foil-compatible processing backends (e.g. video). `process_external()`: POST file bytes to the configured route with Bearer auth, configurable timeout and retry (transient failures only: timeouts, transport errors, HTTP 5xx — exponential backoff; 4xx forwarded as-is). `check_external_processor()`: health check used at startup (`check_on_startup`) and by `/health`. `merge_external_metadata()`: external metadata passed through, foil overrides `wall_clock_time` and fills timing fields if absent (`Metadata` allows extra fields). `external_mime_ext()`: MIME → extension for externally-routed types.
+
 **`src/foil_serve/libreoffice.py`** — `LibreOfficeServer`: persistent LibreOffice headless server (soffice --headless --accept). `convert_to_pdf()`: converts DOCX, PPTX, DOC, PPT, ODT, ODP to PDF without revision marks. `convert_spreadsheet()`: dedicated spreadsheet → PDF conversion with paper format (A2–Tabloid), landscape/portrait, fit-to-page-width. `convert_xls_to_xlsx()`: legacy encrypted XLS → XLSX conversion.
 
 **`src/foil_serve/security.py`** — `verify_api_key()`: FastAPI dependency for `Authorization: Bearer` header validation via HTTPBearer.
@@ -107,6 +112,19 @@ PaddleOCR is not thread-safe and leaks GPU/CPU memory. The current solution:
 1. `processes=1` pool with `maxtasksperchild=N` (`max_tasks_between_pipeline_reload` in config, default 5) — worker recycled every N documents
 2. `spawn` multiprocessing context — clean worker initialization
 3. Worker recycle costs a few seconds per reload
+
+### External Processor Configuration
+External foil-compatible backends (e.g. video → markdown) are defined in `server_config.toml` under `[[external_processors]]`. Each processor has:
+- `name`: identifier (logs, semaphore, `external_processor_name` query param on `/health`)
+- `url`, `process_route` (default `/v1/process`), `health_route` (default `/health`), `endpoint_api_key`
+- `mime_types`: MIME types routed to this processor — each type may be claimed by at most one enabled processor; types overlapping native support are delegated externally (warning logged at startup)
+- `max_concurrent_requests`: asyncio.Semaphore size (waits excluded from active time)
+- `timeout_s` (default 600), `max_retries` (default 2), `retry_backoff_s` (default 1.0, doubles per retry)
+- `max_file_size_mb`: per-type size limit
+- `check_on_startup`: health-check the processor during lifespan (server aborts startup on failure)
+- `enabled`: enable/disable without removing the config
+
+Calls go through a shared `httpx.AsyncClient` (`app.state.external_http_client`) — fully async, the event loop is never blocked.
 
 ### VLM Configuration
 VLM endpoints are defined in `server_config.toml` under `[[vlm_models]]`. Each model has:

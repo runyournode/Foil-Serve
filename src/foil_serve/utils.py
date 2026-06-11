@@ -5,7 +5,7 @@ import re
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeIs, get_args
 
 import chardet
 import magic
@@ -53,7 +53,7 @@ MimeExt = Literal[
 ]
 
 # Maps MIME type strings to file extensions.
-# Keys also define which MIME types are accepted for processing.
+# Keys also define which MIME types are natively accepted for processing (additional mime can be supported by external processor).
 mime_def: dict[str, MimeExt | None] = {
     # PDF
     "application/pdf": ".pdf",
@@ -85,6 +85,13 @@ mime_def: dict[str, MimeExt | None] = {
     # Empty file
     "inode/x-empty": None,
 }
+
+_NATIVE_MIME_EXTS: frozenset[str] = frozenset(get_args(MimeExt))
+
+
+def is_native_mime_ext(ext: str) -> TypeIs[MimeExt]:
+    """True if `ext` is a natively supported extension (narrows to MimeExt)."""
+    return ext in _NATIVE_MIME_EXTS
 
 
 # -----------------------------------
@@ -358,12 +365,22 @@ def _detect_md(path: Path) -> str | None:
     return None
 
 
-def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt, str]:
+def prepare_input_file(
+    file_content: bytes,
+    tmpdir: Path,
+    extra_mimes: dict[str, str] | None = None,
+) -> tuple[Path, str, str]:
     """
     Write file content to tmpdir, detect MIME type, rename with proper extension.
 
+    `extra_mimes` maps additional accepted MIME types to file extensions
+    (e.g. {"video/mp4": ".mp4"} for types routed to an external processor).
+    The native `mime_def` mapping stays authoritative: extra_mimes is only a
+    fallback for types foil doesn't know natively — the MIME → extension
+    mapping is intrinsic to the file type, regardless of who processes it.
+
     Returns (file_path, mime_ext, raw_mime) where:
-      - mime_ext is like '.pdf', '.docx', etc. (a MimeExt literal)
+      - mime_ext is like '.pdf', '.mp4', etc.
       - raw_mime is the raw MIME type string, e.g. 'application/pdf'
     """
     input_file = tmpdir / "input_file.bin"
@@ -379,7 +396,7 @@ def prepare_input_file(file_content: bytes, tmpdir: Path) -> tuple[Path, MimeExt
     if raw_mime in ["application/html", "text/html"]:
         raw_mime = _detect_md(input_file) or raw_mime
 
-    mime = mime_def.get(raw_mime)
+    mime = mime_def.get(raw_mime) or (extra_mimes or {}).get(raw_mime)
     if mime is None:
         raise UnsupportedMimeTypeError(raw_mime)
     return input_file.rename(input_file.with_suffix(mime.lower())), mime, raw_mime
