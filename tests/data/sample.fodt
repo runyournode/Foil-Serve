@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    office:version="1.2"
+    office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>foil-serve LibreOffice integration test fixture.</text:p>
+   <text:p>This flat-ODT document is converted to PDF over the UNO pipe (Unix domain socket).</text:p>
+  </office:text>
+ </office:body>
+</office:document>

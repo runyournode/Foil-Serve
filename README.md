@@ -221,9 +221,22 @@ Additional artifact types can be enabled independently:
 - `save_table_conversion_artifacts`: saves input spreadsheet + generated PDF when sparse fallback triggers.
 - `save_cell_error_artifacts`: saves Markdown before/after error masking when cell errors are detected.
 
+### LibreOffice UNO transport (Unix domain socket)
+The persistent LibreOffice server is reached over a UNO **pipe**, which on Linux is a Unix domain socket — **no TCP port is exposed**. The pipe name is unique per start and namespaced with `foil_soffice_`; the osl library creates the socket under `/tmp` (`OSL_PIPE_<euid>_foil_soffice_<pid>_<rnd>`). foil-serve does **not** hard-code that location: the real socket path is resolved from the kernel via `/proc/net/unix`, matched by the unique pipe name (see `_resolve_socket_path()` in `libreoffice.py`).
+
+Deployment notes (relevant for non-root containers):
+- The app must be able to **write to `/tmp`** (the default `1777` permissions are fine) — that's where osl places the socket, and it ignores `$TMPDIR`.
+- The soffice server and the UNO client run under the **same UID** (same process tree), so the socket's owner-only write bit is sufficient — no cross-user access is involved.
+- Residual sockets left by a hard crash are cleaned up automatically at startup: within the resolved socket directory, any `foil_soffice_*` socket with no live listener is unlinked (a socket still accepting connections — e.g. another instance — is left untouched). See `_sweep_dead_pipes()` in `libreoffice.py`.
+
 ### Single uvicorn worker
 Foil Serve is not compatible with multiple uvicorn worker (because of the way we spawn and kill the LibreOffice server). 
 This should not be too hard to solve, but I don't expect uvicorn worker to be the bottleneck.
+
+The UNO pipe name is already unique per process. Making it multi-worker-safe would additionally require **namespacing each worker**:
+- a per-worker LibreOffice profile (`-env:UserInstallation=file://<per-worker dir>`) — otherwise LibreOffice's `SingleOfficeIPC` mechanism routes every worker to a single soffice instance;
+- a per-worker PID file (the current `soffice.pid` path is shared).
+
 If extra ressources are available and scaling is required, it would probably be better to try increasing the number of paddle pipeline.
 
 

@@ -6,6 +6,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,11 @@ from settings import PaperFormat
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# Prefix for our UNO pipe names. Namespacing keeps the residual-socket sweep
+# (see LibreOfficeServer._sweep_dead_pipes) from ever touching LibreOffice's own
+# SingleOfficeIPC pipe or pipes belonging to other applications.
+PIPE_PREFIX = "foil_soffice_"
 
 # Paper dimensions in 1/100 mm (landscape: width > height)
 PAPER_SIZES: dict[PaperFormat, tuple[int, int]] = {
@@ -33,21 +39,86 @@ class LibreOfficeServer:
     avoiding the ~3s spawn overhead on every document. If soffice crashes during
     a conversion, it is automatically restarted before retrying.
 
-    PID persistence: the soffice PID is written to a file inside `runtime_dir`
-    so that stale processes from previous app crashes are cleaned up at next startup.
+    Transport: soffice listens on a UNO **pipe**, which on Linux is a Unix domain
+    socket created by the osl library (conventionally `/tmp/OSL_PIPE_<euid>_<name>`,
+    though the exact directory is osl-internal). No TCP port is exposed. The pipe
+    name is unique per start and namespaced with `PIPE_PREFIX`; the real socket
+    path is resolved from the kernel via /proc/net/unix rather than assumed.
+
+    Crash recovery: the soffice PID is written to a file inside `runtime_dir` so
+    stale processes from a previous app crash are killed at next startup. Residual
+    socket files left by a hard crash are removed by `_sweep_dead_pipes()`.
     """
 
     def __init__(self, runtime_dir: str = "/tmp/foil-runtime") -> None:
         self._process: subprocess.Popen | None = None
-        self._port: int | None = None
+        self._pipe_name: str | None = None
+        # Real filesystem path of the bound UNO socket, resolved from the kernel
+        # at readiness (see _resolve_socket_path). None until soffice is ready.
+        self._socket_path: Path | None = None
         self._lock = threading.Lock()
         self._pid_file = Path(runtime_dir) / "soffice.pid"
 
     @staticmethod
-    def _find_free_port() -> int:
-        with socket.socket() as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    def _make_pipe_name() -> str:
+        """Build a unique, namespaced UNO pipe name (see PIPE_PREFIX).
+
+        Uniqueness guarantees a fresh run never collides with a residual socket
+        from a crashed run, and lets the cleanup sweep recognise our own sockets.
+        """
+        return f"{PIPE_PREFIX}{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+    def _resolve_socket_path(self) -> Path | None:
+        """Ask the kernel where our UNO socket is actually bound.
+
+        Reads /proc/net/unix and returns the filesystem path whose basename ends
+        with the current (unique) pipe name. This is robust: it does not assume
+        where the osl library places the socket — it reads the real location from
+        the kernel. Returns None if the socket is not bound yet.
+        """
+        if self._pipe_name is None:
+            return None
+        try:
+            lines = Path("/proc/net/unix").read_text().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            # Trailing column is the bound path (only for pathname sockets);
+            # for unbound sockets the last column is the numeric inode instead.
+            last = line.rsplit(maxsplit=1)[-1] if line else ""
+            if last.startswith("/") and Path(last).name.endswith(self._pipe_name):
+                return Path(last)
+        return None
+
+    def _sweep_dead_pipes(self) -> None:
+        """Remove orphaned UNO pipe sockets left by crashed soffice processes.
+
+        Runs after our own socket is ready, so the directory is learned from the
+        real socket path rather than assumed. Only our own namespaced sockets
+        (PIPE_PREFIX) for the current euid are considered, and our own live socket
+        is skipped. A socket that still accepts a connection belongs to a live
+        soffice (e.g. another worker) and is left untouched; only sockets with no
+        listener are unlinked.
+        """
+        if self._socket_path is None:
+            return
+        for pipe in self._socket_path.parent.glob(
+            f"OSL_PIPE_{os.geteuid()}_{PIPE_PREFIX}*"
+        ):
+            if pipe == self._socket_path:
+                continue  # our own live socket
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.3)
+                    s.connect(str(pipe))
+                # A live soffice is listening — leave it alone.
+            except OSError:
+                # No listener → stale socket file, safe to remove.
+                try:
+                    pipe.unlink()
+                    logger.info(f"Removed stale UNO pipe socket {pipe}")
+                except OSError:
+                    pass
 
     @staticmethod
     def _is_soffice_process(pid: int) -> bool:
@@ -55,12 +126,12 @@ class LibreOfficeServer:
         try:
             cmdline = Path(f"/proc/{pid}/cmdline").read_text()
             # cmdline should be something like (on Ubuntu 24.04 at least):
-            # `'/usr/lib/libreoffice/program/oosplash\x00--headless\x00--norestore\x00--accept=socket,host=localhost,port=59411;urp;\x00'`
+            # `'/usr/lib/libreoffice/program/oosplash\x00--headless\x00--norestore\x00--accept=pipe,name=foil_soffice_...;urp;\x00'`
             t_headless = "headless" in cmdline
-            t_port = "port=" in cmdline
+            t_pipe = "pipe" in cmdline and "name=" in cmdline
             t_libre_office = "libreoffice" in cmdline
             t_soffice = "soffice" in cmdline
-            return t_headless and t_port and (t_libre_office or t_soffice)
+            return t_headless and t_pipe and (t_libre_office or t_soffice)
         except OSError:
             return False
 
@@ -98,33 +169,43 @@ class LibreOfficeServer:
                 logger.warning("soffice stderr: %s", line)
 
     def _wait_ready(self, timeout: float = 15.0) -> None:
-        """Poll the UNO socket until soffice accepts connections."""
+        """Poll the UNO pipe until soffice accepts connections, caching the resolved path.
+
+        The socket location is read from the kernel (_resolve_socket_path); no path
+        is assumed. On success the real path is stored in _socket_path.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("localhost", self._port), timeout=0.5):
+            candidate = self._resolve_socket_path()
+            if candidate is not None:
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.5)
+                        s.connect(str(candidate))
+                    self._socket_path = candidate
                     return
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.3)
+                except OSError:
+                    pass
+            time.sleep(0.3)
         raise RuntimeError(
-            f"soffice did not become ready within {timeout}s on port {self._port}"
+            f"soffice did not become ready within {timeout}s (pipe {self._pipe_name})"
         )
 
     def start(self) -> None:
-        """Cleanup any stale process, pick a free port, spawn soffice, wait for readiness."""
+        """Cleanup stale process, spawn soffice on a fresh UNO pipe, wait for readiness."""
         self._cleanup_stale_processes()
 
         # noinspection PyDeprecation
         if not shutil.which("soffice"):
             raise RuntimeError("soffice not found in PATH")
 
-        self._port = self._find_free_port()
+        self._pipe_name = self._make_pipe_name()
         self._process = subprocess.Popen(
             [
                 "soffice",
                 "--headless",
                 "--norestore",
-                f"--accept=socket,host=localhost,port={self._port};urp;",
+                f"--accept=pipe,name={self._pipe_name};urp;",
             ],
             stderr=subprocess.PIPE,
         )
@@ -139,10 +220,17 @@ class LibreOfficeServer:
 
         # Persist PID so a future crash recovery can clean it up
         self._pid_file.write_text(str(self._process.pid))
-        logger.info(f"soffice started (pid={self._process.pid}, port={self._port})")
+        logger.info(
+            f"soffice started (pid={self._process.pid}, pipe={self._pipe_name})"
+        )
 
-        self._wait_ready()
-        logger.info(f"soffice ready on port {self._port}")
+        self._wait_ready()  # resolves and caches self._socket_path
+        # Now that the real socket directory is known, clean up residual sockets
+        # left by crashed runs (never our own live socket).
+        self._sweep_dead_pipes()
+        logger.info(
+            f"soffice ready on pipe {self._pipe_name} (socket {self._socket_path})"
+        )
 
     def _restart(self) -> None:
         """Restart soffice after a crash."""
@@ -154,6 +242,10 @@ class LibreOfficeServer:
         except Exception:
             pass
         self._pid_file.unlink(missing_ok=True)
+        # Drop the pipe socket of the crashed instance if it lingered.
+        if self._socket_path is not None:
+            self._socket_path.unlink(missing_ok=True)
+            self._socket_path = None
         self.start()
 
     def _ensure_running(self) -> None:
@@ -213,7 +305,7 @@ def convert():
     )
 
     ctx = resolver.resolve(
-        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+        "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
@@ -291,7 +383,7 @@ def convert():
     )
 
     ctx = resolver.resolve(
-        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+        "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
@@ -340,7 +432,7 @@ def convert():
     )
 
     ctx = resolver.resolve(
-        "uno:socket,host=localhost,port={self._port};urp;StarOffice.ComponentContext"
+        "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
@@ -367,14 +459,14 @@ convert()
     def convert_xls_to_xlsx(self, file_path: Path, output_xlsx: Path) -> None:
         """Convert a legacy .xls to .xlsx via UNO (handles old encryption with empty password)."""
         self._ensure_running()
-        assert self._port is not None
+        assert self._pipe_name is not None
         script = self._build_uno_script_xls_to_xlsx(file_path, output_xlsx)
         self._run_uno_script(script, label="UNO xls→xlsx")
 
     def convert_general(self, file_path: Path, output_pdf: Path) -> None:
         """Convert a document (Writer, Impress, etc.) to PDF via UNO."""
         self._ensure_running()
-        assert self._port is not None
+        assert self._pipe_name is not None
         script = self._build_uno_script_general(file_path, output_pdf)
         self._run_uno_script(script, label="UNO general")
 
@@ -383,7 +475,7 @@ convert()
     ) -> None:
         """Convert a spreadsheet to PDF via UNO (landscape, fit-to-width)."""
         self._ensure_running()
-        assert self._port is not None
+        assert self._pipe_name is not None
         script = self._build_uno_script_spreadsheet(file_path, output_pdf, paper_format)
         self._run_uno_script(script, label="UNO spreadsheet")
 
@@ -399,6 +491,10 @@ convert()
             finally:
                 self._process = None
         self._pid_file.unlink(missing_ok=True)
+        # Remove our pipe socket in case soffice did not clean it up on exit.
+        if self._socket_path is not None:
+            self._socket_path.unlink(missing_ok=True)
+            self._socket_path = None
         logger.info("soffice stopped")
 
 
