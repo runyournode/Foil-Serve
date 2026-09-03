@@ -6,7 +6,7 @@
 # Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
 # (No clearing mechanism — manage disk space manually.)             -
 # -------------------------------------------------------------------
-log_level = "DEBUG"         # DEBUG | INFO | WARNING | ERROR
+log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
 libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
 log_file = "/var/log/foil/foil.log"  # Comment to disable logging to file
 
@@ -124,11 +124,12 @@ excel_max_output_ratio = 5.0
 # The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
 excel_pdf_fallback_enabled = true
 # Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
-excel_min_input_for_fallback_mb = 0.5
+excel_min_input_for_fallback_mb = 0.25
 # If Markdown output is smaller than this fraction of input size, trigger fallback.
 # Overridable per request with the `excel_min_output_ratio` query param (the request
 # value wins when provided); the param is accepted only on the "auto" routes.
 excel_min_output_ratio = 0.01
+
 
 # -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----
 # Paper format used when converting spreadsheets to PDF.
@@ -215,8 +216,10 @@ max_concurrent_excel = 5
 enabled = true
 max_concurrent_requests = 20
 name = "ministral-3-3b"
+min_size = [64, 64]
 temperature = 0.0
 max_output_tokens = 5000
+max_input_ocr_length = 700
 url = "http://foil_vllm-ministral-3-3b:8000/v1"
 endpoint_name = "mistralai/ministral-3-3b"
 endpoint_api_key = 'none'

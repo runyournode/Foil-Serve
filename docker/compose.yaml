@@ -1,6 +1,7 @@
 services:
   foil_app:
-    image: ghcr.io/runyournode/foil-serve:main-offline
+#    image: ghcr.io/runyournode/foil-serve:main-offline
+    image: ghcr.io/runyournode/foil-serve:sha-9481a8c-offline
     container_name: foil_app
     gpus: all
     ipc: host
@@ -32,7 +33,7 @@ services:
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
-    image: docker.io/vllm/vllm-openai:v0.22.1
+    image: docker.io/vllm/vllm-openai:v0.28.0  # v0.18.0 -> ok
     container_name: foil_vllm-PaddleOCR-VL-1.5
     gpus: all
     ipc: host
@@ -64,14 +65,14 @@ services:
 
   # Soft Req : mistralai/ministral-3-3b
   foil_vllm-ministral-3-3b:
-    image: docker.io/vllm/vllm-openai:v0.22.1
+    image: docker.io/vllm/vllm-openai:v0.28.0  # v0.18.0-cu130 -> ok, v0.22.1 -> KO
     container_name: foil_vllm-ministral-3-3b
     ipc: host
     gpus: all
     expose:
       - "8000"
-#    ports: # dev only
-#      - "8082:8000"
+#    ports: # dev only (keep commented else `http://foil_vllm-ministral-3-3b:8000/v1` won't be found)
+#      - "8001:8000"
     networks:
       - foil-net
     environment:
