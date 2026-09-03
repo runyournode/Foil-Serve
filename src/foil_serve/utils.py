@@ -397,3 +397,51 @@ def prepare_input_file(
     if mime is None:
         raise UnsupportedMimeTypeError(raw_mime)
     return input_file.rename(input_file.with_suffix(mime.lower())), mime, raw_mime
+
+
+# -----------------------------------
+#  Type-specific input size limits
+# -----------------------------------
+
+# Extensions read as plain text — no pipeline, no size limit beyond the global one.
+TEXT_EXTS: frozenset[str] = frozenset({".txt", ".json", ".csv", ".xml", ".md"})
+SPREADSHEET_EXTS: frozenset[str] = frozenset({".xls", ".xlsx", ".ods"})
+IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".bmp", ".webp", ".tiff"})
+OFFICE_EXTS: frozenset[str] = frozenset(
+    {".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"}
+)
+# ZIP containers: a declared size can be forged, so these get the two-phase bomb check.
+ZIP_BASED_EXTS: frozenset[str] = frozenset(
+    {".docx", ".pptx", ".odt", ".odp", ".xlsx", ".ods"}
+)
+
+
+def check_input_size(
+    mime: str,
+    size_bytes: int,
+    max_pdf_mb: int,
+    max_image_mb: int,
+    max_office_mb: int,
+    max_excel_mb: int,
+) -> None:
+    """Apply the size limit that matches the detected type.
+
+    Raises ValueError when the file is too large, NotImplementedError when the
+    type has no limit defined (a new MimeExt was added without a limit here).
+    Plain-text types are exempt: the global limit already covers them.
+    """
+    if mime == ".pdf":
+        check_file_size(size_bytes, max_pdf_mb, "PDF file")
+    elif mime in IMAGE_EXTS:
+        check_file_size(size_bytes, max_image_mb, "Image file")
+    elif mime in OFFICE_EXTS:
+        check_file_size(size_bytes, max_office_mb, "Office file")
+    elif mime in SPREADSHEET_EXTS:
+        # On-disk (compressed) size — reliable for all spreadsheet formats
+        check_file_size(size_bytes, max_excel_mb, "Spreadsheet file")
+    elif mime in TEXT_EXTS:
+        pass
+    else:
+        raise NotImplementedError(
+            f"File size check not implemented for this type: {mime}"
+        )

@@ -12,6 +12,7 @@ document → PDF conversion over the pipe using the committed fixture in data/.
 """
 
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -150,3 +151,47 @@ def test_convert_document_over_pipe(tmp_path):
         srv.stop()
 
     assert srv._socket_path is None  # cleaned up on stop
+
+
+@pytest.mark.skipif(
+    shutil.which("soffice") is None, reason="LibreOffice (soffice) not installed"
+)
+def test_convert_spreadsheet_reports_pages_per_sheet(tmp_path):
+    """The sheet→page map must account for every page of the exported PDF.
+
+    This is the invariant the spreadsheet table of contents relies on: a sheet may
+    span several pages (fit-to-width only constrains columns), and hidden sheets are
+    not exported at all — a map that got either wrong would misplace every anchor.
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+
+    wb = openpyxl.Workbook()
+    long_sheet = wb.active
+    long_sheet.title = "Long"
+    for row in range(400):
+        long_sheet.append([f"row {row}", row, row * 2])
+    wb.create_sheet("Short").append(["a", "b"])
+    hidden = wb.create_sheet("Hidden")
+    hidden.append(["x"])
+    hidden.sheet_state = "hidden"
+
+    src = tmp_path / "input.xlsx"
+    wb.save(src)
+    out = tmp_path / "out.pdf"
+
+    srv = LibreOfficeServer(runtime_dir=str(tmp_path))
+    srv.start()
+    try:
+        sheet_map = srv.convert_spreadsheet(
+            src, out, paper_format="A4", landscape=False
+        )
+    finally:
+        srv.stop()
+
+    assert sheet_map is not None, "LibreOffice should report the page counts"
+    assert [name for name, _ in sheet_map] == ["Long", "Short"]  # hidden sheet excluded
+    assert dict(sheet_map)["Long"] > 1, "a 400-row sheet must span several A4 pages"
+
+    # Count the page objects of the produced PDF, without pulling in a PDF library.
+    n_pages = len(re.findall(rb"/Type\s*/Page[^s]", out.read_bytes()))
+    assert sum(count for _, count in sheet_map) == n_pages

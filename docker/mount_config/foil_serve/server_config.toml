@@ -76,6 +76,25 @@ max_unzip_size_mb = 2048
 # -------------------------------------------------------------------
 # Spreadsheet processing                                            -
 # -------------------------------------------------------------------
+# A spreadsheet (.xls / .xlsx / .ods) can be converted in four ways, chosen per
+# request with the `spreadsheet_mode` query param on /v1/process (and its variants),
+# or with a dedicated route that pins the mode:
+#
+#   auto (default)  pandas cell extraction, falling back to PDF+OCR when the file is
+#                   empty or suspiciously sparse. This is the ONLY mode driven by the
+#                   excel_pdf_fallback_enabled / excel_min_* settings below.
+#                   → POST /v1/process                        (+ /download)
+#   pandas          cell extraction only. Never falls back, whatever those settings say.
+#                   → POST /v1/process/spreadsheet_pandas     (+ /download)
+#   ocr             LibreOffice → PDF → PaddleOCR only. pandas is not run at all.
+#                   → POST /v1/process/spreadsheet_ocr        (+ /download)
+#   both            both conversions, concatenated in a single Markdown document.
+#                   → POST /v1/process/spreadsheet_both       (+ /download)
+#
+# Whatever the mode, a spreadsheet output starts with a header stating the method used
+# and a table of contents giving the line number of every sheet in the document.
+# The mode is ignored for every other file type: the dedicated routes accept PDF,
+# Office, image and text files too, they just process them as usual.
 
 # Table format for all pure-MD table rendering (Excel/ODS sheets and HTML tables from the OCR pipeline).
 # "llm" (default): minimal formatting, reduced tokens (no padding, short separators)
@@ -86,28 +105,37 @@ table_output_format = "llm"
 # true (default): error cells become empty strings before rendering.
 # false: error cells show a short label (e.g. #ref, #n/a, #val, #name, #div, #null, #num).
 # In both cases, fully empty rows and columns are stripped from the output.
+# Applies to the pandas conversion only (modes auto, pandas, both).
 excel_mask_cell_errors = true
 
-# Maximum ratio of output Markdown size to input file size.
-# If exceeded, the request is rejected (HTTP 413).
-# Example: 5.0 means a 10 MB Excel may produce at most 50 MB of Markdown.
+# Size budget for EACH conversion section of the output, as a ratio of the input file size.
+# A section that exceeds it is removed from the Markdown and replaced by a short note
+# saying why — in "both" mode, a huge pandas section is dropped and the OCR section is
+# still returned (and vice versa). HTTP 413 is returned only when no section survives,
+# which is what the single-section modes (auto, pandas, ocr) always come down to.
+# Example: 5.0 means a 10 MB spreadsheet may yield at most 50 MB of Markdown per section.
 excel_max_output_ratio = 5.0
 
+# -- The three settings below apply to mode "auto" ONLY -------------
 # Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
 # images, shapes only), convert to PDF and process via Paddle OCR instead
 # (which mean possible allucinations... ).
 # Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
+# The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
 excel_pdf_fallback_enabled = true
 # Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
 excel_min_input_for_fallback_mb = 0.5
 # If Markdown output is smaller than this fraction of input size, trigger fallback.
+# Overridable per request with the `excel_min_output_ratio` query param (the request
+# value wins when provided); the param is accepted only on the "auto" routes.
 excel_min_output_ratio = 0.01
 
-# Paper format used when converting spreadsheets to PDF (for the fallback pipeline).
+# -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----
+# Paper format used when converting spreadsheets to PDF.
 # Supported values: "A3", "A4", "A2", "Letter", "Legal", "Tabloid"
 excel_pdf_paper_format = "A3"
 
-# Page orientation for spreadsheet → PDF conversion (fallback pipeline).
+# Page orientation for spreadsheet → PDF conversion.
 # true (default): landscape — better for wide spreadsheets with many columns.
 # false: portrait — better for narrow spreadsheets with few columns.
 excel_pdf_landscape = true

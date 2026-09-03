@@ -1,6 +1,11 @@
 """Generate test spreadsheet files for edge-case testing.
 
 Run:  uv run python tests/spreadsheet/generate_test_files.py
+
+Careful: this rewrites EVERY fixture, and openpyxl embeds fresh zip metadata, so
+untouched fixtures come out byte-different. After adding a generator, restore the
+rest with `git checkout -- tests/spreadsheet/fixtures/` and keep only what you meant
+to change.
 """
 
 from pathlib import Path
@@ -361,6 +366,131 @@ def gen_multi_table_sparse():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  19. Multi-sheet workbook where one sheet spans SEVERAL PDF pages
+#      Feeds the table-of-contents tests: the naive "one sheet = one PDF page"
+#      assumption breaks here, since fit-to-width only constrains columns.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_multipage_sheets():
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Budget"
+    ws.append(["Item", "Q1", "Q2", "Q3", "Q4"])
+    for i in range(1, 260):  # ~6 A3 pages
+        ws.append([f"Line item {i}", i * 10, i * 11, i * 12, i * 13])
+
+    ws2 = wb.create_sheet("Summary")
+    ws2.append(["Metric", "Value"])
+    ws2.append(["Total revenue", 123456])
+    ws2.append(["Total cost", 98765])
+    ws2.append(["Margin", 24691])
+
+    ws3 = wb.create_sheet("Notes")
+    ws3.append(["Note"])
+    ws3.append(["Figures are provisional."])
+    ws3.append(["Reviewed by finance."])
+    _save(wb, "multipage_sheets.xlsx")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  20. pandas output noticeably larger than the OCR output of the same file
+#      Cells hold full-precision values but are DISPLAYED rounded, so the PDF
+#      (and therefore the OCR section) is smaller than the pandas section.
+#      Lets a single excel_max_output_ratio drop one section and keep the other.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_precision_mismatch():
+    import random
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Measures"
+    ws.append([f"col{i}" for i in range(6)])
+    random.seed(1)
+    for _ in range(200):
+        ws.append([random.random() * 1000 for _ in range(6)])
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.number_format = "0.0"
+    _save(wb, "precision_mismatch.xlsx")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  21. Genuinely sparse spreadsheet: a big picture, almost no cells.
+#      This is what excel_pdf_fallback_enabled exists for. It must stay ABOVE
+#      excel_min_input_for_fallback_mb (0.5 MB) or the sparse check is skipped,
+#      hence the deliberately incompressible image noise.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_sparse_image_only():
+    import random
+
+    from PIL import Image, ImageDraw
+    from openpyxl.drawing.image import Image as XLImage
+
+    img_path = OUT / "_sparse_chart.png"
+    im = Image.new("RGB", (2000, 1300), "white")
+    draw = ImageDraw.Draw(im)
+    draw.text((80, 50), "QUARTERLY REVENUE REPORT", fill="black")
+    for i, (label, height) in enumerate(
+        [("Q1", 400), ("Q2", 700), ("Q3", 550), ("Q4", 900)]
+    ):
+        x = 150 + i * 430
+        draw.rectangle([x, 1150 - height, x + 260, 1150], fill=(60, 90, 200))
+        draw.text((x + 110, 1170), label, fill="black")
+    # Noise keeps the PNG from compressing below the fallback size gate.
+    px = im.load()
+    random.seed(0)
+    for _ in range(700000):
+        x, y = random.randrange(2000), random.randrange(1300)
+        px[x, y] = (px[x, y][0] ^ 3, px[x, y][1] ^ 5, px[x, y][2] ^ 7)
+    im.save(img_path)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Chart"
+    ws.append(["Quarter", "Revenue"])  # a real but tiny table
+    ws.append(["Q1", 400000])
+    ws.append(["Q2", 700000])
+    ws.add_image(XLImage(img_path))
+    _save(wb, "sparse_image_only.xlsx")
+    img_path.unlink()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  22. Large dense spreadsheet, also above the fallback size gate.
+#      Counterpart of #21: same size class, but NOT sparse — `auto` must keep
+#      the pandas conversion. WARNING: never send this one through the OCR
+#      pipeline, it renders to hundreds of PDF pages.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_big_dense():
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["A", "B", "C"])
+    for i in range(30000):
+        ws.append([f"v{i}", i, i * 2])
+    ws2 = wb.create_sheet("Meta")
+    ws2.append(["k", "v"])
+    ws2.append(["owner", "finance"])
+    _save(wb, "big_dense.xlsx")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  23. Multi-sheet .ods — the odfpy engine had no fixture at all
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_ods_multi_sheet():
+    import pandas as pd
+
+    path = OUT / "multi_sheet.ods"
+    with pd.ExcelWriter(path, engine="odf") as writer:
+        pd.DataFrame({"Quarter": ["Q1", "Q2"], "Revenue": [400000, 700000]}).to_excel(
+            writer, sheet_name="First", index=False
+        )
+        pd.DataFrame({"Note": ["provisional"]}).to_excel(
+            writer, sheet_name="Second", index=False
+        )
+    print(f"  ✓ {path.name}  ({path.stat().st_size:,} bytes)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("Generating test spreadsheets in:", OUT)
@@ -382,4 +512,9 @@ if __name__ == "__main__":
     gen_multi_table_special_names()
     gen_multi_table_overlapping_columns()
     gen_multi_table_sparse()
+    gen_multipage_sheets()
+    gen_precision_mismatch()
+    gen_sparse_image_only()
+    gen_big_dense()
+    gen_ods_multi_sheet()
     print("Done.")

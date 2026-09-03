@@ -2,6 +2,7 @@ import asyncio
 import time
 import logging
 
+from fastapi import HTTPException
 from openai.types.chat import ChatCompletionUserMessageParam
 from openai.types.chat.chat_completion_content_part_image_param import (
     ChatCompletionContentPartImageParam,
@@ -120,3 +121,51 @@ async def describe_image_sem(
         description = await describe_image(client, img_name, img_b64, ocr)
         elapsed = time.perf_counter() - t0
     return img_name, description, elapsed
+
+
+async def describe_images(
+    client: AsyncOpenAIWithInfo,
+    model_name: str,
+    imgs_b64: dict[str, str],
+    ocrs: dict[str, str],
+    semaphore: asyncio.Semaphore,
+) -> tuple[dict[str, str], float]:
+    """Describe every image that has OCR context, concurrently.
+
+    Images without an OCR entry are skipped: the pipeline did not treat them as
+    figures, so there is no context to feed the prompt.
+
+    Returns (descriptions, total_seconds) where total_seconds is the sum of the
+    individual call durations — it does not account for concurrency.
+
+    Raises HTTPException(502) if any description fails: a partial set would
+    silently produce a document with missing captions.
+    """
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tasks = [
+                tg.create_task(
+                    describe_image_sem(
+                        client=client,
+                        img_name=img_name,
+                        img_b64=img_b64,
+                        ocr=ocrs[img_name],
+                        semaphore=semaphore,
+                    )
+                )
+                for img_name, img_b64 in imgs_b64.items()
+                if img_name in ocrs
+            ]
+    except ExceptionGroup as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error in image description with {model_name}:\n{e}",
+        )
+
+    descriptions: dict[str, str] = {}
+    total_seconds = 0.0
+    for task in tasks:
+        img_name, description, elapsed = task.result()
+        descriptions[img_name] = description
+        total_seconds += elapsed
+    return descriptions, total_seconds

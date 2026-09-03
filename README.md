@@ -19,6 +19,48 @@ PaddleOCR outputs verbose HTML tables. foil-serve post-processes each table in t
 
 The output format for Markdown tables is controlled by `table_output_format` in `server_config.toml` (`"llm"` compact or `"human"` aligned — same setting as for spreadsheet tables).
 
+### 📑 Spreadsheet conversion strategies
+
+Spreadsheets are converted in one of four ways, chosen **per request** — either with the `spreadsheet_mode` query param, or with a route that pins it:
+
+| Mode | Cell extraction (pandas) | PDF + OCR | Dedicated route |
+|---|---|---|---|
+| `auto` *(default)* | yes | only when the file is empty or sparse | — (`/v1/process`) |
+| `pandas` | yes | never | `/v1/process/spreadsheet_pandas` |
+| `ocr` | no | yes | `/v1/process/spreadsheet_ocr` |
+| `both` | yes | yes — two sections in one document | `/v1/process/spreadsheet_both` |
+
+`auto` reproduces the historical behaviour and is the **only** mode driven by the `excel_pdf_fallback_enabled` / `excel_min_*` settings; the explicit modes are a direct client decision and ignore them. Each dedicated route also has a `/download` variant, and all of them accept every supported file type — the mode is simply a no-op outside `.xls`, `.xlsx` and `.ods`.
+
+### 🧭 Spreadsheet header and table of contents
+
+Every spreadsheet output is prefixed with a header stating the method actually used, and a table of contents giving the **exact line number** of each sheet — so an agentic RAG pipeline can cite a position instead of re-scanning the whole document:
+
+````markdown
+# Spreadsheet converted to Markdown
+
+Source file type: `.xlsx` — conversion method: **both** (cell values read with pandas, then PaddleOCR over a PDF rendering of the sheets).
+
+## Table of contents
+
+Line numbers refer to this document, first line included.
+
+|Section|Line|
+|---|---|
+|pandas — Budget|22|
+|pandas — Summary|287|
+|pandas — Notes|296|
+|ocr — Budget|306|
+|ocr — Summary|582|
+|ocr — Notes|593|
+
+---
+````
+
+(Real output for a three-sheet workbook whose `Budget` sheet spans six PDF pages — hence the 276-line gap before `Summary` in the OCR section.)
+
+In `ocr` and `both`, the sheet anchors come from the per-sheet page count LibreOffice reports, so a sheet spanning several PDF pages still gets a single anchor with the next sheet placed after all of them. When that map is unavailable or disagrees with what the pipeline returned, the table of contents degrades to one entry per page (`## Page N`) instead of guessing — the line numbers stay exact either way.
+
 ### 📁 Extended input format support
 
 | Format | Conversion | Post-processing |
@@ -26,13 +68,17 @@ The output format for Markdown tables is controlled by `table_output_format` in 
 | `.txt`, `.json`, `.csv`, `.xml`, `.md` | Pass-through (smart encoding detection) | — |
 | `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML tables → Markdown or simplified HTML, optional VLM image description |
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
-| `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables (optional fallback: LibreOffice → PDF → PaddleOCR-VL) | Cell error masking, output size guard |
+| `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables, LibreOffice → PDF → PaddleOCR-VL, or both — see *Spreadsheet conversion strategies* | Cell error masking, header + table of contents, per-section size budget |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
 
-**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. When a spreadsheet produces very little cell data (e.g. content is mostly text boxes or images), foil-serve can fall back to PDF+OCR conversion via LibreOffice (configurable paper format and orientation, default A3 landscape, fit-to-width). This fallback is enabled by default but can be disabled via `excel_pdf_fallback_enabled`. Output size is capped relative to input size (HTTP 413 if exceeded). Empty spreadsheets (no cell data at all) return HTTP 422 when the fallback is disabled. The Markdown table format (`table_output_format`: `"llm"` compact or `"human"` aligned) applies to both spreadsheet tables and HTML tables converted from the OCR pipeline.
+**Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. The Markdown table format (`table_output_format`: `"llm"` compact or `"human"` aligned) applies to both spreadsheet tables and HTML tables converted from the OCR pipeline.
+
+In `auto` mode, a spreadsheet that produces very little cell data (content mostly in text boxes, images or shapes) falls back to PDF+OCR via LibreOffice — configurable paper format and orientation, default A3 landscape, fit-to-width. The threshold is `excel_min_output_ratio`, which can be **overridden per request** with the query param of the same name; the check itself only runs above `excel_min_input_for_fallback_mb`, and the whole fallback can be turned off with `excel_pdf_fallback_enabled`. An empty spreadsheet returns HTTP 422 when no OCR conversion is going to run.
+
+**Output size budget:** `excel_max_output_ratio` caps each conversion **section** relative to the input file size. A section that exceeds it is removed from the Markdown and replaced by a short note explaining why — so in `both` mode an oversized pandas section is dropped while the OCR section is still returned, correctly indexed. HTTP 413 is returned only when no section survives.
 
 **Markdown files with HTML tables:** some Markdown files (e.g. outputs from other conversion tools) contain embedded HTML tables and are misdetected as `text/html` by libmagic. foil-serve applies a heuristic (`_detect_md`) to distinguish these from real HTML pages: if no HTML document root markers (`<!DOCTYPE html>`, `<html>`, `<head>`, `<body>`) are found but Markdown structural elements are present (headings, lists, links), the file is treated as Markdown and passed through unchanged. Real HTML pages remain unsupported and are rejected with HTTP 422.
 
@@ -51,14 +97,33 @@ Support for additional formats is welcome — contributions are open 🙌
 |---|---|---|
 | `/docs` | `GET` | Interactive Swagger documentation (offline-enabled) |
 | `/v1/process` | `POST` | Convert document to Markdown + extract images (JSON response) |
-| `/v1/process/download` | `POST` | Same as above but returns a `tar.zst` archive |
+| `/v1/md/process` | `POST` | Same, but returns only `page_content` (no images, no metadata) |
+| `/v1/process/download` | `POST` | Same as `/v1/process` but returns a `tar.zst` archive |
+| `/v1/process/spreadsheet_pandas` | `POST` | `/v1/process` with the spreadsheet strategy pinned to `pandas` |
+| `/v1/process/spreadsheet_ocr` | `POST` | … pinned to `ocr` |
+| `/v1/process/spreadsheet_both` | `POST` | … pinned to `both` |
+| `/v1/process/spreadsheet_{mode}/download` | `POST` | Same three, returning a `tar.zst` archive |
 | `/v1/vlm_models` | `GET` | List available VLM models for image description |
-| `/health` | `GET` | Server health check, optionally validates VLM endpoints |
+| `/health` | `GET` | Server health check, optionally validates VLM endpoints and external processors |
+
+The `spreadsheet_*` routes accept every supported file type — the pinned mode only affects `.xls`, `.xlsx` and `.ods`, and is ignored for PDF, Office, image and text inputs.
 
 ### `POST /v1/process`
 
 **Request:** raw file bytes (`application/octet-stream`) + optional query params:
-- `image_description_model_name`: name of the VLM model to use for image description (see `/v1/vlm_models`)
+
+| Param | Applies to | Description |
+|---|---|---|
+| `image_description_model_name` | all routes | VLM used to describe extracted figures (see `/v1/vlm_models`) |
+| `spreadsheet_mode` | `/v1/process`, `/v1/md/process`, `/v1/process/download` | `auto` (default), `pandas`, `ocr` or `both` — see *Spreadsheet conversion strategies*. Ignored for non-spreadsheet inputs |
+| `excel_min_output_ratio` | same three | Per-request override of the sparse-detection threshold. `auto` mode only |
+
+```bash
+curl -X POST "http://localhost:8081/v1/process?spreadsheet_mode=both" \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.xlsx
+```
 
 **Response (`ProcessedDocument`):**
 ```json
@@ -163,6 +228,19 @@ prompt = "default"              # key from [prompts] section or a direct prompt 
 extra_body = {chat_template_kwargs = {enable_thinking = false}} # optional extra body parameter (e.g. disable thinking on vllm)
 ```
 
+### Spreadsheet processing (`server_config.toml`)
+
+| Setting | Default | Applies to | Description |
+|---|---|---|---|
+| `table_output_format` | `"llm"` | all | `"llm"` compact or `"human"` aligned — also used for HTML tables from the OCR pipeline |
+| `excel_mask_cell_errors` | `true` | pandas | Mask error cells with an empty string, or label them (`#ref`, `#n/a`, …) |
+| `excel_max_output_ratio` | `5.0` | all | Size budget **per conversion section**, as a ratio of the input size. An oversized section is dropped with a note; HTTP 413 only when none survives |
+| `excel_pdf_fallback_enabled` | `true` | `auto` only | Fall back to PDF+OCR for empty or sparse spreadsheets |
+| `excel_min_input_for_fallback_mb` | `0.5` | `auto` only | Skip the sparse check below this input size |
+| `excel_min_output_ratio` | `0.01` | `auto` only | Below this output/input ratio the file is considered sparse. Overridable per request |
+| `excel_pdf_paper_format` | `"A3"` | `ocr`, `both`, `auto` fallback | `A2`, `A3`, `A4`, `Letter`, `Legal` or `Tabloid` |
+| `excel_pdf_landscape` | `true` | `ocr`, `both`, `auto` fallback | Landscape suits wide sheets; portrait suits narrow ones |
+
 ### OCR output control (`server_config.toml`)
 
 Controls whether `<ocr>` tags (Paddle OCR text on images) appear in the final Markdown:
@@ -182,7 +260,10 @@ When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and 
 If an image-only document contains no text, the Paddle pipeline may produce sparse Markdown (without even referencing the image), causing the VLM description step to be skipped. This server is not recommended for pure image description use cases.
 
 ### Embedded objects in spreadsheets
-Only cell content is extracted from spreadsheet files. Embedded images, charts, and text boxes are ignored. When the extracted cell content is too sparse, foil-serve falls back to PDF+OCR, which may capture some visual elements but with lower fidelity.
+The pandas conversion extracts cell content only — embedded images, charts and text boxes are ignored. The `ocr` and `both` modes (and the `auto` fallback) render the sheets to PDF first, which does capture those visual elements, but with OCR fidelity rather than exact values.
+
+### OCR cost on large spreadsheets
+A dense spreadsheet renders to as many PDF pages as it needs, and each page goes through the model. A file with tens of thousands of rows can therefore occupy the single Paddle worker for a long time in `ocr` or `both` mode. Something to keep in mind before lowering `excel_min_output_ratio` or routing large files to a fixed OCR mode.
 
 ### Upside-down images
 Extracted images may be rotated relative to the original document.
@@ -193,6 +274,33 @@ Office documents (excluding spreadsheets) are converted to PDF before OCR. This 
 ---
 
 ## 🛠️ Developer notes
+
+### Project layout
+
+| Module | Role |
+|---|---|
+| `main.py` | Application assembly only — lifespan (runtime dirs, semaphores, LibreOffice server, PaddleOCR pipeline + startup smoke test) and the router mount |
+| `api.py` | The HTTP surface. The six fixed-mode routes are generated by one closure factory rather than written out |
+| `processing.py` | `process_document()` — the conversion orchestration. Owns what the domain modules deliberately do not: mapping domain errors to HTTP status codes, and accounting *active* time |
+| `spreadsheet.py` | Cell extraction, header + table-of-contents assembly, and the pure decision rules (`resolve_strategy`, `is_sparse`) |
+| `pipeline.py` | The PaddleOCR worker pool. Returns **one Markdown string per PDF page** |
+| `libreoffice.py` | Persistent UNO server, Office/spreadsheet → PDF, and the per-sheet page counts |
+| `postprocessing.py` / `table_utils.py` | Figure blocks, per-page helpers, HTML table simplification |
+| `external.py`, `vlm.py`, `utils.py`, `debug.py`, `settings.py`, `schemas.py`, `security.py` | Remote backends, VLM fan-out, MIME/size/archive helpers, failure artifacts, config, models, auth |
+
+Two conventions worth knowing before editing:
+
+- **Active time excludes semaphore waits.** `ActiveTimer.track()` is always opened *inside* an `async with <semaphore>` block, never around it.
+- **The pipeline output stays split per page** until the very end. Post-processing runs page by page so output line numbers remain mappable to PDF pages — that is what makes the spreadsheet table of contents exact. Join with `postprocessing.join_pages()`.
+
+### Tests
+
+```bash
+uv run pytest tests/          # offline suite
+uv run pytest tests/live/ -v  # end-to-end, needs a running server (skipped otherwise)
+```
+
+`tests/live/` talks to an actual instance and is skipped automatically when none answers on `$FOIL_SERVE_URL` (default `http://127.0.0.1:8081`). It covers what the offline suite structurally cannot — chiefly that the sheet → page map LibreOffice reports lines up with the pages PaddleOCR returns. See `tests/README.md` for the full layout and for the fixture generator.
 
 ### Memory management & worker recycling
 PaddleOCR is not thread-safe and leaks GPU/CPU memory over time. The current workaround uses a `spawn`-based multiprocessing pool (`processes=1`) that recycles the worker process every N documents (`max_tasks_between_pipeline_reload` in `server_config.toml`, default 5). Each recycle takes a few seconds while the pipeline reloads.
@@ -218,7 +326,7 @@ When `save_failed_artifacts = true` in `server_config.toml`, any processing fail
 This directory is not automatically cleaned up — manage disk space manually.
 
 Additional artifact types can be enabled independently:
-- `save_table_conversion_artifacts`: saves input spreadsheet + generated PDF when sparse fallback triggers.
+- `save_table_conversion_artifacts`: saves the input spreadsheet + the generated PDF whenever a spreadsheet is rendered to PDF (`ocr`, `both`, or the `auto` fallback).
 - `save_cell_error_artifacts`: saves Markdown before/after error masking when cell errors are detected.
 
 ### LibreOffice UNO transport (Unix domain socket)

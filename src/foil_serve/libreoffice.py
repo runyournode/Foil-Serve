@@ -8,12 +8,55 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeIs, get_args
+
+from pydantic import TypeAdapter, ValidationError
 
 from settings import PaperFormat
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# File types LibreOffice converts to PDF for us.
+OfficeMimeExt = Literal[
+    ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
+]
+_OFFICE_MIME_EXTS = frozenset(get_args(OfficeMimeExt))
+
+
+def is_office_mime_ext(mime: str) -> TypeIs[OfficeMimeExt]:
+    """True when `convert_to_pdf` can handle this extension (and narrows its type)."""
+    return mime in _OFFICE_MIME_EXTS
+
+
+# (sheet name, page count) pairs for the sheets present in a converted PDF.
+# None whenever LibreOffice could not report them — callers must degrade, not guess.
+SheetPageMap = list[tuple[str, int]] | None
+
+# The sidecar is written by a separate process (soffice's own Python), so it is
+# untrusted input and gets validated rather than json.load()ed blindly.
+_SHEET_MAP_ADAPTER: TypeAdapter[list[tuple[str, int]]] = TypeAdapter(
+    list[tuple[str, int]]
+)
+
+
+def _read_sheet_map(path: Path) -> SheetPageMap:
+    """Parse the sheet→page-count sidecar written by the UNO script.
+
+    Returns None when the file is missing or malformed, or when LibreOffice could
+    not count the pages of at least one sheet (-1) — a partial map is worse than
+    none, as it would silently misplace every anchor after the unknown sheet.
+    """
+    try:
+        sheet_map = _SHEET_MAP_ADAPTER.validate_json(path.read_bytes())
+    except (OSError, ValidationError) as e:
+        logger.warning(f"Unusable sheet→page map at '{path}': {e!r}")
+        return None
+    if any(count < 0 for _, count in sheet_map):
+        logger.warning(f"LibreOffice could not count pages for some sheets in '{path}'")
+        return None
+    return sheet_map
+
 
 # Prefix for our UNO pipe names. Namespacing keeps the residual-socket sweep
 # (see LibreOfficeServer._sweep_dead_pipes) from ever touching LibreOffice's own
@@ -357,6 +400,7 @@ convert()
         self,
         file_path: Path,
         output_pdf: Path,
+        sheet_map_path: Path,
         paper_format: PaperFormat = "A3",
         landscape: bool = True,
     ) -> str:
@@ -364,6 +408,10 @@ convert()
         Build a UNO Python script for spreadsheet conversion: sets each sheet to
         the given paper format and orientation with fit-to-page-width before exporting to PDF.
         This avoids tiny text on sheets with many columns.
+
+        The script also writes ``sheet_map_path`` — a JSON list of [sheet name, page
+        count] for the visible sheets — so the caller can map PDF pages back to sheets.
+        A page count of -1 means "unknown"; the caller then ignores the whole map.
         """
         # PAPER_SIZES stores (long_side, short_side)
         long_side, short_side = PAPER_SIZES[paper_format]
@@ -373,6 +421,7 @@ convert()
             width, height = short_side, long_side
         orientation = "landscape" if landscape else "portrait"
         return f"""
+import json
 import uno
 from com.sun.star.beans import PropertyValue
 
@@ -408,6 +457,21 @@ def convert():
         style.Height = {height}   # {paper_format} {orientation} height in 1/100 mm
         style.ScaleToPagesX = 1  # fit all columns to 1 page width
         style.ScaleToPagesY = 0  # unlimited pages vertically
+
+    # Page count per visible sheet, computed after the page styles are applied.
+    # Hidden sheets are skipped: they are not part of the exported PDF.
+    sheet_map = []
+    for i in range(sheets.getCount()):
+        sheet = sheets.getByIndex(i)
+        if not sheet.IsVisible:
+            continue
+        try:
+            n_pages = doc.getRendererCount(sheet, ())
+        except Exception:
+            n_pages = -1
+        sheet_map.append([sheet.Name, n_pages])
+    with open("{sheet_map_path.resolve().as_posix()}", "w", encoding="utf-8") as fh:
+        json.dump(sheet_map, fh)
 
     pdf_filter = PropertyValue()
     pdf_filter.Name = "FilterName"
@@ -471,13 +535,25 @@ convert()
         self._run_uno_script(script, label="UNO general")
 
     def convert_spreadsheet(
-        self, file_path: Path, output_pdf: Path, paper_format: PaperFormat = "A3"
-    ) -> None:
-        """Convert a spreadsheet to PDF via UNO (landscape, fit-to-width)."""
+        self,
+        file_path: Path,
+        output_pdf: Path,
+        paper_format: PaperFormat = "A3",
+        landscape: bool = True,
+    ) -> SheetPageMap:
+        """Convert a spreadsheet to PDF via UNO (fit-to-width).
+
+        Returns the (sheet name, page count) pairs of the exported sheets, or None
+        when LibreOffice could not report them.
+        """
         self._ensure_running()
         assert self._pipe_name is not None
-        script = self._build_uno_script_spreadsheet(file_path, output_pdf, paper_format)
+        sheet_map_path = output_pdf.with_name(f"{output_pdf.stem}_sheets.json")
+        script = self._build_uno_script_spreadsheet(
+            file_path, output_pdf, sheet_map_path, paper_format, landscape
+        )
         self._run_uno_script(script, label="UNO spreadsheet")
+        return _read_sheet_map(sheet_map_path)
 
     def stop(self) -> None:
         """Terminate soffice and remove the PID file."""
@@ -500,26 +576,31 @@ convert()
 
 def convert_to_pdf(
     file_path: Path,
-    mime: Literal[
-        ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
-    ],
+    mime: OfficeMimeExt,
     lo_server: LibreOfficeServer,
     paper_format: PaperFormat | None = None,
-) -> Path:
+    landscape: bool = True,
+) -> tuple[Path, SheetPageMap]:
     """
     Convert an Office document to PDF via LibreOffice UNO (output in same directory as source).
-    For spreadsheets, `paper_format` controls the page size (default "A3").
-    Returns the path of the generated PDF.
+    For spreadsheets, `paper_format` and `landscape` control the page setup (default "A3",
+    landscape).
+    Returns the path of the generated PDF and, for spreadsheets only, the
+    (sheet name, page count) pairs it contains (None when unavailable).
     """
     generated_pdf = file_path.with_suffix(".pdf")
+    sheet_map: SheetPageMap = None
 
     if not file_path.exists():
         raise FileNotFoundError(str(file_path))
 
     if mime in (".xls", ".xlsx", ".ods"):
         try:
-            lo_server.convert_spreadsheet(
-                file_path, generated_pdf, paper_format=paper_format or "A3"
+            sheet_map = lo_server.convert_spreadsheet(
+                file_path,
+                generated_pdf,
+                paper_format=paper_format or "A3",
+                landscape=landscape,
             )
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
@@ -536,4 +617,4 @@ def convert_to_pdf(
     if not generated_pdf.exists():
         raise RuntimeError("PDF conversion failed: no output file was created")
 
-    return generated_pdf
+    return generated_pdf, sheet_map

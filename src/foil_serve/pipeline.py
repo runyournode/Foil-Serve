@@ -37,7 +37,7 @@ def _init_worker(config_path: str) -> None:
 
 def _worker_predict(
     file_path: str, use_ocr_for_image_block: bool = True
-) -> tuple[str, dict[str, Image], float]:
+) -> tuple[list[str], dict[str, Image], float]:
     """
     Worker process entry point — only pipeline.predict() and image extraction.
 
@@ -126,7 +126,9 @@ def _worker_predict(
             "unsupported file type or corrupted file"
         )
 
-    return "  \n".join(mds), imgs, time.perf_counter() - t0_worker
+    # Pages are returned separately (not pre-joined) so the caller can map output
+    # line numbers back to PDF pages — the spreadsheet table of contents needs it.
+    return mds, imgs, time.perf_counter() - t0_worker
 
 
 class PaddlePipelineWrapper:
@@ -183,7 +185,7 @@ class PaddlePipelineWrapper:
 
     async def run(
         self, file_path: str, use_ocr_for_image_block: bool = True
-    ) -> tuple[str, dict[str, Image], float]:
+    ) -> tuple[list[str], dict[str, Image], float]:
         """
         Runs pipeline.predict() in the dedicated worker process for the given file path.
 
@@ -202,10 +204,13 @@ class PaddlePipelineWrapper:
 
         Returns
         -------
-        md_raw : str
-            Raw Markdown from paddle (pages joined, before prune_tables).
+        md_pages : list[str]
+            Raw Markdown from paddle, one entry per page, in order (before prune_tables).
+            Join with "  \\n" to rebuild the whole-document Markdown.
         imgs : dict[str, Image]
             Extracted images as PIL Images {name: PIL.Image}.
+        elapsed : float
+            Active seconds spent in the worker.
         """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()

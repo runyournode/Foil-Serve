@@ -18,6 +18,7 @@ import httpx
 from fastapi import HTTPException
 
 from schemas import ExternalProcessorConfig, Metadata
+from settings import external_registry
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,13 @@ logger = logging.getLogger(__name__)
 def external_mime_ext(raw_mime: str) -> str:
     """Best-effort file extension for an externally-routed MIME type (video/mp4 → .mp4)."""
     return mimetypes.guess_extension(raw_mime) or ".bin"
+
+
+# MIME → extension for every externally-routed type (e.g. {"video/mp4": ".mp4"}).
+# Static after startup: external_registry is loaded once from server_config.toml.
+EXTERNAL_MIME_EXT: dict[str, str] = {
+    raw_mime: external_mime_ext(raw_mime) for raw_mime in external_registry
+}
 
 
 def merge_external_metadata(

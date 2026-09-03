@@ -1,5 +1,8 @@
 import re
 import logging
+from collections.abc import Sequence
+
+from table_utils import prune_tables
 
 logger = logging.getLogger(__name__)
 
@@ -57,3 +60,45 @@ def reformat_md(
         return "".join(parts)
 
     return pattern.sub(replacement_logic, md)
+
+
+# ---------------------------------------------------------------------------
+#  Per-page helpers
+# ---------------------------------------------------------------------------
+# The pipeline returns one Markdown string per PDF page. Post-processing runs
+# page by page so page boundaries — and therefore output line numbers — stay
+# locatable for the spreadsheet table of contents. Paddle never emits a table or
+# a figure across a page boundary, so this is equivalent to processing the whole
+# document at once.
+
+PAGE_SEPARATOR = "  \n"
+
+
+def join_pages(pages: Sequence[str]) -> str:
+    """Rebuild the whole-document Markdown from per-page Markdown."""
+    return PAGE_SEPARATOR.join(pages)
+
+
+def prune_pages(pages: Sequence[str], table_format: str) -> list[str]:
+    """prune_tables applied page by page."""
+    return [
+        prune_tables(md_with_html=page, table_format=table_format) for page in pages
+    ]
+
+
+def reformat_pages(
+    pages: Sequence[str],
+    descriptions_dict: dict[str, str] | None,
+    ocr_dict: dict[str, str],
+    include_ocr: bool,
+) -> list[str]:
+    """reformat_md applied page by page."""
+    return [
+        reformat_md(
+            md=page,
+            descriptions_dict=descriptions_dict,
+            ocr_dict=ocr_dict,
+            include_ocr=include_ocr,
+        )
+        for page in pages
+    ]

@@ -1,4 +1,19 @@
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, HttpUrl
+
+
+class SpreadsheetMode(StrEnum):
+    """Conversion strategy for spreadsheet inputs (.xls/.xlsx/.ods).
+
+    Ignored for every other file type. Selected per request via the
+    `spreadsheet_mode` query param or the dedicated /v1/process/spreadsheet_* routes.
+    """
+
+    AUTO = "auto"  # pandas, with PDF+OCR fallback when the file is empty or sparse
+    PANDAS = "pandas"  # cell extraction only, never falls back
+    OCR = "ocr"  # LibreOffice → PDF → PaddleOCR only, pandas is not run
+    BOTH = "both"  # both conversions, concatenated in a single Markdown document
 
 
 class ExternalProcessorConfig(BaseModel):
