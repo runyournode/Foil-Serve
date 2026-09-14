@@ -5,9 +5,10 @@ optional artifact saving for debugging, and assembly of the final Markdown
 document (header + table of contents with exact line numbers).
 """
 
+import html
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from libreoffice import LibreOfficeServer
 
 from schemas import SpreadsheetMode
 from settings import TableOutputFormat, settings
+from spreadsheet_drawings import Figure
 from table_utils import _compact_table, _render_md_table
 from debug import save_cell_error_artifacts
 
@@ -51,14 +53,26 @@ class SheetAnchor:
 class SpreadsheetConversion:
     """Result of the pandas cell-extraction conversion.
 
+    ``sheets`` holds one (sheet name, Markdown table) pair per sheet read, in
+    workbook order — the table is empty when nothing survived cleaning. Keeping
+    sheets apart lets pictures and charts be appended under their own sheet before
+    the section is assembled and its line numbers counted.
+
     ``pre_clean_bytes`` is the UTF-8 size of the Markdown *before* error masking
     and empty stripping — used for the sparse-fallback ratio check so that files
     heavy with NaN/errors are not incorrectly treated as sparse.
     """
 
-    markdown: str
+    sheets: tuple[tuple[str, str], ...]
     pre_clean_bytes: int
-    anchors: tuple[SheetAnchor, ...]
+
+    @property
+    def markdown(self) -> str:
+        return assemble_sections(self.sheets)[0]
+
+    @property
+    def anchors(self) -> tuple[SheetAnchor, ...]:
+        return assemble_sections(self.sheets)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,10 +211,9 @@ def _excel2txt(
             path, sheet_name=None, dtype=str, keep_default_na=False, engine=engine
         )
         has_any_errors = False
-        txt = ""
+        sheet_tables: list[tuple[str, str]] = []
         txt_with_errors = ""
         txt_pre_clean = ""
-        anchors: list[SheetAnchor] = []
 
         for sheet_name, df in sheets.items():
             # Convert any remaining float NaN (merged cells, formula errors, etc.)
@@ -260,12 +273,7 @@ def _excel2txt(
                 df = _apply_error_replacement(df, error_map)
 
             df = _strip_empty(df)
-            md = _df_to_md(df, table_format)
-            if md:
-                # The heading lands on the line right after the ones already emitted:
-                # the leading "\n" closes the current line, "## …" opens the next one.
-                anchors.append(SheetAnchor(sheet_name, txt.count("\n") + 2))
-                txt += f"\n## {sheet_name}\n\n{md}\n\n"
+            sheet_tables.append((sheet_name, _df_to_md(df, table_format)))
 
         # Raise only when the file is truly empty (no cell data at all, before any
         # cleaning). If pre_clean has content but txt is empty (e.g. all cells were
@@ -280,7 +288,7 @@ def _excel2txt(
             save_cell_error_artifacts(
                 input_path=path,
                 md_with_errors=txt_with_errors,
-                md_final=txt if mask_errors else None,
+                md_final=assemble_sections(sheet_tables)[0] if mask_errors else None,
                 artifacts_dir=Path(settings.artifact_dir)
                 / settings.cell_error_artifacts_subdir,
                 raw_mime=raw_mime,
@@ -296,9 +304,8 @@ def _excel2txt(
         )
         raise e
     return SpreadsheetConversion(
-        markdown=txt,
+        sheets=tuple(sheet_tables),
         pre_clean_bytes=len(txt_pre_clean.encode("utf-8")),
-        anchors=tuple(anchors),
     )
 
 
@@ -376,10 +383,11 @@ def resolve_strategy(mode: SpreadsheetMode) -> tuple[bool, bool]:
 
 
 def is_sparse(
-    conversion: SpreadsheetConversion,
+    pre_clean_bytes: int,
     file_size: int,
     min_input_mb: float,
     min_output_ratio: float,
+    object_bytes: int = 0,
 ) -> bool:
     """True when a spreadsheet yields so little Markdown that OCR is worth trying.
 
@@ -387,12 +395,19 @@ def is_sparse(
     empty-row stripping) so that a NaN/error-heavy file is not mistaken for a
     sparse one: it has real cell data, and OCR would only reproduce the errors.
 
-    Files below ``min_input_mb`` are never considered: rendering a small file to
-    PDF costs more than the little it could add.
+    ``object_bytes`` — the pictures and charts extracted natively — is taken out of
+    the file size first: a small table next to a large picture is fully converted
+    (table by pandas, picture extracted), and must not look sparse because of the
+    picture's weight. What remains is content pandas really cannot see (text
+    boxes, shapes, OLE objects…).
+
+    Files whose remaining size is below ``min_input_mb`` are never considered:
+    rendering a small file to PDF costs more than the little it could add.
     """
-    if file_size < min_input_mb * 1024 * 1024:
+    effective_size = max(file_size - object_bytes, 0)
+    if effective_size < min_input_mb * 1024 * 1024:
         return False
-    return conversion.pre_clean_bytes < file_size * min_output_ratio
+    return pre_clean_bytes < effective_size * min_output_ratio
 
 
 def build_ocr_body(
@@ -431,16 +446,104 @@ def build_ocr_body(
             )
         groups = [(f"Page {i}", [page]) for i, page in enumerate(pages, start=1)]
 
+    # Pages within a sheet keep the pipeline's original "  \n" join.
+    return assemble_sections((name, "  \n".join(group)) for name, group in groups)
+
+
+def assemble_sections(
+    groups: Iterable[tuple[str, str]],
+) -> tuple[str, tuple[SheetAnchor, ...]]:
+    """Join (heading, body) pairs under ``## <heading>`` lines, skipping blank bodies.
+
+    Returns (markdown, anchors) — anchor line numbers are 1-based within the result.
+    """
     txt = ""
     anchors: list[SheetAnchor] = []
-    for name, group in groups:
-        # Pages within a sheet keep the pipeline's original "  \n" join.
-        body = "  \n".join(group)
+    for name, body in groups:
         if not body.strip():
             continue
+        # The heading lands on the line right after the ones already emitted:
+        # the leading "\n" closes the current line, "## …" opens the next one.
         anchors.append(SheetAnchor(name, txt.count("\n") + 2))
         txt += f"\n## {name}\n\n{body}\n\n"
     return txt, tuple(anchors)
+
+
+# ---------------------------------------------------------------------------
+#  Pictures and charts under their sheet
+# ---------------------------------------------------------------------------
+
+
+def _as_lines(text: str) -> str:
+    """Normalize every line break (\\r, \\u2028…) to "\\n", so that line counting —
+    which only sees "\\n" — agrees with ``str.splitlines()`` downstream."""
+    return "\n".join(line.rstrip() for line in text.strip().splitlines())
+
+
+def render_figures(
+    figures: Sequence[Figure],
+    kept_images: Collection[str],
+    descriptions: Mapping[str, str] | None,
+    omitted: int = 0,
+) -> str:
+    """Markdown for the pictures and charts of one sheet, in on-sheet order.
+
+    Same ``<figure>`` shape as the OCR path (``postprocessing.reformat_md``), plus
+    a ``<chart>`` block carrying a chart's structural summary. Images missing from
+    ``kept_images`` (too small, over the cap) are left out; a chart without an image
+    still shows its summary.
+    """
+    blocks: list[str] = []
+    for figure in figures:
+        image = figure.image if figure.image in kept_images else None
+        if image is None and not figure.summary:
+            continue
+        parts = ["<figure>"]
+        if image is not None:
+            alt = " ".join(figure.alt_text.split())
+            alt_attr = f' alt="{html.escape(alt)}"' if alt else ""
+            parts.append(f'<img src="{image}"{alt_attr}>')
+        if figure.summary:
+            summary = "  \n".join(
+                html.escape(_as_lines(figure.summary), quote=False).split("\n")
+            )
+            parts.append(f"<chart>  \n{summary}  \n</chart>")
+        description = (
+            descriptions.get(image, "") if descriptions is not None and image else ""
+        )
+        if description.strip():
+            parts.append(f"<figcaption>  \n{_as_lines(description)}  \n</figcaption>")
+        parts.append("</figure>")
+        blocks.append("\n".join(parts))
+    if omitted:
+        blocks.append(
+            f"> {omitted} more image(s) on this sheet were not extracted: "
+            f"the per-document image limit was reached."
+        )
+    return "\n\n".join(blocks)
+
+
+def merge_sheet_bodies(
+    tables: Sequence[tuple[str, str]],
+    figures: Mapping[str, str],
+    sheet_order: Sequence[str] = (),
+) -> list[tuple[str, str]]:
+    """Per-sheet bodies: the table, then the sheet's figures.
+
+    Sheets follow ``sheet_order`` (the workbook order, which also knows chart
+    sheets pandas does not read), then any sheet it does not list.
+    """
+    table_by_sheet = dict(tables)
+    names = dict.fromkeys([*sheet_order, *table_by_sheet, *figures])
+    bodies = []
+    for name in names:
+        parts = [
+            part.strip("\n")
+            for part in (table_by_sheet.get(name, ""), figures.get(name, ""))
+            if part.strip()
+        ]
+        bodies.append((name, "\n\n".join(parts)))
+    return bodies
 
 
 # ---------------------------------------------------------------------------

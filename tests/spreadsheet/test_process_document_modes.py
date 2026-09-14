@@ -17,9 +17,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from PIL import Image
 
 from fastapi import HTTPException
 
+from libreoffice import RenderedShape
 from schemas import SpreadsheetMode
 from settings import settings
 
@@ -46,24 +48,36 @@ def isolated_runtime(tmp_path, monkeypatch):
 @pytest.fixture
 def request_stub():
     """A stand-in for fastapi.Request carrying only the app.state we touch."""
+    lo_server = MagicMock()
+    # Drawing rendering fails like a missing LibreOffice would; tests that need
+    # renderings install a fake (see `fake_render`).
+    lo_server.render_drawings.side_effect = RuntimeError("no LibreOffice in unit tests")
     state = types.SimpleNamespace(
         pipeline_wrapper=MagicMock(),
         excel_sem=asyncio.Semaphore(1),
         libreoffice_sem=asyncio.Semaphore(1),
-        # Raises on any conversion attempt, so reaching LibreOffice is observable.
-        libreoffice_server=MagicMock(),
+        # The PDF conversion finds no output file and fails, so reaching it is observable.
+        libreoffice_server=lo_server,
+        img_desc_sem={},
     )
     return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
 
 
-def _process(request_stub, fixture: str, mode: SpreadsheetMode, **kwargs):
+def _process(
+    request_stub,
+    fixture: str,
+    mode: SpreadsheetMode,
+    model: str | None = None,
+    client=None,
+    **kwargs,
+):
     content = (FIXTURES / fixture).read_bytes()
     return asyncio.run(
         processing.process_document(
             request_stub,
             content,
-            None,
-            None,
+            model,
+            client,
             time.perf_counter(),
             spreadsheet_mode=mode,
             **kwargs,
@@ -96,7 +110,7 @@ class TestPandasOutcome:
         )
         md = result.page_content
         assert result.mime_ext == ".xlsx"
-        assert result.images == {}, "the pandas path extracts no images"
+        assert result.images == {}, "this workbook has no picture or chart"
         assert result.metadata.img_desc_time == 0
         assert "**pandas**" in md, "the header must state the method actually used"
 
@@ -174,6 +188,182 @@ class TestModeWiring:
             _process(request_stub, "all_sheets_empty.xlsx", SpreadsheetMode.BOTH)
         assert exc.value.status_code == 500, "should have reached the OCR conversion"
         assert "PDF conversion error" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+#  Pictures and charts in the pandas section
+# ---------------------------------------------------------------------------
+
+# A cell range as Excel or ODF writes it — must never reach the Markdown.
+_CELL_RANGE_RE = re.compile(
+    r"\$?[A-Z]{1,3}\$?\d+:\$?[A-Z]{1,3}\$?\d+|!\$?[A-Z]{1,3}\$?\d+"
+)
+
+
+def _section(md: str, sheet: str) -> str:
+    """Body under `## <sheet>`, up to the next heading."""
+    lines = md.splitlines()
+    start = lines.index(f"## {sheet}")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start + 1 : end])
+
+
+@pytest.fixture
+def fake_render(request_stub):
+    """LibreOffice rendering of the two charts of drawings.xlsx, as real PNGs."""
+    calls = []
+
+    def _render(file_path, out_dir, charts, pictures, output_xlsx=None):
+        calls.append((charts, pictures))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shapes = []
+        for index, name in enumerate(["Chart 1", "Chart 2"]):
+            png = out_dir / f"chart{index}.png"
+            Image.new("RGB", (400, 200), (0, 100, 0)).save(png)
+            shapes.append(RenderedShape("Data", "chart", index, name, png))
+        return shapes
+
+    request_stub.app.state.libreoffice_server.render_drawings.side_effect = _render
+    return calls
+
+
+@pytest.fixture
+def fake_vlm(monkeypatch):
+    """Replaces the VLM fan-out; records the context each image was sent with."""
+    contexts: dict[str, str] = {}
+
+    async def _describe(client, model_name, imgs_b64, ocrs, semaphore):
+        described = {name: ocrs[name] for name in imgs_b64 if name in ocrs}
+        contexts.update(described)
+        return {name: f"Description of {name}." for name in described}, 3.0
+
+    monkeypatch.setattr(processing, "describe_images", _describe)
+    return contexts
+
+
+class TestPicturesAndCharts:
+    def test_objects_are_listed_under_their_sheet(self, request_stub):
+        """LibreOffice unavailable: pictures still come out, charts as summaries."""
+        result = _process(request_stub, "drawings.xlsx", SpreadsheetMode.PANDAS)
+        md = result.page_content
+
+        assert set(result.images) == {"imgs/sheet2_picture1.jpg"}, (
+            "the 32x32 icon is below image_min_size"
+        )
+        data = _section(md, "Data")
+        assert data.index("|Month|") < data.index("<chart>"), (
+            "table first, then objects"
+        )
+        assert data.index('"Revenue 2025"') < data.index('"Cost trend"')
+        assert "<img" not in data, "charts were not rendered"
+
+        pics = _section(md, "Pics")
+        assert pics.count("<img") == 1 and 'src="imgs/sheet2_picture1.jpg"' in pics
+        assert "sheet2_picture2" not in md
+
+        rows = _toc(md)
+        assert [label for label, _ in rows] == ["Data", "Pics"]
+        lines = md.splitlines()
+        for label, line in rows:
+            assert lines[line - 1] == f"## {label}"
+        assert not _CELL_RANGE_RE.search(md), "no cell reference in the output"
+
+    def test_rendered_charts_are_described_with_their_summary(
+        self, request_stub, fake_render, fake_vlm
+    ):
+        result = _process(
+            request_stub,
+            "drawings.xlsx",
+            SpreadsheetMode.PANDAS,
+            model="fake-vlm",
+            client=MagicMock(),
+        )
+        assert fake_render == [(True, False)], "charts only: no metafile in this file"
+        assert set(result.images) == {
+            "imgs/sheet1_chart1.jpg",
+            "imgs/sheet1_chart2.jpg",
+            "imgs/sheet2_picture1.jpg",
+        }
+        assert fake_vlm["imgs/sheet1_chart1.jpg"].startswith(
+            'Column chart "Revenue 2025"'
+        )
+        assert fake_vlm["imgs/sheet2_picture1.jpg"] == "", "no meaningful alt text"
+        assert result.metadata.img_desc_time == 3
+
+        md = result.page_content
+        data = _section(md, "Data")
+        assert "Description of imgs/sheet1_chart1.jpg." in data
+        assert data.index('src="imgs/sheet1_chart1.jpg"') < data.index("<figcaption>")
+        assert "Description of imgs/sheet2_picture1.jpg." in _section(md, "Pics")
+
+    def test_image_cap(self, request_stub, fake_render, monkeypatch):
+        monkeypatch.setattr(settings, "excel_max_images", 0)
+        result = _process(request_stub, "drawings.xlsx", SpreadsheetMode.PANDAS)
+        assert result.images == {}
+        md = result.page_content
+        assert _section(md, "Data").count("<chart>") == 2, "charts keep their summary"
+        assert "> 2 more image(s)" in _section(md, "Data")
+        assert "> 2 more image(s)" in _section(md, "Pics")
+
+    def test_extraction_can_be_disabled(self, request_stub, monkeypatch):
+        monkeypatch.setattr(settings, "excel_extract_images", False)
+        result = _process(request_stub, "drawings.xlsx", SpreadsheetMode.PANDAS)
+        assert result.images == {}
+        assert "<figure>" not in result.page_content
+        assert "<chart>" not in result.page_content
+        # Without its pictures, Pics is a lone header cell: pandas renders no table.
+        assert [label for label, _ in _toc(result.page_content)] == ["Data"]
+
+    def test_a_workbook_of_pictures_is_not_empty(self, request_stub, monkeypatch):
+        monkeypatch.setattr(settings, "excel_pdf_fallback_enabled", True)
+        for mode in (SpreadsheetMode.PANDAS, SpreadsheetMode.AUTO):
+            result = _process(request_stub, "pictures_only.xlsx", mode)
+            assert "**pandas**" in result.page_content
+            assert set(result.images) == {"imgs/sheet1_picture1.jpg"}
+            assert "<img" in _section(result.page_content, "Photos")
+
+    def test_auto_keeps_pandas_for_a_small_table_next_to_a_big_picture(
+        self, request_stub, monkeypatch
+    ):
+        """sparse_image_only.xlsx: ~720 kB of picture, a 3-row table."""
+        monkeypatch.setattr(settings, "excel_pdf_fallback_enabled", True)
+        result = _process(request_stub, "sparse_image_only.xlsx", SpreadsheetMode.AUTO)
+        md = result.page_content
+        assert "**pandas**" in md
+        assert "|Quarter|Revenue|" in md.replace(" ", "")
+        assert set(result.images) == {"imgs/sheet1_picture1.jpg"}
+
+    def test_auto_still_falls_back_on_content_it_cannot_extract(
+        self, request_stub, monkeypatch
+    ):
+        """sparse_ole_object.xlsx: the weight is an embedded object, not a picture."""
+        monkeypatch.setattr(settings, "excel_pdf_fallback_enabled", True)
+        with pytest.raises(HTTPException) as exc:
+            _process(request_stub, "sparse_ole_object.xlsx", SpreadsheetMode.AUTO)
+        assert exc.value.status_code == 500
+        assert "PDF conversion error" in exc.value.detail
+
+    def test_a_fallback_extracts_nothing(self, request_stub, monkeypatch):
+        """Once `auto` has chosen OCR, no picture is decoded and nothing is rendered."""
+        monkeypatch.setattr(settings, "excel_pdf_fallback_enabled", True)
+        monkeypatch.setattr(settings, "excel_min_input_for_fallback_mb", 0)
+        calls = []
+        monkeypatch.setattr(processing, "decode_objects", lambda **kw: calls.append(kw))
+        monkeypatch.setattr(
+            processing, "render_with_libreoffice", lambda **kw: calls.append(kw)
+        )
+        with pytest.raises(HTTPException) as exc:
+            _process(
+                request_stub,
+                "drawings.xlsx",
+                SpreadsheetMode.AUTO,
+                excel_min_output_ratio=1000.0,
+            )
+        assert "PDF conversion error" in exc.value.detail, "should have fallen back"
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------

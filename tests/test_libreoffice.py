@@ -195,3 +195,112 @@ def test_convert_spreadsheet_reports_pages_per_sheet(tmp_path):
     # Count the page objects of the produced PDF, without pulling in a PDF library.
     n_pages = len(re.findall(rb"/Type\s*/Page[^s]", out.read_bytes()))
     assert sum(count for _, count in sheet_map) == n_pages
+
+
+# ── drawings: charts and metafile pictures (requires LibreOffice) ─────────────
+
+SPREADSHEET_FIXTURES = Path(__file__).parent / "spreadsheet" / "fixtures"
+needs_soffice = pytest.mark.skipif(
+    shutil.which("soffice") is None, reason="LibreOffice (soffice) not installed"
+)
+
+
+@pytest.fixture(scope="module")
+def lo_server(tmp_path_factory):
+    srv = LibreOfficeServer(runtime_dir=str(tmp_path_factory.mktemp("lo_runtime")))
+    srv.start()
+    yield srv
+    srv.stop()
+
+
+def _colors(png: Path) -> int:
+    from PIL import Image
+
+    with Image.open(png) as im:
+        colors = im.convert("RGB").getcolors(maxcolors=1 << 16)
+    return len(colors) if colors is not None else 1 << 16  # None: even more colors
+
+
+def _input_copy(tmp_path: Path, fixture: str) -> Path:
+    """Copy a fixture the way the app stores uploads (no sibling .xlsx for .xls)."""
+    src = SPREADSHEET_FIXTURES / fixture
+    dst = tmp_path / f"input_file{src.suffix}"
+    shutil.copy(src, dst)
+    return dst
+
+
+@needs_soffice
+def test_render_drawings_exports_charts_only(lo_server, tmp_path):
+    rendered = lo_server.render_drawings(
+        SPREADSHEET_FIXTURES / "drawings.xlsx",
+        tmp_path / "out",
+        charts=True,
+        pictures=True,
+    )
+    assert rendered is not None
+    assert [(r.sheet, r.kind, r.index, r.name) for r in rendered] == [
+        ("Data", "chart", 0, "Chart 1"),
+        ("Data", "chart", 1, "Chart 2"),
+    ], "raster pictures are read from the file, never rendered"
+    for shape in rendered:
+        assert shape.png.parent == tmp_path / "out"
+        assert _colors(shape.png) > 10, "a rendered chart is not a blank canvas"
+
+
+@needs_soffice
+def test_emf_picture_is_rasterized(lo_server, tmp_path):
+    from spreadsheet_drawings import (
+        decode_objects,
+        render_with_libreoffice,
+        survey_drawings,
+    )
+
+    path = _input_copy(tmp_path, "drawings_emf.xlsx")
+    survey = survey_drawings(path, ".xlsx")
+    drawings, rendered = render_with_libreoffice(
+        path,
+        ".xlsx",
+        survey,
+        lo_server,
+        tmp_path,
+        render_charts=True,
+        rasterize_metafiles=True,
+    )
+    assert drawings is not None
+    image = decode_objects(drawings, rendered, 10).images["imgs/sheet1_picture1.jpg"]
+    colors = image.getcolors(maxcolors=1 << 16) or []
+    red = sum(n for n, (r, g, b) in colors if r > 200 and g < 60 and b < 60)
+    assert red > 0.5 * image.width * image.height, "the EMF is a red rectangle"
+
+
+@needs_soffice
+@pytest.mark.parametrize("fixture", ["drawings.xls", "drawings.ods"])
+def test_xls_and_ods_end_to_end(lo_server, tmp_path, fixture):
+    from spreadsheet_drawings import (
+        decode_objects,
+        render_with_libreoffice,
+        survey_drawings,
+    )
+
+    path = _input_copy(tmp_path, fixture)
+    survey = survey_drawings(path, path.suffix)
+    drawings, rendered = render_with_libreoffice(
+        path,
+        path.suffix,
+        survey,
+        lo_server,
+        tmp_path,
+        render_charts=True,
+        rasterize_metafiles=True,
+    )
+    assert drawings is not None
+    result = decode_objects(drawings, rendered, 10)
+    assert set(result.images) == {
+        "imgs/sheet1_chart1.jpg",
+        "imgs/sheet1_chart2.jpg",
+        "imgs/sheet2_picture1.jpg",
+        "imgs/sheet2_picture2.jpg",
+    }
+    assert "Series: Revenue, Cost" in result.contexts["imgs/sheet1_chart1.jpg"], (
+        "LibreOffice-saved charts carry cached series names"
+    )

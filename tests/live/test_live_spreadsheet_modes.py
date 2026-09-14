@@ -218,21 +218,28 @@ class TestQueryParam:
 
 
 class TestSparseFallback:
-    """`sparse_image_only.xlsx` is a big file with almost no cells — exactly what
-    the fallback exists for. It sits above excel_min_input_for_fallback_mb, so
-    the sparse check actually runs."""
+    """`sparse_ole_object.xlsx` is a big file with almost no cells, whose weight is
+    an embedded object pandas cannot see — exactly what the fallback exists for.
+    It sits above excel_min_input_for_fallback_mb, so the sparse check runs."""
 
     def test_auto_falls_back_to_ocr(self):
-        doc = _process("/v1/process", "sparse_image_only.xlsx")
+        doc = _process("/v1/process", "sparse_ole_object.xlsx")
         assert _method(doc["page_content"]) == "ocr"
-        assert doc["images"], "the embedded chart should come back as an image"
 
     def test_request_override_disables_the_fallback(self):
-        doc = _process("/v1/process?excel_min_output_ratio=0", "sparse_image_only.xlsx")
+        doc = _process("/v1/process?excel_min_output_ratio=0", "sparse_ole_object.xlsx")
         assert _method(doc["page_content"]) == "pandas", (
             "a threshold of 0 makes nothing sparse, so pandas must win"
         )
         assert "|Quarter|Revenue|" in doc["page_content"].replace(" ", "")
+
+    def test_a_big_picture_does_not_make_a_file_sparse(self):
+        """`sparse_image_only.xlsx`: ~720 kB of picture next to a small table. The
+        picture is extracted natively, so its weight does not count."""
+        doc = _process("/v1/process", "sparse_image_only.xlsx")
+        assert _method(doc["page_content"]) == "pandas"
+        assert "|Quarter|Revenue|" in doc["page_content"].replace(" ", "")
+        assert set(doc["images"]) == {"imgs/sheet1_picture1.jpg"}
 
     def test_dense_file_of_the_same_size_is_not_sparse(self):
         """Counterpart: same size class, real cell data → pandas, no OCR.
@@ -242,7 +249,39 @@ class TestSparseFallback:
 
 
 # ---------------------------------------------------------------------------
-#  4. Failure modes
+#  4. Pictures and charts of the pandas section
+# ---------------------------------------------------------------------------
+
+
+class TestPicturesAndCharts:
+    """`drawings.*`: a table with two charts on `Data`, two pictures on `Pics`
+    (one of them a 32x32 icon, below image_min_size)."""
+
+    EXPECTED_IMAGES = {
+        "imgs/sheet1_chart1.jpg",
+        "imgs/sheet1_chart2.jpg",
+        "imgs/sheet2_picture1.jpg",
+    }
+
+    @pytest.mark.parametrize(
+        "fixture", ["drawings.xlsx", "drawings.ods", "drawings.xls"]
+    )
+    def test_pandas_extracts_pictures_and_renders_charts(self, fixture):
+        doc = _process("/v1/process/spreadsheet_pandas", fixture)
+        md = doc["page_content"]
+        assert _method(md) == "pandas"
+        assert set(doc["images"]) == self.EXPECTED_IMAGES
+        assert md.count("<chart>") == 2
+        _assert_toc_is_exact(md, ["Data", "Pics"])
+
+    def test_both_carries_native_objects_and_ocr_crops(self):
+        doc = _process("/v1/process/spreadsheet_both", "drawings.xlsx")
+        assert _method(doc["page_content"]) == "both"
+        assert self.EXPECTED_IMAGES <= set(doc["images"])
+
+
+# ---------------------------------------------------------------------------
+#  5. Failure modes
 # ---------------------------------------------------------------------------
 
 
@@ -263,7 +302,7 @@ class TestFailureModes:
 
 
 # ---------------------------------------------------------------------------
-#  5. Non-spreadsheet inputs are unaffected by the mode
+#  6. Non-spreadsheet inputs are unaffected by the mode
 # ---------------------------------------------------------------------------
 
 

@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeIs, get_args
 
@@ -56,6 +57,50 @@ def _read_sheet_map(path: Path) -> SheetPageMap:
         logger.warning(f"LibreOffice could not count pages for some sheets in '{path}'")
         return None
     return sheet_map
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedShape:
+    """A drawing object LibreOffice exported to PNG.
+
+    ``index`` is the object's position among the objects of the same kind on its
+    sheet, in drawing order (groups flattened) — the fallback key used to match it
+    with the object found in the file's XML when shape names are ambiguous.
+    """
+
+    sheet: str
+    kind: Literal["picture", "chart"]
+    index: int
+    name: str
+    png: Path
+
+
+_RENDERED_ADAPTER: TypeAdapter[list[RenderedShape]] = TypeAdapter(list[RenderedShape])
+
+
+def _read_rendered(path: Path, out_dir: Path) -> list[RenderedShape] | None:
+    """Parse the rendering sidecar written by the UNO script.
+
+    Entries whose PNG is missing or lies outside ``out_dir`` are dropped: the
+    sidecar comes from another process and is not trusted to point anywhere else.
+    """
+    try:
+        shapes = _RENDERED_ADAPTER.validate_json(path.read_bytes())
+    except (OSError, ValidationError) as e:
+        logger.warning(f"Unusable drawing rendering sidecar at '{path}': {e!r}")
+        return None
+    root = out_dir.resolve()
+    return [
+        shape
+        for shape in shapes
+        if shape.png.resolve().is_relative_to(root) and shape.png.is_file()
+    ]
+
+
+# Resolution of drawings exported to PNG (charts, metafile pictures), and the cap
+# on their longest side — enough for a VLM to read labels, small enough to ship.
+_RENDER_DPI = 150
+_RENDER_MAX_PX = 2000
 
 
 # Prefix for our UNO pipe names. Namespacing keeps the residual-socket sweep
@@ -519,6 +564,189 @@ def convert():
 
 convert()
 """
+
+    def _build_uno_script_render_drawings(
+        self,
+        file_path: Path,
+        out_dir: Path,
+        sidecar_path: Path,
+        charts: bool,
+        pictures: bool,
+        output_xlsx: Path | None,
+    ) -> str:
+        """Build a UNO script exporting a spreadsheet's charts and metafile pictures to PNG.
+
+        Walks every sheet's draw page (groups flattened, drawing order) and exports:
+        - every chart when ``charts`` is set — charts are stored as XML, not as a bitmap;
+        - every picture whose graphic is not a plain raster format (EMF, WMF, SVM…)
+          when ``pictures`` is set — Pillow cannot draw those on Linux.
+        Raster pictures are skipped: the caller reads their original bytes from the file.
+
+        When ``output_xlsx`` is given, the document is first saved as .xlsx (used for
+        legacy .xls, whose drawings are only readable once converted).
+
+        The script writes ``sidecar_path``: a JSON list of {sheet, kind, index, name,
+        png}. A shape that fails to export is skipped, not fatal.
+        """
+        return f"""
+import json
+import uno
+from com.sun.star.beans import PropertyValue
+
+CHART_CLSID = "12DCAE26-281F-416F-A234-C3086127382E"
+RASTER_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/tiff", "image/webp")
+DPI = {_RENDER_DPI}
+MAX_PX = {_RENDER_MAX_PX}
+RENDER_CHARTS = {charts}
+RENDER_PICTURES = {pictures}
+OUT_DIR = {out_dir.resolve().as_posix()!r}
+OUTPUT_XLSX = {output_xlsx.resolve().as_posix() if output_xlsx else None!r}
+
+
+def prop(name, value):
+    p = PropertyValue()
+    p.Name = name
+    p.Value = value
+    return p
+
+
+def walk(shapes):
+    for i in range(shapes.getCount()):
+        shape = shapes.getByIndex(i)
+        if shape.getShapeType() == "com.sun.star.drawing.GroupShape":
+            for child in walk(shape):
+                yield child
+        else:
+            yield shape
+
+
+def kind_of(shape):
+    shape_type = shape.getShapeType()
+    if shape_type == "com.sun.star.drawing.GraphicObjectShape":
+        return "picture"
+    if shape_type == "com.sun.star.drawing.OLE2Shape":
+        try:
+            if shape.CLSID.upper() == CHART_CLSID:
+                return "chart"
+        except Exception:
+            pass
+    return None
+
+
+def wanted(shape, kind):
+    if kind == "chart":
+        return RENDER_CHARTS
+    if not RENDER_PICTURES:
+        return False
+    try:
+        mime = (shape.Graphic.MimeType or "").lower()
+    except Exception:
+        return False
+    return mime not in RASTER_MIMES
+
+
+def export_png(ctx, smgr, shape, png_path):
+    size_w, size_h = shape.Size.Width, shape.Size.Height  # 1/100 mm
+    if size_w < 100 or size_h < 100:
+        # Degenerate size (seen on generated chartsheets): use a readable default.
+        size_w, size_h = 25000, 15000
+    width = max(1, int(size_w / 2540 * DPI))
+    height = max(1, int(size_h / 2540 * DPI))
+    scale = min(1.0, MAX_PX / max(width, height))
+    width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    exporter = smgr.createInstanceWithContext("com.sun.star.drawing.GraphicExportFilter", ctx)
+    exporter.setSourceDocument(shape)
+    filter_data = uno.Any(
+        "[]com.sun.star.beans.PropertyValue",
+        (prop("PixelWidth", width), prop("PixelHeight", height)),
+    )
+    exporter.filter((
+        prop("URL", uno.systemPathToFileUrl(png_path)),
+        prop("MediaType", "image/png"),
+        prop("FilterData", filter_data),
+    ))
+
+
+def render():
+    localContext = uno.getComponentContext()
+    resolver = localContext.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", localContext
+    )
+    ctx = resolver.resolve(
+        "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
+    )
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    file_url = uno.systemPathToFileUrl({file_path.resolve().as_posix()!r})
+    doc = desktop.loadComponentFromURL(
+        file_url, "_blank", 0,
+        (prop("Hidden", True), prop("MacroExecutionMode", 0), prop("UpdateDocMode", 0)),
+    )
+    rendered = []
+    failures = 0
+    try:
+        if OUTPUT_XLSX:
+            doc.storeToURL(
+                uno.systemPathToFileUrl(OUTPUT_XLSX),
+                (prop("FilterName", "Calc MS Excel 2007 XML"),),
+            )
+        sheets = doc.getSheets()
+        for sheet_no in range(sheets.getCount()):
+            sheet = sheets.getByIndex(sheet_no)
+            counters = [0, 0]  # pictures, charts
+            for shape in walk(sheet.getDrawPage()):
+                kind = kind_of(shape)
+                if kind is None:
+                    continue
+                slot = 1 if kind == "chart" else 0
+                index = counters[slot]
+                counters[slot] += 1
+                if not wanted(shape, kind):
+                    continue
+                png_path = "%s/s%d_%s%d.png" % (OUT_DIR, sheet_no, kind, index)
+                try:
+                    export_png(ctx, smgr, shape, png_path)
+                except Exception:
+                    failures += 1
+                    continue
+                rendered.append(
+                    dict(sheet=sheet.Name, kind=kind, index=index, name=shape.Name, png=png_path)
+                )
+    finally:
+        doc.close(True)
+
+    with open({sidecar_path.resolve().as_posix()!r}, "w", encoding="utf-8") as fh:
+        json.dump(rendered, fh)
+    if failures:
+        print("%d shape(s) could not be exported" % failures)
+
+render()
+"""
+
+    def render_drawings(
+        self,
+        file_path: Path,
+        out_dir: Path,
+        charts: bool,
+        pictures: bool,
+        output_xlsx: Path | None = None,
+    ) -> list[RenderedShape] | None:
+        """Export charts and/or metafile pictures of a spreadsheet to PNG via UNO.
+
+        See `_build_uno_script_render_drawings`. PNGs land in ``out_dir``; the
+        returned list is None when the script ran but its sidecar is unusable.
+        Raises when the script itself fails.
+        """
+        self._ensure_running()
+        assert self._pipe_name is not None
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sidecar_path = out_dir / "rendered.json"
+        script = self._build_uno_script_render_drawings(
+            file_path, out_dir, sidecar_path, charts, pictures, output_xlsx
+        )
+        self._run_uno_script(script, label="UNO render drawings")
+        return _read_rendered(sidecar_path, out_dir)
 
     def convert_xls_to_xlsx(self, file_path: Path, output_xlsx: Path) -> None:
         """Convert a legacy .xls to .xlsx via UNO (handles old encryption with empty password)."""

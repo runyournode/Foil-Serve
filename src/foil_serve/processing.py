@@ -15,6 +15,7 @@ import gc
 import logging
 import tempfile
 import time
+from collections.abc import Collection, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,12 +41,23 @@ from spreadsheet import (
     EmptySpreadsheetError,
     SheetAnchor,
     SpreadsheetConversion,
+    assemble_sections,
     build_ocr_body,
     build_spreadsheet_document,
     excel2txt,
     human_size,
     is_sparse,
+    merge_sheet_bodies,
+    render_figures,
     resolve_strategy,
+)
+from spreadsheet_drawings import (
+    DrawingSurvey,
+    ExtractedObjects,
+    decode_objects,
+    needs_libreoffice,
+    render_with_libreoffice,
+    survey_drawings,
 )
 from utils import (
     SPREADSHEET_EXTS,
@@ -286,8 +298,13 @@ async def _read_plain_text(job: _Job) -> ProcessedResult:
 class _SpreadsheetState:
     """What the pandas conversion produced, and whether OCR still has to run."""
 
-    markdown: str | None = None
-    anchors: tuple[SheetAnchor, ...] = ()
+    # The pandas section is part of the output.
+    keep_pandas: bool = False
+    # (sheet, Markdown table) pairs; empty when the file has no cell data.
+    tables: tuple[tuple[str, str], ...] = ()
+    survey: DrawingSurvey = field(default_factory=DrawingSurvey)
+    # Pictures and charts of the pandas section, once decoded.
+    objects: ExtractedObjects | None = None
     run_ocr: bool = False
     sheet_page_map: SheetPageMap = None
 
@@ -302,6 +319,10 @@ async def _convert_with_pandas(
       pandas — never falls back; an empty file is a 422
       ocr    — pandas is not run at all
       both   — an empty pandas section is a warning, not a failure
+
+    Pictures and charts count as content: they are surveyed here, cheaply (byte
+    counts and drawing XML, nothing decoded), so that a workbook made of pictures
+    is neither "empty" nor "sparse" because of them.
     """
     run_pandas, run_ocr = resolve_strategy(mode)
     state = _SpreadsheetState(run_ocr=run_ocr)
@@ -321,57 +342,166 @@ async def _convert_with_pandas(
                         lo_server=job.state.libreoffice_server,
                     )
                 except EmptySpreadsheetError:
-                    # No cell data at all, before any cleaning.
-                    if mode is SpreadsheetMode.BOTH:
-                        logger.warning(
-                            f"Empty spreadsheet ({job.mime}) — the pandas section will be empty"
-                        )
-                    elif (
-                        mode is SpreadsheetMode.AUTO
-                        and settings.excel_pdf_fallback_enabled
-                    ):
-                        logger.warning(
-                            f"Empty spreadsheet detected ({job.mime}) — falling back to PDF+OCR pipeline"
-                        )
-                        state.run_ocr = True
-                    else:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"Spreadsheet is empty (no cell data found) and mode "
-                            f"'{mode.value}' does not run the OCR conversion ({job.mime})",
-                        )
+                    pass  # no cell data at all, before any cleaning — decided below
+        if settings.excel_extract_images:
+            with job.timer.track():
+                state.survey = await asyncio.to_thread(
+                    survey_drawings, path=job.prepared_path, mime=job.mime
+                )
 
-    if conversion is None:
+    if conversion is None and not state.survey.has_objects:
+        # No cell data, no picture, no chart.
+        if mode is SpreadsheetMode.BOTH:
+            logger.warning(
+                f"Empty spreadsheet ({job.mime}) — the pandas section will be empty"
+            )
+            state.keep_pandas = True
+        elif mode is SpreadsheetMode.AUTO and settings.excel_pdf_fallback_enabled:
+            logger.warning(
+                f"Empty spreadsheet detected ({job.mime}) — falling back to PDF+OCR pipeline"
+            )
+            state.run_ocr = True
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Spreadsheet is empty (no cell data, picture or chart found) and "
+                f"mode '{mode.value}' does not run the OCR conversion ({job.mime})",
+            )
         return state
-    state.markdown, state.anchors = conversion.markdown, conversion.anchors
 
-    # Sparse spreadsheets (text boxes / images / shapes only) — `auto` only:
-    # an explicit mode is the caller's decision, not ours.
+    # Sparse spreadsheets (text boxes / shapes / OLE objects) — `auto` only: an
+    # explicit mode is the caller's decision, not ours.
+    pre_clean_bytes = conversion.pre_clean_bytes if conversion is not None else 0
+    object_bytes = state.survey.object_bytes
     if (
         mode is SpreadsheetMode.AUTO
         and settings.excel_pdf_fallback_enabled
         and is_sparse(
-            conversion,
+            pre_clean_bytes,
             job.file_size,
             min_input_mb=settings.excel_min_input_for_fallback_mb,
             min_output_ratio=min_output_ratio,
+            object_bytes=object_bytes,
         )
     ):
+        effective_size = max(job.file_size - object_bytes, 1)
         logger.warning(
-            f"Sparse spreadsheet detected: {conversion.pre_clean_bytes} bytes pre-clean "
-            f"markdown from {job.file_size} bytes input "
-            f"(ratio {conversion.pre_clean_bytes / job.file_size:.4f}, "
+            f"Sparse spreadsheet detected: {pre_clean_bytes} bytes pre-clean markdown "
+            f"from {effective_size} bytes input ({job.file_size} bytes, "
+            f"{object_bytes} of which are pictures/charts; "
+            f"ratio {pre_clean_bytes / effective_size:.4f}, "
             f"threshold {min_output_ratio:.4f}) — falling back to PDF+OCR pipeline"
         )
         state.run_ocr = True
-        state.markdown, state.anchors = None, ()
+        state.survey = DrawingSurvey()
+        return state
+
+    state.keep_pandas = True
+    state.tables = conversion.sheets if conversion is not None else ()
     return state
+
+
+async def _extract_objects(
+    job: _Job, state: _SpreadsheetState, mode: SpreadsheetMode, tmpdir: Path
+) -> None:
+    """Decode the pictures and charts of a kept pandas section.
+
+    Runs once the OCR fallback is settled, so a discarded section costs nothing.
+    LibreOffice is involved only where the file holds no usable bitmap (charts,
+    EMF/WMF pictures) and for .xls.
+
+    Best effort: failures are logged and the section keeps its tables — an
+    optional extra must not sink a conversion that already succeeded. The one
+    exception is `auto` on a workbook with no cell data whose objects all turned
+    out unusable: it still gets its OCR fallback.
+    """
+    survey = state.survey
+    if not (state.keep_pandas and survey.has_objects):
+        return
+
+    drawings, rendered = survey.drawings, None
+    if needs_libreoffice(
+        job.mime,
+        survey,
+        render_charts=settings.excel_render_charts,
+        rasterize_metafiles=settings.excel_rasterize_metafiles,
+    ):
+        async with job.state.libreoffice_sem:
+            with job.timer.track():
+                try:
+                    drawings, rendered = await asyncio.to_thread(
+                        render_with_libreoffice,
+                        path=job.prepared_path,
+                        mime=job.mime,
+                        survey=survey,
+                        lo_server=job.state.libreoffice_server,
+                        work_dir=tmpdir,
+                        render_charts=settings.excel_render_charts,
+                        rasterize_metafiles=settings.excel_rasterize_metafiles,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"LibreOffice could not render the spreadsheet drawings "
+                        f"({job.mime}): {e!r} — charts keep their text summary only"
+                    )
+
+    if drawings is not None:
+        with job.timer.track():
+            try:
+                state.objects = await asyncio.to_thread(
+                    decode_objects,
+                    drawings=drawings,
+                    rendered=rendered,
+                    max_images=settings.excel_max_images,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not extract the spreadsheet pictures and charts "
+                    f"({job.mime}): {e!r}"
+                )
+
+    nothing_extracted = state.objects is None or not state.objects.figures
+    if (
+        not state.tables
+        and nothing_extracted
+        and mode is SpreadsheetMode.AUTO
+        and settings.excel_pdf_fallback_enabled
+    ):
+        logger.warning(
+            f"Spreadsheet without cell data whose pictures/charts could not be "
+            f"extracted ({job.mime}) — falling back to PDF+OCR pipeline"
+        )
+        state.keep_pandas = False
+        state.run_ocr = True
+        state.objects = None
+
+
+def _pandas_section(
+    state: _SpreadsheetState,
+    kept_images: Collection[str],
+    descriptions: Mapping[str, str] | None,
+) -> tuple[str, tuple[SheetAnchor, ...]]:
+    """The pandas section: each sheet's table, then its pictures and charts."""
+    objects = state.objects
+    figures_md: dict[str, str] = {}
+    sheet_order: tuple[str, ...] = ()
+    if objects is not None:
+        sheet_order = objects.sheet_order
+        for sheet in dict.fromkeys([*objects.figures, *objects.omitted]):
+            figures_md[sheet] = render_figures(
+                objects.figures.get(sheet, []),
+                kept_images,
+                descriptions,
+                omitted=objects.omitted.get(sheet, 0),
+            )
+    return assemble_sections(merge_sheet_bodies(state.tables, figures_md, sheet_order))
 
 
 def _finalize_spreadsheet(
     job: _Job,
     method: SpreadsheetMode,
-    state: _SpreadsheetState,
+    pandas_md: str | None = None,
+    pandas_anchors: tuple[SheetAnchor, ...] = (),
     ocr_md: str | None = None,
     ocr_anchors: tuple[SheetAnchor, ...] = (),
 ) -> str:
@@ -385,8 +515,8 @@ def _finalize_spreadsheet(
         mime_ext=job.mime,
         method=method,
         table_format=settings.table_output_format,
-        pandas_md=state.markdown,
-        pandas_anchors=state.anchors,
+        pandas_md=pandas_md,
+        pandas_anchors=pandas_anchors,
         ocr_md=ocr_md,
         ocr_anchors=ocr_anchors,
         input_bytes=job.file_size,
@@ -608,74 +738,93 @@ async def process_document(
                 if excel_min_output_ratio is not None
                 else settings.excel_min_output_ratio,
             )
-            if not sheet.run_ocr:
-                # Pandas-only outcome — the OCR pipeline is never touched.
-                return ProcessedResult(
-                    page_content=_finalize_spreadsheet(
-                        job, SpreadsheetMode.PANDAS, sheet
-                    ),
-                    images={},
-                    metadata=job.timer.metadata(),
-                    mime_ext=job.mime,
-                    raw_mime=job.raw_mime,
-                )
+            await _extract_objects(job, sheet, spreadsheet_mode, tmpdir)
+        # A pandas-only outcome never touches the OCR pipeline.
+        run_pipeline = not is_spreadsheet or sheet.run_ocr
 
-        # ── Phase 2 : convert to PDF when the pipeline cannot read the input ──
-        pipeline_input, sheet.sheet_page_map = await _to_pipeline_input(
-            job, tmpdir, is_spreadsheet
-        )
-        if job.artifact_ctx is not None and pipeline_input != job.prepared_path:
-            job.artifact_ctx.converted_pdf = pipeline_input
-
-        # ── Phase 3 : pipeline.predict() — serialized in a dedicated worker ──
         # OCR on image blocks is needed when a VLM description is requested (it
         # feeds the prompt) or when OCR text is wanted in the Markdown without VLM.
         has_vlm = image_description_model_name is not None and client is not None
         need_image_ocr = has_vlm or settings.output_paddle_ocr_no_img_desc
-        pages, imgs = await _run_pipeline(job, pipeline_input, need_image_ocr)
+        pages: list[str] = []
+        imgs: dict[str, Image] = {}
+
+        if run_pipeline:
+            # ── Phase 2 : convert to PDF when the pipeline cannot read the input
+            pipeline_input, sheet.sheet_page_map = await _to_pipeline_input(
+                job, tmpdir, is_spreadsheet
+            )
+            if job.artifact_ctx is not None and pipeline_input != job.prepared_path:
+                job.artifact_ctx.converted_pdf = pipeline_input
+
+            # ── Phase 3 : pipeline.predict() — serialized in a dedicated worker
+            pages, imgs = await _run_pipeline(job, pipeline_input, need_image_ocr)
 
     # tmpdir cleaned up; the worker is done and no longer needs the file.
 
     # ── Phase 4 : post-processing ────────────────────────────────────────────
-    ocrs, pages = await _post_process(job, pages, need_image_ocr)
+    ocrs: dict[str, str] = {}
+    if run_pipeline:
+        ocrs, pages = await _post_process(job, pages, need_image_ocr)
+    native = sheet.objects
+    if native is not None:
+        imgs = imgs | native.images
     imgs_b64 = _encode_images(job, imgs, image_description_model_name)
 
     # ── Phase 5 : image description (async, external VLM) ────────────────────
     if has_vlm and imgs_b64:
         assert client is not None and image_description_model_name is not None
+        # Paddle figures get their OCR text as context; pictures and charts read
+        # from a spreadsheet get their alt text / chart summary.
+        contexts = (ocrs | native.contexts) if native is not None else ocrs
         descriptions, img_desc_time = await describe_images(
             client=client,
             model_name=image_description_model_name,
             imgs_b64=imgs_b64,
-            ocrs=ocrs,
+            ocrs=contexts,
             semaphore=job.state.img_desc_sem.get(image_description_model_name),
         )
     else:
         descriptions, img_desc_time = None, 0.0
 
     # ── Phase 6 : inject descriptions and OCR into the figure blocks ─────────
-    include_ocr = (has_vlm and settings.output_paddle_ocr) or (
-        not has_vlm and settings.output_paddle_ocr_no_img_desc
-    )
-    with job.timer.track():
-        pages = await asyncio.to_thread(
-            reformat_pages,
-            pages=pages,
-            descriptions_dict=descriptions,
-            ocr_dict=ocrs,
-            include_ocr=include_ocr,
+    if run_pipeline:
+        include_ocr = (has_vlm and settings.output_paddle_ocr) or (
+            not has_vlm and settings.output_paddle_ocr_no_img_desc
         )
+        with job.timer.track():
+            pages = await asyncio.to_thread(
+                reformat_pages,
+                pages=pages,
+                descriptions_dict=descriptions,
+                ocr_dict=ocrs,
+                include_ocr=include_ocr,
+            )
 
     if is_spreadsheet:
-        # Group the OCR pages per sheet (when LibreOffice could say how many pages
-        # each sheet spans) and prepend the header + table of contents.
-        ocr_md, ocr_anchors = build_ocr_body(pages, sheet.sheet_page_map)
-        method = (
-            SpreadsheetMode.BOTH
-            if spreadsheet_mode is SpreadsheetMode.BOTH
-            else SpreadsheetMode.OCR
+        with job.timer.track():
+            pandas_md, pandas_anchors = (
+                _pandas_section(sheet, imgs_b64.keys(), descriptions)
+                if sheet.keep_pandas
+                else (None, ())
+            )
+            # Group the OCR pages per sheet (when LibreOffice could say how many
+            # pages each sheet spans).
+            ocr_md, ocr_anchors = (
+                build_ocr_body(pages, sheet.sheet_page_map)
+                if sheet.run_ocr
+                else (None, ())
+            )
+        if not sheet.run_ocr:
+            method = SpreadsheetMode.PANDAS
+        elif spreadsheet_mode is SpreadsheetMode.BOTH:
+            method = SpreadsheetMode.BOTH
+        else:
+            method = SpreadsheetMode.OCR
+        # Prepend the header + table of contents.
+        page_content = _finalize_spreadsheet(
+            job, method, pandas_md, pandas_anchors, ocr_md, ocr_anchors
         )
-        page_content = _finalize_spreadsheet(job, method, sheet, ocr_md, ocr_anchors)
     else:
         page_content = join_pages(pages)
         if not page_content.strip():

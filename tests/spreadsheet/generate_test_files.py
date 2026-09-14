@@ -491,6 +491,212 @@ def gen_ods_multi_sheet():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  24. Pictures and charts next to real tables.
+#      Data: a table + a bar chart (top) and a line chart (lower down).
+#      Pics: a caption cell, an RGBA picture, and a 32x32 icon below it — the icon
+#      is under image_min_size, so it must not reach the response.
+#      openpyxl writes charts WITHOUT cached values: summaries degrade to
+#      "series N" here, the .ods/.xls variants below (saved by LibreOffice) have them.
+# ─────────────────────────────────────────────────────────────────────────────
+def _png(size: tuple[int, int], color: tuple[int, ...], mode: str = "RGBA") -> bytes:
+    import io
+
+    from PIL import Image, ImageDraw
+
+    im = Image.new(mode, size, (255, 255, 255, 0) if mode == "RGBA" else "white")
+    ImageDraw.Draw(im).ellipse(
+        [size[0] // 8, size[1] // 8, size[0] * 7 // 8, size[1] * 7 // 8], fill=color
+    )
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def gen_drawings():
+    import io
+
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.drawing.image import Image as XLImage
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["Month", "Revenue", "Cost"])
+    for i, month in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun"]):
+        ws.append([month, 100 + i * 20, 80 + i * 5])
+
+    bar = BarChart()
+    bar.title = "Revenue 2025"
+    bar.x_axis.title = "Month"
+    bar.y_axis.title = "EUR"
+    bar.add_data(
+        Reference(ws, min_col=2, min_row=1, max_col=3, max_row=7), titles_from_data=True
+    )
+    bar.set_categories(Reference(ws, min_col=1, min_row=2, max_row=7))
+    ws.add_chart(bar, "E2")
+
+    line = LineChart()
+    line.title = "Cost trend"
+    line.add_data(Reference(ws, min_col=3, min_row=1, max_row=7), titles_from_data=True)
+    line.set_categories(Reference(ws, min_col=1, min_row=2, max_row=7))
+    ws.add_chart(line, "E20")
+
+    pics = wb.create_sheet("Pics")
+    pics["A1"] = "A picture below"
+    pics.add_image(XLImage(io.BytesIO(_png((400, 300), (200, 30, 30, 255)))), "B3")
+    pics.add_image(XLImage(io.BytesIO(_png((32, 32), (30, 30, 200, 255)))), "B30")
+    _save(wb, "drawings.xlsx")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  25. A workbook with pictures and no cell data at all: not "empty" any more.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_pictures_only():
+    import io
+
+    from openpyxl.drawing.image import Image as XLImage
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Photos"
+    ws.add_image(XLImage(io.BytesIO(_png((200, 150), (30, 160, 60, 255)))), "A1")
+    _save(wb, "pictures_only.xlsx")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  26. Tiny table + a large payload pandas cannot see and that is NOT a picture
+#      or a chart (an embedded OLE object). It stays sparse for `auto`, unlike
+#      sparse_image_only.xlsx whose weight is a picture extracted natively.
+# ─────────────────────────────────────────────────────────────────────────────
+def gen_sparse_ole_object():
+    import random
+    import zipfile
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["Quarter", "Revenue"])
+    ws.append(["Q1", 400000])
+    path = OUT / "sparse_ole_object.xlsx"
+    wb.save(path)
+    random.seed(1)
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/embeddings/oleObject1.bin", random.randbytes(400_000))
+    print(f"  ✓ {path.name}  ({path.stat().st_size:,} bytes)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  27. An EMF picture (Pillow cannot draw it on Linux): pictures_only.xlsx with its
+#      PNG swapped for a hand-built EMF — a red rectangle on a 200x150 canvas.
+# ─────────────────────────────────────────────────────────────────────────────
+def _emf_red_rectangle() -> bytes:
+    import struct
+
+    records = [
+        # EMR_CREATEBRUSHINDIRECT: handle 1, solid red brush (COLORREF 0x00BBGGRR)
+        struct.pack("<IIIIII", 39, 24, 1, 0, 0x000000FF, 0),
+        # EMR_SELECTOBJECT: handle 1
+        struct.pack("<III", 37, 12, 1),
+        # EMR_RECTANGLE
+        struct.pack("<IIiiii", 43, 24, 10, 10, 190, 140),
+        # EMR_EOF
+        struct.pack("<IIIII", 14, 20, 0, 16, 20),
+    ]
+    header_size = 88
+    total = header_size + sum(len(r) for r in records)
+    header = struct.pack(
+        "<II4i4iIIIIHHIII2i2i",
+        1,  # EMR_HEADER
+        header_size,
+        0,
+        0,
+        199,
+        149,  # bounds, device units
+        0,
+        0,
+        5292,
+        3969,  # frame, 0.01 mm (200x150 px at 96 dpi)
+        0x464D4520,  # " EMF"
+        0x10000,
+        total,
+        len(records) + 1,
+        2,  # handles (index 0 is reserved)
+        0,
+        0,
+        0,
+        0,  # description, palette
+        1024,
+        768,  # reference device, pixels
+        271,
+        203,  # reference device, millimeters
+    )
+    return header + b"".join(records)
+
+
+def gen_drawings_emf():
+    import zipfile
+
+    src = OUT / "pictures_only.xlsx"
+    path = OUT / "drawings_emf.xlsx"
+    with (
+        zipfile.ZipFile(src) as zin,
+        zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout,
+    ):
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            name = info.filename
+            if name.startswith("xl/media/"):
+                name, data = "xl/media/image1.emf", _emf_red_rectangle()
+            elif name == "xl/drawings/_rels/drawing1.xml.rels":
+                data = data.replace(b"image1.png", b"image1.emf")
+            elif name == "[Content_Types].xml":
+                data = data.replace(
+                    b'<Default Extension="png" ContentType="image/png"/>',
+                    b'<Default Extension="emf" ContentType="image/x-emf"/>',
+                )
+            zout.writestr(name, data)
+    print(f"  ✓ {path.name}  ({path.stat().st_size:,} bytes)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  28. The same drawings saved by LibreOffice as .ods and .xls (charts WITH cached
+#      values), plus a drawing-less .xls. Needs `soffice` on the PATH.
+# ─────────────────────────────────────────────────────────────────────────────
+def _soffice_convert(src: Path, target_ext: str, name: str) -> None:
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("soffice") is None:
+        print(f"  ✗ {name}  (skipped: soffice not installed)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            [
+                "soffice",
+                f"-env:UserInstallation=file://{tmp}/profile",
+                "--headless",
+                "--convert-to",
+                target_ext,
+                "--outdir",
+                tmp,
+                str(src),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        produced = Path(tmp) / f"{src.stem}.{target_ext}"
+        shutil.move(produced, OUT / name)
+    print(f"  ✓ {name}  ({(OUT / name).stat().st_size:,} bytes)")
+
+
+def gen_drawings_libreoffice():
+    _soffice_convert(OUT / "drawings.xlsx", "ods", "drawings.ods")
+    _soffice_convert(OUT / "drawings.xlsx", "xls", "drawings.xls")
+    _soffice_convert(OUT / "multi_table_independent.xlsx", "xls", "plain.xls")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("Generating test spreadsheets in:", OUT)
@@ -517,4 +723,9 @@ if __name__ == "__main__":
     gen_sparse_image_only()
     gen_big_dense()
     gen_ods_multi_sheet()
+    gen_drawings()
+    gen_pictures_only()
+    gen_sparse_ole_object()
+    gen_drawings_emf()
+    gen_drawings_libreoffice()
     print("Done.")

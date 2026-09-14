@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     excel_min_output_ratio: float
     excel_pdf_paper_format: PaperFormat
     excel_pdf_landscape: bool
+    # Pictures and charts of the pandas section (defaults keep older configs valid)
+    excel_extract_images: bool = True
+    excel_render_charts: bool = True
+    excel_rasterize_metafiles: bool = True
+    excel_max_images: int = Field(default=200, ge=0)
 
     model_config = SettingsConfigDict(
         toml_file="config/server_config.toml", extra="ignore"

@@ -118,7 +118,8 @@ excel_max_output_ratio = 5.0
 
 # -- The three settings below apply to mode "auto" ONLY -------------
 # Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
-# images, shapes only), convert to PDF and process via Paddle OCR instead
+# shapes only), convert to PDF and process via Paddle OCR instead. Pictures and
+# charts do not count against the file when `excel_extract_images` is on — see below
 # (which mean possible allucinations... ).
 # Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
 # The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
@@ -129,6 +130,26 @@ excel_min_input_for_fallback_mb = 0.25
 # Overridable per request with the `excel_min_output_ratio` query param (the request
 # value wins when provided); the param is accepted only on the "auto" routes.
 excel_min_output_ratio = 0.01
+
+
+# -- Pictures and charts: modes "auto", "pandas", "both" ------------
+# The pandas section extracts the pictures and charts of each sheet and lists them
+# under the sheet's table (in on-sheet order), returned in `images` and described
+# by the VLM when `image_description_model_name` is requested.
+# Pictures are read from the file as-is. Their bytes are excluded from the file
+# size in the "auto" sparse check: a small table next to a big picture stays pandas.
+# false: pictures and charts are ignored by the pandas section (previous behaviour).
+excel_extract_images = true
+# Charts are stored as data, not as a bitmap: LibreOffice renders them to PNG.
+# false: a chart is described by its text summary only (type, title, series), no
+# LibreOffice call.
+excel_render_charts = true
+# EMF/WMF pictures cannot be decoded natively on Linux: LibreOffice renders them.
+# false: such pictures are skipped.
+excel_rasterize_metafiles = true
+# Max distinct images extracted per document (pictures + rendered charts). Beyond
+# it, pictures are dropped with a note and charts keep their text summary.
+excel_max_images = 200
 
 
 # -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----

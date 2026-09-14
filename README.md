@@ -61,6 +61,38 @@ Line numbers refer to this document, first line included.
 
 In `ocr` and `both`, the sheet anchors come from the per-sheet page count LibreOffice reports, so a sheet spanning several PDF pages still gets a single anchor with the next sheet placed after all of them. When that map is unavailable or disagrees with what the pipeline returned, the table of contents degrades to one entry per page (`## Page N`) instead of guessing — the line numbers stay exact either way.
 
+### 🖼️ Pictures and charts in spreadsheets
+
+The pandas section (`auto`, `pandas`, `both`) also extracts the **pictures and charts** of each sheet, listed under the sheet's table in on-sheet order (top-to-bottom, left-to-right) and returned in `images` — described by the VLM when `image_description_model_name` is set:
+
+````markdown
+## Data
+
+|Month|Revenue|Cost|
+|---|---|---|
+|Jan|100|80|
+…
+
+<figure>
+<img src="imgs/sheet1_chart1.jpg">
+<chart>  
+Column chart "Revenue 2025" — data from sheet Data  
+Axes: Month / EUR  
+Series: Revenue, Cost  
+Categories: Jan … Jun (6 points)  
+</chart>
+<figcaption>  
+…VLM description…  
+</figcaption>
+</figure>
+````
+
+- **Pictures** are read from the file itself (original bytes, no OCR round-trip), with their alt text when it is meaningful. EMF/WMF pictures are rendered by LibreOffice.
+- **Charts** are stored as data, not as a bitmap: LibreOffice renders them, and a text summary (type, title, axes, series, category span) is always included. Values are not repeated when the chart plots cells that are already in the table — only literal values or links to other workbooks are listed.
+- **No cell references** are written: row and column coordinates do not survive in a Markdown table.
+- `.xlsx` and `.ods` are read natively; `.xls` goes through LibreOffice, but only when the file actually contains pictures or charts.
+- In `auto`, the size of these objects does not count in the sparse check: a small table next to a large picture stays a pandas conversion, with the picture extracted. A workbook with pictures but no cell data is not considered empty.
+
 ### 📁 Extended input format support
 
 | Format | Conversion | Post-processing |
@@ -68,7 +100,7 @@ In `ocr` and `both`, the sheet anchors come from the per-sheet page count LibreO
 | `.txt`, `.json`, `.csv`, `.xml`, `.md` | Pass-through (smart encoding detection) | — |
 | `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML tables → Markdown or simplified HTML, optional VLM image description |
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
-| `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables, LibreOffice → PDF → PaddleOCR-VL, or both — see *Spreadsheet conversion strategies* | Cell error masking, header + table of contents, per-section size budget |
+| `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables, LibreOffice → PDF → PaddleOCR-VL, or both — see *Spreadsheet conversion strategies* | Cell error masking, pictures and charts extraction, header + table of contents, per-section size budget, optional VLM image description |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 
 
@@ -76,7 +108,7 @@ In `ocr` and `both`, the sheet anchors come from the per-sheet page count LibreO
 
 **Spreadsheet processing:** cell errors (`#REF!`, `#N/A`, `nan`, etc.) are detected and masked by default. Legacy-encrypted `.xls` files (empty password) are automatically converted to `.xlsx` via LibreOffice before processing. The Markdown table format (`table_output_format`: `"llm"` compact or `"human"` aligned) applies to both spreadsheet tables and HTML tables converted from the OCR pipeline.
 
-In `auto` mode, a spreadsheet that produces very little cell data (content mostly in text boxes, images or shapes) falls back to PDF+OCR via LibreOffice — configurable paper format and orientation, default A3 landscape, fit-to-width. The threshold is `excel_min_output_ratio`, which can be **overridden per request** with the query param of the same name; the check itself only runs above `excel_min_input_for_fallback_mb`, and the whole fallback can be turned off with `excel_pdf_fallback_enabled`. An empty spreadsheet returns HTTP 422 when no OCR conversion is going to run.
+In `auto` mode, a spreadsheet that produces very little cell data (content mostly in text boxes, shapes or embedded objects — pictures and charts are extracted natively and do not count) falls back to PDF+OCR via LibreOffice — configurable paper format and orientation, default A3 landscape, fit-to-width. The threshold is `excel_min_output_ratio`, which can be **overridden per request** with the query param of the same name; the check itself only runs above `excel_min_input_for_fallback_mb`, and the whole fallback can be turned off with `excel_pdf_fallback_enabled`. An empty spreadsheet returns HTTP 422 when no OCR conversion is going to run.
 
 **Output size budget:** `excel_max_output_ratio` caps each conversion **section** relative to the input file size. A section that exceeds it is removed from the Markdown and replaced by a short note explaining why — so in `both` mode an oversized pandas section is dropped while the OCR section is still returned, correctly indexed. HTTP 413 is returned only when no section survives.
 
@@ -237,7 +269,11 @@ extra_body = {chat_template_kwargs = {enable_thinking = false}} # optional extra
 | `excel_max_output_ratio` | `5.0` | all | Size budget **per conversion section**, as a ratio of the input size. An oversized section is dropped with a note; HTTP 413 only when none survives |
 | `excel_pdf_fallback_enabled` | `true` | `auto` only | Fall back to PDF+OCR for empty or sparse spreadsheets |
 | `excel_min_input_for_fallback_mb` | `0.5` | `auto` only | Skip the sparse check below this input size |
-| `excel_min_output_ratio` | `0.01` | `auto` only | Below this output/input ratio the file is considered sparse. Overridable per request |
+| `excel_min_output_ratio` | `0.01` | `auto` only | Below this output/input ratio the file is considered sparse (picture and chart bytes excluded from the input size). Overridable per request |
+| `excel_extract_images` | `true` | `auto`, `pandas`, `both` | Extract pictures and charts under each sheet's table. `false`: cell values only |
+| `excel_render_charts` | `true` | `auto`, `pandas`, `both` | Render charts to images with LibreOffice. `false`: text summary only |
+| `excel_rasterize_metafiles` | `true` | `auto`, `pandas`, `both` | Render EMF/WMF pictures with LibreOffice. `false`: they are skipped |
+| `excel_max_images` | `200` | `auto`, `pandas`, `both` | Distinct images per document. Beyond it, pictures are dropped with a note, charts keep their summary |
 | `excel_pdf_paper_format` | `"A3"` | `ocr`, `both`, `auto` fallback | `A2`, `A3`, `A4`, `Letter`, `Legal` or `Tabloid` |
 | `excel_pdf_landscape` | `true` | `ocr`, `both`, `auto` fallback | Landscape suits wide sheets; portrait suits narrow ones |
 
@@ -260,7 +296,7 @@ When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and 
 If an image-only document contains no text, the Paddle pipeline may produce sparse Markdown (without even referencing the image), causing the VLM description step to be skipped. This server is not recommended for pure image description use cases.
 
 ### Embedded objects in spreadsheets
-The pandas conversion extracts cell content only — embedded images, charts and text boxes are ignored. The `ocr` and `both` modes (and the `auto` fallback) render the sheets to PDF first, which does capture those visual elements, but with OCR fidelity rather than exact values.
+The pandas conversion extracts cell content, pictures and charts. Text boxes, shapes, SmartArt, embedded OLE objects (Word, PDF, Visio…), cell comments and Excel 365 "place in cell" pictures are ignored. The `ocr` and `both` modes (and the `auto` fallback) render the sheets to PDF first, which does capture those visual elements, but with OCR fidelity rather than exact values. Excel 2016+ chart types (waterfall, treemap, sunburst…) get a best-effort summary and may not render. Charts written by tools that store no cached values (e.g. openpyxl) have unnamed series in their summary.
 
 ### OCR cost on large spreadsheets
 A dense spreadsheet renders to as many PDF pages as it needs, and each page goes through the model. A file with tens of thousands of rows can therefore occupy the single Paddle worker for a long time in `ocr` or `both` mode. Something to keep in mind before lowering `excel_min_output_ratio` or routing large files to a fixed OCR mode.
@@ -282,9 +318,10 @@ Office documents (excluding spreadsheets) are converted to PDF before OCR. This 
 | `main.py` | Application assembly only — lifespan (runtime dirs, semaphores, LibreOffice server, PaddleOCR pipeline + startup smoke test) and the router mount |
 | `api.py` | The HTTP surface. The six fixed-mode routes are generated by one closure factory rather than written out |
 | `processing.py` | `process_document()` — the conversion orchestration. Owns what the domain modules deliberately do not: mapping domain errors to HTTP status codes, and accounting *active* time |
-| `spreadsheet.py` | Cell extraction, header + table-of-contents assembly, and the pure decision rules (`resolve_strategy`, `is_sparse`) |
+| `spreadsheet.py` | Cell extraction, figure blocks, header + table-of-contents assembly, and the pure decision rules (`resolve_strategy`, `is_sparse`) |
+| `spreadsheet_drawings.py` | Pictures and charts of a workbook: cheap survey (before the fallback decision), native `.xlsx` / `.ods` parsing, chart summaries, decoding |
 | `pipeline.py` | The PaddleOCR worker pool. Returns **one Markdown string per PDF page** |
-| `libreoffice.py` | Persistent UNO server, Office/spreadsheet → PDF, and the per-sheet page counts |
+| `libreoffice.py` | Persistent UNO server, Office/spreadsheet → PDF, the per-sheet page counts, and chart / metafile rendering |
 | `postprocessing.py` / `table_utils.py` | Figure blocks, per-page helpers, HTML table simplification |
 | `external.py`, `vlm.py`, `utils.py`, `debug.py`, `settings.py`, `schemas.py`, `security.py` | Remote backends, VLM fan-out, MIME/size/archive helpers, failure artifacts, config, models, auth |
 
