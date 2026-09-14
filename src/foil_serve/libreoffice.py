@@ -704,7 +704,7 @@ def render():
                 counters[slot] += 1
                 if not wanted(shape, kind):
                     continue
-                png_path = "%s/s%d_%s%d.png" % (OUT_DIR, sheet_no, kind, index)
+                png_path = f"{{OUT_DIR}}/s{{sheet_no}}_{{kind}}{{index}}.png"
                 try:
                     export_png(ctx, smgr, shape, png_path)
                 except Exception:
@@ -719,7 +719,7 @@ def render():
     with open({sidecar_path.resolve().as_posix()!r}, "w", encoding="utf-8") as fh:
         json.dump(rendered, fh)
     if failures:
-        print("%d shape(s) could not be exported" % failures)
+        print(f"{{failures}} shape(s) could not be exported")
 
 render()
 """
