@@ -457,6 +457,8 @@ class TestDecode:
             tmp_path / "a.zip",
             {
                 "m/logo.png": buf.getvalue(),
+                # Most producers store a picture once per use, not once per content.
+                "m/logo_copy.png": buf.getvalue(),
                 "m/other.png": _png(),
                 "m/broken.png": b"not an image",
                 "m/vector.emf": b"\x01\x00\x00\x00",
@@ -482,6 +484,7 @@ class TestDecode:
                     "chart", "S1", 1, name="Chart 2", summary="Line chart"
                 ),  # not rendered
                 _obj("picture", "S2", 0, media="m/logo.png"),  # same media as S1
+                _obj("picture", "S2", 1, media="m/logo_copy.png"),  # same bytes
             ),
         )
         rendered = [RenderedShape("S1", "chart", 0, "Chart 1", rendered_png)]
@@ -500,7 +503,10 @@ class TestDecode:
             ("chart", "imgs/sheet1_chart1.jpg"),
             ("chart", None),  # summary only
         ]
-        assert [f.image for f in result.figures["S2"]] == ["imgs/sheet1_picture1.jpg"]
+        assert [f.image for f in result.figures["S2"]] == [
+            "imgs/sheet1_picture1.jpg",
+            "imgs/sheet1_picture1.jpg",
+        ]
         assert result.omitted == {}
 
     def test_transparency_is_flattened_on_white(self, archive):

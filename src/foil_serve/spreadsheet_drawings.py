@@ -22,6 +22,7 @@ Cell coordinates are read only to order objects within their sheet; they are nev
 written to the Markdown, where row and column numbers do not survive.
 """
 
+import hashlib
 import io
 import logging
 import posixpath
@@ -1163,7 +1164,8 @@ def decode_objects(
     """Turn discovered objects into images and figures.
 
     - A picture used several times (a logo on every sheet) is decoded once and
-      shares one image name.
+      shares one image name — identical bytes count as the same picture, whether
+      the file stores them once or once per use.
     - Past ``max_images`` distinct images, pictures are dropped and counted in
       ``omitted``; charts keep their text summary without an image.
     - A picture that cannot be decoded (or rendered) is dropped; a chart that was
@@ -1175,21 +1177,38 @@ def decode_objects(
     images: dict[str, Image] = {}
     contexts: dict[str, str] = {}
     omitted: Counter[str] = Counter()
-    by_media: dict[str, str | None] = {}
+    digests: dict[
+        str, str | None
+    ] = {}  # media path → content digest (None: unreadable)
+    by_content: dict[str, str | None] = {}  # content digest → image name
 
     with zipfile.ZipFile(drawings.source) as zf:
         for obj in drawings.objects:
             png = renders.get((obj.sheet, obj.kind, obj.kind_index))
             image_name: str | None = None
+            data: bytes | None = None
+            digest: str | None = None
 
-            if obj.media is not None and obj.media in by_media:
-                image_name = by_media[obj.media]
+            if obj.kind == "picture" and obj.media is not None:
+                if obj.media not in digests:
+                    data = _read_media(zf, obj.media)
+                    digests[obj.media] = (
+                        hashlib.sha1(data).hexdigest() if data is not None else None
+                    )
+                digest = digests[obj.media]
+
+            if digest is not None and digest in by_content:
+                image_name = by_content[digest]
+            elif obj.kind == "picture" and digest is None:
+                pass  # unreadable picture
             elif obj.kind == "chart" and png is None:
                 pass  # not rendered: the chart keeps its text summary only
             elif len(images) >= max_images:
                 omitted[obj.sheet] += 1
             else:
-                img = _load(obj, zf, png)
+                if data is None and obj.media is not None:
+                    data = _read_media(zf, obj.media)
+                img = _decode(obj, data, png)
                 if img is not None:
                     sheet_no = sheet_numbers.get(obj.sheet, 0)
                     image_name = (
@@ -1197,8 +1216,8 @@ def decode_objects(
                     )
                     images[image_name] = img
                     contexts[image_name] = obj.summary or obj.alt_text
-                if obj.media is not None:
-                    by_media[obj.media] = image_name
+                if digest is not None:
+                    by_content[digest] = image_name
 
             if image_name is None and obj.kind == "picture":
                 continue
@@ -1215,16 +1234,19 @@ def decode_objects(
     )
 
 
-def _load(obj: SheetObject, zf: zipfile.ZipFile, png: Path | None) -> Image | None:
-    if obj.kind == "chart" or obj.media is None:
-        return to_rgb(png.read_bytes()) if png is not None else None
-    if PurePosixPath(obj.media).suffix.lower() in RASTER_EXTS:
-        try:
-            return to_rgb(zf.read(obj.media))
-        except (KeyError, zipfile.BadZipFile, OSError) as e:
-            logger.warning(f"Picture skipped: cannot read '{obj.media}' ({e!r})")
+def _read_media(zf: zipfile.ZipFile, media: str) -> bytes | None:
+    try:
+        return zf.read(media)
+    except (KeyError, zipfile.BadZipFile, OSError) as e:
+        logger.warning(f"Picture skipped: cannot read '{media}' ({e!r})")
+        return None
+
+
+def _decode(obj: SheetObject, data: bytes | None, png: Path | None) -> Image | None:
+    if obj.kind == "picture" and obj.media is not None and data is not None:
+        if PurePosixPath(obj.media).suffix.lower() in RASTER_EXTS:
+            return to_rgb(data)
+        if png is None:
+            logger.info(f"Picture skipped: '{obj.media}' needs LibreOffice rendering")
             return None
-    if png is not None:
-        return to_rgb(png.read_bytes())
-    logger.info(f"Picture skipped: '{obj.media}' needs LibreOffice rendering")
-    return None
+    return to_rgb(png.read_bytes()) if png is not None else None
