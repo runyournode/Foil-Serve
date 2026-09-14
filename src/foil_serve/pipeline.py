@@ -11,7 +11,9 @@ from PIL.Image import Image
 from paddleocr import PaddleOCRVL
 from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLResult
 
+from postprocessing import name_by_content
 from settings import settings, setup_logging
+from utils import EncodedImage
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,7 @@ def _init_worker(config_path: str) -> None:
 
 def _worker_predict(
     file_path: str, use_ocr_for_image_block: bool = True
-) -> tuple[list[str], dict[str, Image], float]:
+) -> tuple[list[str], dict[str, EncodedImage], float]:
     """
     Worker process entry point — only pipeline.predict() and image extraction.
 
@@ -53,7 +55,7 @@ def _worker_predict(
     """
     t0_worker = time.perf_counter()
     mds: list[str] = []
-    imgs: dict[str, Image] = {}
+    imgs: dict[str, EncodedImage] = {}
 
     # Retry on vLLM "Already borrowed" race condition.
     # SUSPECTED Root cause: PaddleOCR's _parallel.py sends all pages of a document concurrently
@@ -105,11 +107,14 @@ def _worker_predict(
             page_count += 1
             paddle_page_md: dict = paddle_page.markdown
             md: str = paddle_page_md.get("markdown_texts", "")
+            img: dict[str, Image] = paddle_page_md.get("markdown_images", {})
+            # Content names, page by page: PaddleX box-based names collide across
+            # pages. Encoding here also ships JPEG bytes, not raw pixels, to the parent.
+            md, encoded = name_by_content(md, img)
+            imgs.update(encoded)
             if md:
                 mds.append(md)
-            img: dict[str, Image] = paddle_page_md.get("markdown_images", {})
-            for img_name, pil_img in img.items():
-                imgs[img_name] = pil_img.copy()  # detached from PaddleX buffers
+            for pil_img in img.values():
                 pil_img.close()
             img.clear()
             del img
@@ -185,7 +190,7 @@ class PaddlePipelineWrapper:
 
     async def run(
         self, file_path: str, use_ocr_for_image_block: bool = True
-    ) -> tuple[list[str], dict[str, Image], float]:
+    ) -> tuple[list[str], dict[str, EncodedImage], float]:
         """
         Runs pipeline.predict() in the dedicated worker process for the given file path.
 
@@ -207,8 +212,9 @@ class PaddlePipelineWrapper:
         md_pages : list[str]
             Raw Markdown from paddle, one entry per page, in order (before prune_tables).
             Join with "  \\n" to rebuild the whole-document Markdown.
-        imgs : dict[str, Image]
-            Extracted images as PIL Images {name: PIL.Image}.
+        imgs : dict[str, EncodedImage]
+            Extracted images, JPEG-encoded and named after their content (the
+            Markdown references use the same names).
         elapsed : float
             Active seconds spent in the worker.
         """

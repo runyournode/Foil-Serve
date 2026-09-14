@@ -1,10 +1,31 @@
 import re
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+
+from PIL.Image import Image
 
 from table_utils import prune_tables
+from utils import EncodedImage
 
 logger = logging.getLogger(__name__)
+
+
+def name_by_content(
+    md: str, images: Mapping[str, Image]
+) -> tuple[str, dict[str, EncodedImage]]:
+    """Encode one page's crops and rename them after their content.
+
+    PaddleX names a crop after its box only (no page number): two different images
+    at the same place on two pages would share a name. Content names fix that, and
+    make identical crops collapse into one image. References are rewritten in their
+    quoted form, so a name that merely contains another one is left alone.
+    """
+    encoded: dict[str, EncodedImage] = {}
+    for old_name, img in images.items():
+        image = EncodedImage.from_pil(img)
+        encoded[image.name] = image
+        md = md.replace(f'"{old_name}"', f'"{image.name}"')
+    return md, encoded
 
 
 def extract_raw_ocr(md_with_html: str) -> dict[str, str]:

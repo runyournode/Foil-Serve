@@ -14,7 +14,6 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi_offline import FastAPIOffline
 from fastapi import FastAPI
-from PIL.Image import Image
 
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 # os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"        # ← returns memory to the system
@@ -37,7 +36,7 @@ from settings import (
     setup_logging,
     align_uvicorn_logging,
 )
-from utils import MimeExt, mime_def
+from utils import EncodedImage, MimeExt, mime_def
 
 _log_file_handler = setup_logging()
 
@@ -110,12 +109,12 @@ async def lifespan(_app: FastAPI):
     logger.info("Testing pipeline connection with test_pipeline.jpeg ...")
     try:
         pages: list[str]
-        imgs: dict[str, Image]
+        imgs: dict[str, EncodedImage]
         pages, imgs, _ = await pipeline_wrapper.run(test_img.as_posix())
         txt = join_pages(pages)
         if "know about magic" not in txt.lower():
             raise RuntimeError(f"Pipeline was executed but OCR was way too bad: {txt=}")
-        if not isinstance(next(iter(imgs.values()), None), Image):
+        if not isinstance(next(iter(imgs.values()), None), EncodedImage):
             raise RuntimeError(
                 f"Pipeline was executed but no image was extracted: {imgs=}"
             )

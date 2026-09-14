@@ -211,18 +211,24 @@ def _section(md: str, sheet: str) -> str:
     return "\n".join(lines[start + 1 : end])
 
 
-@pytest.fixture
-def fake_render(request_stub):
-    """LibreOffice rendering of the two charts of drawings.xlsx, as real PNGs."""
+_NAME_RE = re.compile(r"^imgs/[0-9a-f]{16}\.jpg$")
+
+
+def _srcs(md: str) -> list[str]:
+    return re.findall(r'<img src="([^"]+)"', md)
+
+
+def _install_render(request_stub, colors: list[tuple[int, int, int]]) -> list:
+    """Fake LibreOffice rendering of the two charts of drawings.xlsx, as real PNGs."""
     calls = []
 
     def _render(file_path, out_dir, charts, pictures, output_xlsx=None):
         calls.append((charts, pictures))
         out_dir.mkdir(parents=True, exist_ok=True)
         shapes = []
-        for index, name in enumerate(["Chart 1", "Chart 2"]):
+        for index, (name, color) in enumerate(zip(["Chart 1", "Chart 2"], colors)):
             png = out_dir / f"chart{index}.png"
-            Image.new("RGB", (400, 200), (0, 100, 0)).save(png)
+            Image.new("RGB", (400, 200), color).save(png)
             shapes.append(RenderedShape("Data", "chart", index, name, png))
         return shapes
 
@@ -231,17 +237,23 @@ def fake_render(request_stub):
 
 
 @pytest.fixture
+def fake_render(request_stub):
+    """Two charts rendering to different images."""
+    return _install_render(request_stub, [(0, 100, 0), (100, 0, 0)])
+
+
+@pytest.fixture
 def fake_vlm(monkeypatch):
-    """Replaces the VLM fan-out; records the context each image was sent with."""
-    contexts: dict[str, str] = {}
+    """Replaces the VLM fan-out; records the context of every image sent to it."""
+    sent: list[tuple[str, str]] = []
 
     async def _describe(client, model_name, imgs_b64, ocrs, semaphore):
         described = {name: ocrs[name] for name in imgs_b64 if name in ocrs}
-        contexts.update(described)
+        sent.extend(described.items())
         return {name: f"Description of {name}." for name in described}, 3.0
 
     monkeypatch.setattr(processing, "describe_images", _describe)
-    return contexts
+    return sent
 
 
 class TestPicturesAndCharts:
@@ -250,19 +262,16 @@ class TestPicturesAndCharts:
         result = _process(request_stub, "drawings.xlsx", SpreadsheetMode.PANDAS)
         md = result.page_content
 
-        assert set(result.images) == {"imgs/sheet2_picture1.jpg"}, (
-            "the 32x32 icon is below image_min_size"
-        )
+        assert len(result.images) == 1, "the 32x32 icon is below image_min_size"
+        (picture,) = result.images
+        assert _NAME_RE.match(picture), "images are named after their content"
         data = _section(md, "Data")
         assert data.index("|Month|") < data.index("<chart>"), (
             "table first, then objects"
         )
         assert data.index('"Revenue 2025"') < data.index('"Cost trend"')
         assert "<img" not in data, "charts were not rendered"
-
-        pics = _section(md, "Pics")
-        assert pics.count("<img") == 1 and 'src="imgs/sheet2_picture1.jpg"' in pics
-        assert "sheet2_picture2" not in md
+        assert _srcs(_section(md, "Pics")) == [picture]
 
         rows = _toc(md)
         assert [label for label, _ in rows] == ["Data", "Pics"]
@@ -282,22 +291,37 @@ class TestPicturesAndCharts:
             client=MagicMock(),
         )
         assert fake_render == [(True, False)], "charts only: no metafile in this file"
-        assert set(result.images) == {
-            "imgs/sheet1_chart1.jpg",
-            "imgs/sheet1_chart2.jpg",
-            "imgs/sheet2_picture1.jpg",
-        }
-        assert fake_vlm["imgs/sheet1_chart1.jpg"].startswith(
-            'Column chart "Revenue 2025"'
-        )
-        assert fake_vlm["imgs/sheet2_picture1.jpg"] == "", "no meaningful alt text"
+        md = result.page_content
+        data, pics = _section(md, "Data"), _section(md, "Pics")
+        chart_1, chart_2 = _srcs(data)
+        (picture,) = _srcs(pics)
+        assert set(result.images) == {chart_1, chart_2, picture}
+
+        contexts = dict(fake_vlm)
+        assert len(fake_vlm) == 3, "one VLM call per distinct image"
+        assert contexts[chart_1].startswith('Column chart "Revenue 2025"')
+        assert contexts[picture] == "", "no meaningful alt text"
         assert result.metadata.img_desc_time == 3
 
-        md = result.page_content
-        data = _section(md, "Data")
-        assert "Description of imgs/sheet1_chart1.jpg." in data
-        assert data.index('src="imgs/sheet1_chart1.jpg"') < data.index("<figcaption>")
-        assert "Description of imgs/sheet2_picture1.jpg." in _section(md, "Pics")
+        assert f"Description of {chart_1}." in data
+        assert data.index(f'src="{chart_1}"') < data.index("<figcaption>")
+        assert f"Description of {picture}." in pics
+
+    def test_identical_images_are_stored_and_described_once(
+        self, request_stub, fake_vlm
+    ):
+        _install_render(request_stub, [(0, 100, 0), (0, 100, 0)])
+        result = _process(
+            request_stub,
+            "drawings.xlsx",
+            SpreadsheetMode.PANDAS,
+            model="fake-vlm",
+            client=MagicMock(),
+        )
+        chart_1, chart_2 = _srcs(_section(result.page_content, "Data"))
+        assert chart_1 == chart_2, "same pixels, same name"
+        assert len(result.images) == 2, "the chart image and the picture"
+        assert [name for name, _ in fake_vlm].count(chart_1) == 1
 
     def test_image_cap(self, request_stub, fake_render, monkeypatch):
         monkeypatch.setattr(settings, "excel_max_images", 0)
@@ -322,8 +346,8 @@ class TestPicturesAndCharts:
         for mode in (SpreadsheetMode.PANDAS, SpreadsheetMode.AUTO):
             result = _process(request_stub, "pictures_only.xlsx", mode)
             assert "**pandas**" in result.page_content
-            assert set(result.images) == {"imgs/sheet1_picture1.jpg"}
-            assert "<img" in _section(result.page_content, "Photos")
+            assert _srcs(_section(result.page_content, "Photos")) == list(result.images)
+            assert len(result.images) == 1
 
     def test_auto_keeps_pandas_for_a_small_table_next_to_a_big_picture(
         self, request_stub, monkeypatch
@@ -334,7 +358,7 @@ class TestPicturesAndCharts:
         md = result.page_content
         assert "**pandas**" in md
         assert "|Quarter|Revenue|" in md.replace(" ", "")
-        assert set(result.images) == {"imgs/sheet1_picture1.jpg"}
+        assert len(result.images) == 1 and _srcs(md) == list(result.images)
 
     def test_auto_still_falls_back_on_content_it_cannot_extract(
         self, request_stub, monkeypatch

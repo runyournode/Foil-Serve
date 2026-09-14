@@ -222,6 +222,20 @@ def _edge_case_xlsx(path: Path) -> Path:
     return path
 
 
+_NAME_RE = re.compile(r"^imgs/[0-9a-f]{16}\.jpg$")
+
+
+def _pixel(image, xy: tuple[int, int]) -> tuple[int, ...]:
+    """A pixel of an EncodedImage, decoded back from its JPEG bytes."""
+    with Image.open(io.BytesIO(image.jpeg)) as im:
+        return im.convert("RGB").getpixel(xy)
+
+
+def _near(a: tuple[int, ...], b: tuple[int, ...], tolerance: int = 8) -> bool:
+    """JPEG is lossy: compare colors with a tolerance."""
+    return all(abs(x - y) <= tolerance for x, y in zip(a, b))
+
+
 def _zip_with(path: Path, members: dict[str, bytes]) -> Path:
     with zipfile.ZipFile(path, "w") as zf:
         for name, data in members.items():
@@ -490,31 +504,45 @@ class TestDecode:
         rendered = [RenderedShape("S1", "chart", 0, "Chart 1", rendered_png)]
         result = decode_objects(drawings, rendered, max_images=10)
 
-        assert set(result.images) == {
-            "imgs/sheet1_picture1.jpg",
-            "imgs/sheet1_chart1.jpg",
-        }
-        assert result.contexts == {
-            "imgs/sheet1_picture1.jpg": "Logo",
-            "imgs/sheet1_chart1.jpg": "Pie chart",
-        }
-        assert [(f.kind, f.image) for f in result.figures["S1"]] == [
-            ("picture", "imgs/sheet1_picture1.jpg"),
-            ("chart", "imgs/sheet1_chart1.jpg"),
-            ("chart", None),  # summary only
+        (logo, _), (chart, _), (unrendered, _) = [
+            (f.image, f.kind) for f in result.figures["S1"]
         ]
-        assert [f.image for f in result.figures["S2"]] == [
-            "imgs/sheet1_picture1.jpg",
-            "imgs/sheet1_picture1.jpg",
-        ]
+        assert unrendered is None, "an unrendered chart keeps its summary only"
+        assert logo != chart and set(result.images) == {logo, chart}
+        assert all(_NAME_RE.match(name) for name in result.images)
+        assert result.contexts == {logo: "Logo", chart: "Pie chart"}
+        assert [f.image for f in result.figures["S2"]] == [logo, logo]
         assert result.omitted == {}
+
+    def test_identical_pixels_share_one_image(self, archive, tmp_path):
+        """Two charts rendering to the same pixels: one image, not counted twice."""
+        first, second = tmp_path / "first.png", tmp_path / "second.png"
+        first.write_bytes(_png(color=(0, 128, 0)))
+        second.write_bytes(first.read_bytes())
+        drawings = WorkbookDrawings(
+            archive,
+            ("S1",),
+            (
+                _obj("chart", "S1", 0, name="Chart 1", summary="a"),
+                _obj("chart", "S1", 1, name="Chart 2", summary="b"),
+                _obj("picture", "S1", 0, media="m/other.png"),
+            ),
+        )
+        rendered = [
+            RenderedShape("S1", "chart", 0, "Chart 1", first),
+            RenderedShape("S1", "chart", 1, "Chart 2", second),
+        ]
+        result = decode_objects(drawings, rendered, max_images=2)
+        names = [f.image for f in result.figures["S1"]]
+        assert names[0] == names[1] != names[2]
+        assert set(result.images) == set(names) and result.omitted == {}
 
     def test_transparency_is_flattened_on_white(self, archive):
         drawings = WorkbookDrawings(
             archive, ("S1",), (_obj("picture", "S1", 0, media="m/logo.png"),)
         )
-        image = decode_objects(drawings, None, 10).images["imgs/sheet1_picture1.jpg"]
-        assert image.mode == "RGB" and image.getpixel((0, 0)) == (255, 255, 255)
+        (image,) = decode_objects(drawings, None, 10).images.values()
+        assert _near(_pixel(image, (0, 0)), (255, 255, 255))
 
     def test_cap_drops_pictures_and_keeps_chart_summaries(self, archive, rendered_png):
         drawings = WorkbookDrawings(
@@ -528,11 +556,9 @@ class TestDecode:
         )
         rendered = [RenderedShape("S1", "chart", 0, "Chart 1", rendered_png)]
         result = decode_objects(drawings, rendered, max_images=1)
-        assert list(result.images) == ["imgs/sheet1_picture1.jpg"]
-        assert [(f.kind, f.image) for f in result.figures["S1"]] == [
-            ("picture", "imgs/sheet1_picture1.jpg"),
-            ("chart", None),
-        ]
+        (picture, chart) = result.figures["S1"]
+        assert list(result.images) == [picture.image]
+        assert (chart.kind, chart.image) == ("chart", None)
         assert result.omitted == {"S1": 2}
 
     def test_renderings_match_by_index_when_names_are_ambiguous(
@@ -553,9 +579,10 @@ class TestDecode:
             RenderedShape("S1", "chart", 1, "Chart 1", second),
             RenderedShape("S1", "chart", 0, "Chart 1", first),
         ]
-        images = decode_objects(drawings, rendered, 10).images
-        assert images["imgs/sheet1_chart1.jpg"].getpixel((5, 5)) == (255, 0, 0)
-        assert images["imgs/sheet1_chart2.jpg"].getpixel((5, 5)) == (0, 0, 255)
+        result = decode_objects(drawings, rendered, 10)
+        chart_a, chart_b = (result.images[f.image] for f in result.figures["S1"])
+        assert _near(_pixel(chart_a, (5, 5)), (255, 0, 0))
+        assert _near(_pixel(chart_b, (5, 5)), (0, 0, 255))
 
     def test_pixel_limit(self, monkeypatch):
         monkeypatch.setattr(spreadsheet_drawings, "_MAX_PIXELS", 1000)

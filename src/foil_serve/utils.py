@@ -1,9 +1,11 @@
 import io
 import base64
+import hashlib
 import logging
 import re
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeIs, get_args
 
@@ -99,20 +101,45 @@ def is_native_mime_ext(ext: str) -> TypeIs[MimeExt]:
 # -----------------------------------
 
 
+def pil_to_jpeg(img: Image) -> bytes:
+    """The one JPEG encoding of the app: every served image goes through it."""
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    with io.BytesIO() as buffer:
+        img.save(buffer, format="JPEG", quality=95, subsampling=0)
+        return buffer.getvalue()
+
+
 def pil_to_b64(img: Image) -> str:
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=95, subsampling=0)
-    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    buffer.close()
-    return b64
+    return base64.b64encode(pil_to_jpeg(img)).decode("utf-8")
 
 
-def batch_pil_to_b64(images_dict: dict[str, Image]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for name, img in images_dict.items():
-        result[name] = pil_to_b64(img)
-        img.close()  # immediate release of PIL buffer
-    return result
+@dataclass(frozen=True, slots=True)
+class EncodedImage:
+    """An extracted image, JPEG-encoded once, named after its content.
+
+    The name is ``imgs/<first 16 hex chars of sha256(jpeg)>.jpg``: identical images
+    get the same name (so they are stored and described once), different images can
+    never collide, and the name is a prefix of the ``sha256sum`` of the served file.
+    64 bits are plenty within a document; a store shared across many documents should
+    keep the full sha256 or compare bytes on insert.
+    """
+
+    jpeg: bytes
+    width: int
+    height: int
+
+    @property
+    def name(self) -> str:
+        return f"imgs/{hashlib.sha256(self.jpeg).hexdigest()[:16]}.jpg"
+
+    @property
+    def b64(self) -> str:
+        return base64.b64encode(self.jpeg).decode("utf-8")
+
+    @classmethod
+    def from_pil(cls, img: Image) -> "EncodedImage":
+        return cls(jpeg=pil_to_jpeg(img), width=img.width, height=img.height)
 
 
 # -----------------------------------

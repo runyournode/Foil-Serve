@@ -11,6 +11,7 @@ An integration test (skipped when LibreOffice is absent) drives an actual
 document → PDF conversion over the pipe using the committed fixture in data/.
 """
 
+import io
 import os
 import re
 import shutil
@@ -267,10 +268,13 @@ def test_emf_picture_is_rasterized(lo_server, tmp_path):
         rasterize_metafiles=True,
     )
     assert drawings is not None
-    image = decode_objects(drawings, rendered, 10).images["imgs/sheet1_picture1.jpg"]
-    colors = image.getcolors(maxcolors=1 << 16) or []
+    (encoded,) = decode_objects(drawings, rendered, 10).images.values()
+    from PIL import Image
+
+    with Image.open(io.BytesIO(encoded.jpeg)) as image:
+        colors = image.convert("RGB").getcolors(maxcolors=1 << 16) or []
     red = sum(n for n, (r, g, b) in colors if r > 200 and g < 60 and b < 60)
-    assert red > 0.5 * image.width * image.height, "the EMF is a red rectangle"
+    assert red > 0.5 * encoded.width * encoded.height, "the EMF is a red rectangle"
 
 
 @needs_soffice
@@ -295,12 +299,10 @@ def test_xls_and_ods_end_to_end(lo_server, tmp_path, fixture):
     )
     assert drawings is not None
     result = decode_objects(drawings, rendered, 10)
-    assert set(result.images) == {
-        "imgs/sheet1_chart1.jpg",
-        "imgs/sheet1_chart2.jpg",
-        "imgs/sheet2_picture1.jpg",
-        "imgs/sheet2_picture2.jpg",
-    }
-    assert "Series: Revenue, Cost" in result.contexts["imgs/sheet1_chart1.jpg"], (
+    chart_1, chart_2 = (f.image for f in result.figures["Data"])
+    picture_1, picture_2 = (f.image for f in result.figures["Pics"])
+    assert set(result.images) == {chart_1, chart_2, picture_1, picture_2}
+    assert len(result.images) == 4, "two rendered charts, two pictures"
+    assert "Series: Revenue, Cost" in result.contexts[chart_1], (
         "LibreOffice-saved charts carry cached series names"
     )

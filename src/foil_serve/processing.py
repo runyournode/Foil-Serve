@@ -11,7 +11,6 @@ Everything reusable lives elsewhere — MIME detection and size limits in
 """
 
 import asyncio
-import gc
 import logging
 import tempfile
 import time
@@ -23,7 +22,6 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import HTTPException, Request
-from PIL.Image import Image
 
 from debug import ArtifactContext, save_table_conversion_artifacts
 from external import EXTERNAL_MIME_EXT, merge_external_metadata, process_external
@@ -63,8 +61,8 @@ from utils import (
     SPREADSHEET_EXTS,
     TEXT_EXTS,
     ZIP_BASED_EXTS,
+    EncodedImage,
     UnsupportedMimeTypeError,
-    batch_pil_to_b64,
     check_file_size,
     check_input_size,
     check_zip_uncompressed_size,
@@ -605,7 +603,7 @@ async def _to_pipeline_input(
 
 async def _run_pipeline(
     job: _Job, pipeline_input: Path, need_image_ocr: bool
-) -> tuple[list[str], dict[str, Image]]:
+) -> tuple[list[str], dict[str, EncodedImage]]:
     """Run PaddleOCR in its dedicated worker. Returns one Markdown string per page."""
     wrapper: PaddlePipelineWrapper = job.state.pipeline_wrapper
     async with job.failing_with("Pipeline error"):
@@ -638,25 +636,25 @@ async def _post_process(
 
 
 def _encode_images(
-    job: _Job, imgs: dict[str, Image], model_name: Optional[str]
+    job: _Job, imgs: dict[str, EncodedImage], model_name: Optional[str]
 ) -> dict[str, str]:
-    """Drop images below the minimum size, then encode the rest as base64 JPEG."""
+    """Drop images below the minimum size, then base64 the rest.
+
+    Images are already JPEG-encoded and content-named where they were produced, so
+    each distinct image appears once here — and is described and returned once.
+    """
     if not imgs:
         return {}
     vlm_config = vlm_registry.get(model_name or "")
     min_w, min_h = (
         vlm_config.min_size if vlm_config is not None else settings.image_min_size
     )
-    accepted: dict[str, Image] = {}
-    for name, img in imgs.items():
-        if img.size[0] >= min_w and img.size[1] >= min_h:
-            accepted[name] = img
-        else:
-            img.close()
     with job.timer.track():
-        encoded = batch_pil_to_b64(images_dict=accepted)
-    gc.collect()
-    return encoded
+        return {
+            name: image.b64
+            for name, image in imgs.items()
+            if image.width >= min_w and image.height >= min_h
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +745,7 @@ async def process_document(
         has_vlm = image_description_model_name is not None and client is not None
         need_image_ocr = has_vlm or settings.output_paddle_ocr_no_img_desc
         pages: list[str] = []
-        imgs: dict[str, Image] = {}
+        imgs: dict[str, EncodedImage] = {}
 
         if run_pipeline:
             # ── Phase 2 : convert to PDF when the pipeline cannot read the input
@@ -768,6 +766,7 @@ async def process_document(
         ocrs, pages = await _post_process(job, pages, need_image_ocr)
     native = sheet.objects
     if native is not None:
+        # A shared name means identical bytes: the union is also a dedup.
         imgs = imgs | native.images
     imgs_b64 = _encode_images(job, imgs, image_description_model_name)
 

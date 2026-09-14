@@ -74,7 +74,7 @@ The pandas section (`auto`, `pandas`, `both`) also extracts the **pictures and c
 …
 
 <figure>
-<img src="imgs/sheet1_chart1.jpg">
+<img src="imgs/3f9c2a71d04be85e.jpg">
 <chart>  
 Column chart "Revenue 2025" — data from sheet Data  
 Axes: Month / EUR  
@@ -162,7 +162,7 @@ curl -X POST "http://localhost:8081/v1/process?spreadsheet_mode=both" \
 {
   "page_content": "# Markdown content ...",
   "images": {
-    "page_1_figure_1.jpg": "<base64 JPEG>"
+    "imgs/3f9c2a71d04be85e.jpg": "<base64 JPEG>"
   },
   "metadata": {
     "active_conversion_time_no_img_desc": 12,
@@ -171,6 +171,8 @@ curl -X POST "http://localhost:8081/v1/process?spreadsheet_mode=both" \
   }
 }
 ```
+
+**Image names are content-addressed:** `imgs/` + the first 16 hex characters of the sha256 of the JPEG bytes returned. An image repeated in the document (a logo on every page or sheet) is returned once and described by the VLM once, and every `<img src>` referencing it uses the same name. Names are stable identifiers: a client can store and serve images by name, and check a file with `sha256sum`.
 
 ### Response metadata fields
 

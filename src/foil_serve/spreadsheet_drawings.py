@@ -16,7 +16,8 @@ for anything heavy:
    for ZIP formats the objects themselves, read from the (small) drawing XML.
 2. ``render_with_libreoffice()`` — only for what has no bitmap in the file (charts,
    EMF/WMF pictures) and for .xls.
-3. ``decode_objects()`` — picture bytes and rendered PNGs → RGB PIL images.
+3. ``decode_objects()`` — picture bytes and rendered PNGs → JPEG images named after
+   their content.
 
 Cell coordinates are read only to order objects within their sheet; they are never
 written to the Markdown, where row and column numbers do not survive.
@@ -41,6 +42,7 @@ from PIL.Image import Image
 from xlrd.compdoc import CompDoc
 
 from libreoffice import LibreOfficeServer, RenderedShape
+from utils import EncodedImage
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +157,7 @@ class ExtractedObjects:
 
     sheet_order: tuple[str, ...]
     figures: dict[str, list[Figure]]
-    images: dict[str, Image]
+    images: dict[str, EncodedImage]
     # image name → VLM prompt context (chart summary / alt text)
     contexts: dict[str, str]
     # sheet → images dropped over the cap
@@ -1163,24 +1165,24 @@ def decode_objects(
 ) -> ExtractedObjects:
     """Turn discovered objects into images and figures.
 
-    - A picture used several times (a logo on every sheet) is decoded once and
-      shares one image name — identical bytes count as the same picture, whether
-      the file stores them once or once per use.
+    - Images are JPEG-encoded and named after their content (`EncodedImage.name`):
+      identical images share one name, so they are stored and described once.
+    - A picture whose source bytes were already seen (a logo on every sheet, stored
+      once per use) is not even decoded again.
     - Past ``max_images`` distinct images, pictures are dropped and counted in
       ``omitted``; charts keep their text summary without an image.
     - A picture that cannot be decoded (or rendered) is dropped; a chart that was
       not rendered keeps its summary.
     """
     renders = _match_renderings(drawings.objects, rendered or ())
-    sheet_numbers = {name: i for i, name in enumerate(drawings.sheet_order, start=1)}
     figures: dict[str, list[Figure]] = {}
-    images: dict[str, Image] = {}
+    images: dict[str, EncodedImage] = {}
     contexts: dict[str, str] = {}
     omitted: Counter[str] = Counter()
-    digests: dict[
-        str, str | None
-    ] = {}  # media path → content digest (None: unreadable)
-    by_content: dict[str, str | None] = {}  # content digest → image name
+    # media path → digest of its source bytes (None: unreadable)
+    digests: dict[str, str | None] = {}
+    # source digest → image name (None: could not be decoded)
+    by_source: dict[str, str | None] = {}
 
     with zipfile.ZipFile(drawings.source) as zf:
         for obj in drawings.objects:
@@ -1197,8 +1199,8 @@ def decode_objects(
                     )
                 digest = digests[obj.media]
 
-            if digest is not None and digest in by_content:
-                image_name = by_content[digest]
+            if digest is not None and digest in by_source:
+                image_name = by_source[digest]
             elif obj.kind == "picture" and digest is None:
                 pass  # unreadable picture
             elif obj.kind == "chart" and png is None:
@@ -1210,14 +1212,14 @@ def decode_objects(
                     data = _read_media(zf, obj.media)
                 img = _decode(obj, data, png)
                 if img is not None:
-                    sheet_no = sheet_numbers.get(obj.sheet, 0)
-                    image_name = (
-                        f"imgs/sheet{sheet_no}_{obj.kind}{obj.kind_index + 1}.jpg"
-                    )
-                    images[image_name] = img
-                    contexts[image_name] = obj.summary or obj.alt_text
+                    image = EncodedImage.from_pil(img)
+                    img.close()
+                    image_name = image.name
+                    if image_name not in images:  # identical pixels: already there
+                        images[image_name] = image
+                        contexts[image_name] = obj.summary or obj.alt_text
                 if digest is not None:
-                    by_content[digest] = image_name
+                    by_source[digest] = image_name
 
             if image_name is None and obj.kind == "picture":
                 continue

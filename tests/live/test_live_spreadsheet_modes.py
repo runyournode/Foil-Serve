@@ -90,6 +90,12 @@ def _process(route: str, fixture: str) -> dict:
 
 
 _TOC_ROW_RE = re.compile(r"^\|\s*(.+?)\s*\|\s*(\d+)\s*\|$")
+_NAME_RE = re.compile(r"^imgs/[0-9a-f]{16}\.jpg$")
+
+
+def _srcs(md: str) -> list[str]:
+    """Image references of a Markdown document, in order."""
+    return re.findall(r'<img src="([^"]+)"', md)
 
 
 def _toc(md: str) -> list[tuple[str, int]]:
@@ -239,7 +245,8 @@ class TestSparseFallback:
         doc = _process("/v1/process", "sparse_image_only.xlsx")
         assert _method(doc["page_content"]) == "pandas"
         assert "|Quarter|Revenue|" in doc["page_content"].replace(" ", "")
-        assert set(doc["images"]) == {"imgs/sheet1_picture1.jpg"}
+        assert len(doc["images"]) == 1
+        assert _srcs(doc["page_content"]) == list(doc["images"])
 
     def test_dense_file_of_the_same_size_is_not_sparse(self):
         """Counterpart: same size class, real cell data → pandas, no OCR.
@@ -257,12 +264,6 @@ class TestPicturesAndCharts:
     """`drawings.*`: a table with two charts on `Data`, two pictures on `Pics`
     (one of them a 32x32 icon, below image_min_size)."""
 
-    EXPECTED_IMAGES = {
-        "imgs/sheet1_chart1.jpg",
-        "imgs/sheet1_chart2.jpg",
-        "imgs/sheet2_picture1.jpg",
-    }
-
     @pytest.mark.parametrize(
         "fixture", ["drawings.xlsx", "drawings.ods", "drawings.xls"]
     )
@@ -270,14 +271,43 @@ class TestPicturesAndCharts:
         doc = _process("/v1/process/spreadsheet_pandas", fixture)
         md = doc["page_content"]
         assert _method(md) == "pandas"
-        assert set(doc["images"]) == self.EXPECTED_IMAGES
+        assert len(doc["images"]) == 3, "two rendered charts and one picture"
+        assert all(_NAME_RE.match(name) for name in doc["images"])
+        assert sorted(_srcs(md)) == sorted(doc["images"])
         assert md.count("<chart>") == 2
         _assert_toc_is_exact(md, ["Data", "Pics"])
 
     def test_both_carries_native_objects_and_ocr_crops(self):
         doc = _process("/v1/process/spreadsheet_both", "drawings.xlsx")
-        assert _method(doc["page_content"]) == "both"
-        assert self.EXPECTED_IMAGES <= set(doc["images"])
+        md = doc["page_content"]
+        assert _method(md) == "both"
+        pandas_section = md[: md.index("# Visual rendering (PaddleOCR)")]
+        assert len(set(_srcs(pandas_section))) == 3
+        assert set(_srcs(md)) == set(doc["images"]), "every reference resolves"
+        assert len(doc["images"]) > 3, "Paddle crops come on top of native objects"
+
+    def test_archive_files_are_named_after_their_sha256(self):
+        import hashlib
+        import io
+        import tarfile
+
+        import zstandard
+
+        status, body = _post(
+            "/v1/process/spreadsheet_pandas/download", FIXTURES / "drawings.xlsx"
+        )
+        assert status == 200 and isinstance(body, bytes)
+        with tarfile.open(
+            fileobj=io.BytesIO(zstandard.ZstdDecompressor().decompress(body, 64 << 20))
+        ) as tar:
+            files = {
+                m.name: tar.extractfile(m).read()
+                for m in tar.getmembers()
+                if m.name.startswith("imgs/")
+            }
+        assert len(files) == 3
+        for name, data in files.items():
+            assert name == f"imgs/{hashlib.sha256(data).hexdigest()[:16]}.jpg"
 
 
 # ---------------------------------------------------------------------------
