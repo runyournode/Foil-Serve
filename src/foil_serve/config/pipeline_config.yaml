@@ -1,7 +1,7 @@
 
 pipeline_name: PaddleOCR-VL-1.5
 
-batch_size: 1  # adapt to vram
+batch_size: 12  # adapt to vram
 
 use_queues: True  # keep for async processing
 

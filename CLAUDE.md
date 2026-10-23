@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FastAPI-based document-to-Markdown conversion server using PaddleOCR-VL-1.5 (0.9B vision-language model served via vLLM). Converts PDF, DOCX, PPTX, images, Excel/ODS, and other formats to structured Markdown with extracted images. Optionally describes images via external OpenAI-compatible VLM endpoints.
+FastAPI-based document-to-Markdown conversion server using PaddleOCR-VL-1.5 (0.9B vision-language model served via vLLM). Converts PDF, DOCX, PPTX, RTF, images, Excel/ODS, and other formats to structured Markdown with extracted images. Optionally describes images via external OpenAI-compatible VLM endpoints.
 
 This server is designed to be called by a **gateway** server that acts as the source of truth for the API contract (see *Gateway Integration* section).
 
@@ -87,18 +87,20 @@ POST /v1/process or /v1/process/download (file upload)   [api.py → processing.
           → OCR needed (`ocr`, `both`, or the `auto` fallback) → continue to Phase 2
           → otherwise (pandas only) → skip Phases 2–4
       → .tiff/.webp: image_to_pdf() via Pillow (handles multipage TIFF)
-  → Phase 2: libreoffice_sem → convert_to_pdf() via LibreOfficeServer (DOCX, PPTX, DOC, PPT, ODT, ODP)
+  → Phase 2: libreoffice_sem → convert_to_pdf() via LibreOfficeServer (DOCX, PPTX, DOC, PPT, ODT, ODP, RTF)
              (spreadsheets also get back a sheet → page-count map for the table of contents)
   → Phase 3: PaddlePipelineWrapper.run() — multiprocessing.Pool worker (1 process, maxtasksperchild=N)
              returns Markdown per PDF page + JPEG crops renamed after their content
              (name_by_content, page by page)
   → Phase 4: parallel post-processing — extract_raw_ocr() + prune_tables() (page by page)
-  → Image filtering (min size) + base64 — images are already `EncodedImage`s, one per
-    distinct content (Paddle crops ∪ spreadsheet objects: a shared name means identical bytes)
+  → Small images (`small_image_threshold`): dropped or kept per `ignore_small_images`,
+    never described; base64 — images are already `EncodedImage`s, one per distinct content (Paddle crops ∪ spreadsheet objects: a shared name means identical bytes)
   → Phase 5 (optional): describe images via VLM endpoint (async TaskGroup, semaphore-limited per model)
              — Paddle figures with their OCR text, spreadsheet pictures/charts with their
              alt text / chart summary as context
-  → Phase 6: reformat_md() — inject VLM descriptions + OCR into markdown figure blocks
+  → Phase 6: reformat_md() — inject VLM descriptions + OCR into markdown figure blocks,
+             collapse runs of blank lines (collapse_blank_lines, fenced code untouched)
+  → Non-spreadsheets: join_pages(), or join_marked_pages() when `add_pdf_page`
   → Spreadsheets: pandas section = render_figures() under each sheet's table
                   (merge_sheet_bodies → assemble_sections, line numbers counted after captions)
                   + build_ocr_body() (## anchors per sheet or per page)
@@ -118,17 +120,17 @@ POST /v1/process or /v1/process/download (file upload)   [api.py → processing.
 
 **`src/foil_serve/spreadsheet_drawings.py`** — Pictures and charts embedded in spreadsheets, for the pandas section. Split by cost so the OCR fallback is settled before anything heavy: `survey_drawings()` (never raises → `DrawingSurvey`: `object_bytes`, `has_objects`, `has_charts`, and for .xlsx/.ods the `WorkbookDrawings`), `needs_libreoffice()` / `render_with_libreoffice()`, `decode_objects()` (→ `ExtractedObjects`: per-sheet `Figure`s, content-named `EncodedImage`s — a picture stored once per use is decoded once, identical pixels share one image and one slot of `excel_max_images` — VLM contexts, `omitted` counts). `.xlsx`: OPC relationship chain workbook → sheet → drawing → media / chart part, namespace-agnostic (transitional + strict), two/one/absolute anchors, groups, `mc:AlternateContent`, chartex; hidden, linked, SmartArt and OLE objects are skipped. `.ods`: streaming `iterparse` of `content.xml` (row/col counters honor repeats) + `Object N/content.xml` charts. `.xls`: BIFF scan via `xlrd.compdoc` (OBJ records typed chart/picture, MsoDrawingGroup bytes), then LibreOffice → .xlsx. Chart summaries (`format_chart_summary`) give type, title, axes, source sheet, series names, category span — **never cell references**, and values only for series not backed by workbook cells (literals, external links). Cell anchors only order objects on their sheet. Renderings are matched to objects by (sheet, kind, shape name), falling back to the drawing-order index.
 
-**`src/foil_serve/pipeline.py`** — `PaddlePipelineWrapper`: multiprocessing pool (processes=1, maxtasksperchild=N) with automatic worker recycling to address PaddleOCR memory leaks. `_worker_predict()` runs pipeline.predict() in the worker process. `run()` accepts `use_ocr_for_image_block` flag to skip OCR when not needed, and returns **one Markdown string per PDF page** (join with `"  \n"`) so output line numbers can be mapped back to pages, plus the crops as `EncodedImage`s. PaddleX names crops by their box only (no page number — two different pictures at the same place on two pages would collide), so the worker renames them after their content page by page (`postprocessing.name_by_content`); JPEG bytes, not raw pixels, cross the process boundary.
+**`src/foil_serve/pipeline.py`** — `PaddlePipelineWrapper`: multiprocessing pool (processes=1, maxtasksperchild=N) with automatic worker recycling to address PaddleOCR memory leaks. `_worker_predict()` runs pipeline.predict() in the worker process. `run()` accepts `use_ocr_for_image_block` flag to skip OCR when not needed, and returns **one Markdown string per PDF page, empty pages included** (index n = page n+1; join with `"  \n"`) so output line numbers can be mapped back to pages, plus the crops as `EncodedImage`s. PaddleX names crops by their box only (no page number — two different pictures at the same place on two pages would collide), so the worker renames them after their content page by page (`postprocessing.name_by_content`); JPEG bytes, not raw pixels, cross the process boundary.
 
-**`src/foil_serve/vlm.py`** — `describe_image()` / `describe_image_sem()`: async image description via external OpenAI-compatible VLM. OCR text is injected into the prompt and truncated to `client.max_input_ocr_length` chars. `describe_images()`: TaskGroup fan-out over every figure that has OCR context; any failure becomes a 502 rather than a document with missing captions.
+**`src/foil_serve/vlm.py`** — `describe_image()` / `describe_image_sem()`: async image description via external OpenAI-compatible VLM. OCR text is injected into the prompt and truncated to `client.max_input_ocr_length` chars. `describe_images()`: TaskGroup fan-out over every image that has a key in the context dict (OCR text or alt text / chart summary, possibly empty — images not referenced by a figure block have no key and are skipped); any failure becomes a 502 rather than a document with missing captions.
 
-**`src/foil_serve/utils.py`** — MIME detection (`prepare_input_file()`), image utilities (`pil_to_jpeg()` — the single JPEG encoding, `EncodedImage` — JPEG bytes + size, named `imgs/<sha256(jpeg)[:16]>.jpg`), `build_tar_zst()` (in-memory tar.zst archive creation), `read_text_smart()` (auto-detect encoding via chardet), `image_to_pdf()` (TIFF/WebP → PDF via Pillow), `check_zip_uncompressed_size()` (two-phase zip bomb detection), `check_file_size()`, `check_input_size()` (type-specific limits), `_detect_ooxml()` (OOXML fallback from ZIP central directory).
+**`src/foil_serve/utils.py`** — Supported extensions, **listed once**: one `Literal` per family (`OfficeDocExt`, `SpreadsheetExt`, `ImageExt`, `TextExt`), from which `MimeExt` and the runtime sets (`OFFICE_EXTS`, `SPREADSHEET_EXTS`, `IMAGE_EXTS`, `TEXT_EXTS`, `PAGED_EXTS`) are derived and which `libreoffice.py` imports — a new format is added there and to `mime_def` only (a test checks both agree). MIME detection (`prepare_input_file()`), image utilities (`pil_to_jpeg()` — the single JPEG encoding, `EncodedImage` — JPEG bytes + size, named `imgs/<sha256(jpeg)[:16]>.jpg`), `build_tar_zst()` (in-memory tar.zst archive creation), `read_text_smart()` (auto-detect encoding via chardet), `image_to_pdf()` (TIFF/WebP → PDF via Pillow), `check_zip_uncompressed_size()` (two-phase zip bomb detection), `check_file_size()`, `check_input_size()` (type-specific limits), `_detect_ooxml()` (OOXML fallback from ZIP central directory).
 
 **`src/foil_serve/postprocessing.py`** — `name_by_content()`: encodes one page's crops and rewrites their quoted references to content names (called in the Paddle worker). `extract_raw_ocr()`: extracts per-image OCR text from raw Paddle markdown. `reformat_md()`: injects VLM descriptions and OCR into figure blocks (accepts `include_ocr` flag). Per-page variants `prune_pages()` / `reformat_pages()` plus `join_pages()` (separator `"  \n"`) keep page boundaries locatable for the spreadsheet table of contents. (`prune_tables()` itself lives in `table_utils.py`.)
 
 **`src/foil_serve/external.py`** — Async client for external foil-compatible processing backends (e.g. video). `process_external()`: POST file bytes to the configured route with Bearer auth, configurable timeout and retry (transient failures only: timeouts, transport errors, HTTP 5xx — exponential backoff; 4xx forwarded as-is). `check_external_processor()`: health check used at startup (`check_on_startup`) and by `/health`. `merge_external_metadata()`: external metadata passed through, foil overrides `wall_clock_time` and fills timing fields if absent (`Metadata` allows extra fields). `external_mime_ext()` / `EXTERNAL_MIME_EXT`: MIME → extension for externally-routed types.
 
-**`src/foil_serve/libreoffice.py`** — `LibreOfficeServer`: persistent LibreOffice headless server (soffice --headless --accept). Reached over a UNO **pipe** (Unix domain socket, osl creates it under `/tmp` and ignores `$TMPDIR`) — **no TCP port**; requires the app to be able to write to `/tmp`. Pipe name is unique per start and namespaced with `PIPE_PREFIX` (`foil_soffice_`); the real socket path is resolved from the kernel via `/proc/net/unix` (`_resolve_socket_path()`), not hard-coded. `_sweep_dead_pipes()` removes residual sockets (no live listener) from crashed runs at startup, leaving live ones untouched. `convert_to_pdf()`: converts DOCX, PPTX, DOC, PPT, ODT, ODP to PDF without revision marks. `convert_spreadsheet()`: dedicated spreadsheet → PDF conversion with paper format (A2–Tabloid), landscape/portrait, fit-to-page-width; also returns a `SheetPageMap` (sheet name → page count, via `XRenderable.getRendererCount`, written by the UNO script as a JSON sidecar and validated on read — `None` when unusable). `convert_xls_to_xlsx()`: legacy encrypted XLS → XLSX conversion. `render_drawings()`: one UNO call exporting a spreadsheet's charts (OLE2Shape with the chart CLSID) and non-raster pictures (EMF/WMF/SVM) to PNG via `GraphicExportFilter` (150 dpi, ≤ 2000 px), optionally saving an .xlsx copy first (used for .xls); returns `RenderedShape`s from a validated JSON sidecar (PNG paths confined to the output dir). `OfficeMimeExt` / `is_office_mime_ext()`: the types this module converts, with a `TypeIs` narrower (same pattern as `MimeExt` in `utils.py`).
+**`src/foil_serve/libreoffice.py`** — `LibreOfficeServer`: persistent LibreOffice headless server (soffice --headless --accept). Reached over a UNO **pipe** (Unix domain socket, osl creates it under `/tmp` and ignores `$TMPDIR`) — **no TCP port**; requires the app to be able to write to `/tmp`. Pipe name is unique per start and namespaced with `PIPE_PREFIX` (`foil_soffice_`); the real socket path is resolved from the kernel via `/proc/net/unix` (`_resolve_socket_path()`), not hard-coded. `_sweep_dead_pipes()` removes residual sockets (no live listener) from crashed runs at startup, leaving live ones untouched. `convert_to_pdf()`: converts DOCX, PPTX, DOC, PPT, ODT, ODP, RTF to PDF without revision marks. `convert_spreadsheet()`: dedicated spreadsheet → PDF conversion with paper format (A2–Tabloid), landscape/portrait, fit-to-page-width; also returns a `SheetPageMap` (sheet name → page count, via `XRenderable.getRendererCount`, written by the UNO script as a JSON sidecar and validated on read — `None` when unusable). `convert_xls_to_xlsx()`: legacy encrypted XLS → XLSX conversion. `render_drawings()`: one UNO call exporting a spreadsheet's charts (OLE2Shape with the chart CLSID) and non-raster pictures (EMF/WMF/SVM) to PNG via `GraphicExportFilter` (150 dpi, ≤ 2000 px), optionally saving an .xlsx copy first (used for .xls); returns `RenderedShape`s from a validated JSON sidecar (PNG paths confined to the output dir). `OfficeMimeExt` / `is_office_mime_ext()`: the types this module converts (`Literal[OfficeDocExt, SpreadsheetExt]`, imported from `utils.py`), with a `TypeIs` narrower.
 
 **`src/foil_serve/security.py`** — `verify_api_key()`: FastAPI dependency for `Authorization: Bearer` header validation via HTTPBearer.
 
@@ -136,7 +138,7 @@ POST /v1/process or /v1/process/download (file upload)   [api.py → processing.
 
 **`src/foil_serve/schemas.py`** — Pydantic models: `ProcessedDocument`, `Metadata` (API response), `VLMModelConfig` (internal config). See *Gateway Integration* for the `Metadata` contract.
 
-**`src/foil_serve/settings.py`** — TOML config loader (Pydantic v2), dynamic VLM registry, `AsyncOpenAIWithInfo` (OpenAI client extended with model metadata), `validate_endpoint()` FastAPI dependency. Defines `TableOutputFormat = Literal["human", "llm"]` and `PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]`.
+**`src/foil_serve/settings.py`** — TOML config loader (Pydantic v2; `Settings`, `VLMModelConfig` and `ExternalProcessorConfig` have **no default values** and `extra="forbid"`: a missing, unknown or obsolete key aborts startup — nothing is ever silently defaulted or ignored. A new setting must be added to every `server_config.toml` in the repo), dynamic VLM registry, `AsyncOpenAIWithInfo` (OpenAI client extended with model metadata), `validate_endpoint()` FastAPI dependency. Defines `TableOutputFormat = Literal["human", "llm"]` and `PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]`.
 
 **`src/foil_serve/config/server_config.toml`** — Runtime configuration: API keys, VLM model definitions, prompts, pipeline reload settings, spreadsheet processing options (output format, error handling, PDF fallback), artifact saving, OCR output control, concurrency limits.
 
@@ -144,19 +146,21 @@ POST /v1/process or /v1/process/download (file upload)   [api.py → processing.
 
 **`docker/compose.yaml`** — 3 services: `foil_app` (port 8081), vLLM for PaddleOCR-VL-1.5 (port 8088, dev only), vLLM for Ministral-3-3B (internal to the docker network, no published port).
 
+**`docker/rtx4090/`** — Same stack tuned for a single RTX 4090, latency over VRAM: vLLM v0.32.0 (needs `trust-request-mm-kwargs`), fixed KV caches, 32 / 8 sequences, worker never recycled. Its own `mount_config/` and `mount_runtime/`.
+
 ### Memory Management Strategy
 PaddleOCR is not thread-safe and leaks GPU/CPU memory. The current solution:
-1. `processes=1` pool with `maxtasksperchild=N` (`max_tasks_between_pipeline_reload` in config, default 5) — worker recycled every N documents
+1. `processes=1` pool with `maxtasksperchild=N` (`max_tasks_between_pipeline_reload` in config) — worker recycled every N documents
 2. `spawn` multiprocessing context — clean worker initialization
 3. Worker recycle costs a few seconds per reload
 
 ### External Processor Configuration
 External foil-compatible backends (e.g. video → markdown) are defined in `server_config.toml` under `[[external_processors]]`. Each processor has:
 - `name`: identifier (logs, semaphore, `external_processor_name` query param on `/health`)
-- `url`, `process_route` (default `/v1/process`), `health_route` (default `/health`), `endpoint_api_key`
+- `url`, `process_route` (e.g. `/v1/process`), `health_route` (e.g. `/health`; `""` when the server has none — then `check_on_startup` must be false, `/health?external_processor_name=<it>` answers 400 and `all` lists it under `unchecked_external_processors`), `endpoint_api_key` (`""` = no auth header)
 - `mime_types`: MIME types routed to this processor — each type may be claimed by at most one enabled processor; types overlapping native support are delegated externally (warning logged at startup)
 - `max_concurrent_requests`: asyncio.Semaphore size (waits excluded from active time)
-- `timeout_s` (default 600), `max_retries` (default 2), `retry_backoff_s` (default 1.0, doubles per retry)
+- `timeout_s`, `max_retries`, `retry_backoff_s` (doubles per retry)
 - `max_file_size_mb`: per-type size limit
 - `check_on_startup`: health-check the processor during lifespan (server aborts startup on failure)
 - `enabled`: enable/disable without removing the config
@@ -168,10 +172,12 @@ VLM endpoints are defined in `server_config.toml` under `[[vlm_models]]`. Each m
 - `name`: value used as `image_description_model_name` query param
 - `url`, `endpoint_name`, `endpoint_api_key`: OpenAI-compatible endpoint
 - `temperature`, `max_output_tokens`: generation parameters
-- `max_input_ocr_length` (default 700): max chars of OCR text injected into the prompt
-- `min_size` (default [64,64]): minimum image dimensions to process
+- `max_input_ocr_length`: max chars of OCR text injected into the prompt
 - `prompt`: key from `[prompts]` section or a direct prompt string
+- `extra_body`: provider-specific parameters forwarded as-is (`{}` for none)
 - `enabled`: enable/disable without removing the config
+
+Small images (width OR height below the global `small_image_threshold`) are never sent to the VLM. `ignore_small_images = true` drops them from the Markdown and from `images`; `false` returns them and references them with a bare `<img>` (no `<figure>`/`<figcaption>`; `<ocr>` only when OCR output is on and the text is < `SMALL_IMAGE_MAX_OCR_CHARS` = 40).
 
 ### Spreadsheet Configuration
 
@@ -195,14 +201,15 @@ Key settings in `server_config.toml`:
 - `excel_pdf_fallback_enabled` *(auto only)*: fall back to PDF+OCR for empty or sparse spreadsheets
 - `excel_min_input_for_fallback_mb` *(auto only)*: minimum file size to trigger sparse fallback check
 - `excel_min_output_ratio` *(auto only)*: if `md_bytes / (file_bytes - picture_and_chart_bytes)` is below this, trigger PDF fallback — overridable per request with the query param of the same name
-- `excel_extract_images` (default true): pictures and charts in the pandas section; false restores cell-only output
-- `excel_render_charts` (default true): LibreOffice renders charts to PNG; false keeps the text summary only
-- `excel_rasterize_metafiles` (default true): LibreOffice renders EMF/WMF pictures; false skips them
-- `excel_max_images` (default 200): distinct images per document; beyond, pictures are dropped with a note and charts keep their summary
+- `excel_extract_images`: pictures and charts in the pandas section; false restores cell-only output
+- `excel_render_charts`: LibreOffice renders charts to PNG; false keeps the text summary only
+- `excel_rasterize_metafiles`: LibreOffice renders EMF/WMF pictures; false skips them
+- `excel_max_images`: distinct images per document; beyond, pictures are dropped with a note and charts keep their summary
 - `excel_pdf_paper_format`: paper format for the PDF rendering (A2, A3, A4, Letter, Legal, Tabloid)
 - `excel_pdf_landscape`: landscape orientation for the PDF rendering
 - `output_paddle_ocr`: include raw OCR text in final markdown
 - `output_paddle_ocr_no_img_desc`: include OCR text when no VLM image description is requested
+- `add_pdf_page`: start each page of a paginated input (`PAGED_EXTS`: PDF, office documents, TIFF/WebP) with `<page number="n/n_max" />` (`postprocessing.join_marked_pages`); never for spreadsheets or single images
 
 ## Gateway Integration
 

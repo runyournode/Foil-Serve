@@ -1,6 +1,6 @@
 import re
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 from PIL.Image import Image
 
@@ -8,6 +8,9 @@ from table_utils import prune_tables
 from utils import EncodedImage
 
 logger = logging.getLogger(__name__)
+
+# OCR on a small image is kept only below this length (see reformat_md)
+SMALL_IMAGE_MAX_OCR_CHARS = 40
 
 
 def name_by_content(
@@ -45,15 +48,46 @@ def extract_raw_ocr(md_with_html: str) -> dict[str, str]:
     return ocr_results
 
 
+_BLANK_RUN = re.compile(r"\n(?:[ \t]*\n){2,}")
+_LEADING_BLANK_LINES = re.compile(r"\A(?:[ \t]*\n)+")
+_CODE_FENCE = re.compile(r"(?m)^(```|~~~).*?^\1[ \t]*$", re.DOTALL)
+
+
+def collapse_blank_lines(md: str) -> str:
+    """Keep at most one blank line in a row, outside fenced code blocks.
+
+    Paddle often emits several blank lines between blocks, and a removed figure
+    block leaves its surrounding ones behind: neither carries any meaning.
+    """
+    parts: list[str] = []
+    last = 0
+    for fence in _CODE_FENCE.finditer(md):
+        parts.append(_BLANK_RUN.sub("\n\n", md[last : fence.start()]))
+        parts.append(fence.group(0))
+        last = fence.end()
+    parts.append(_BLANK_RUN.sub("\n\n", md[last:]))
+    return "".join(parts)
+
+
 def reformat_md(
     md: str,
     descriptions_dict: dict[str, str] | None,
     ocr_dict: dict[str, str],
     include_ocr: bool = True,
+    small_images: Collection[str] = (),
+    ignore_small_images: bool = True,
 ) -> str:
     """
     Reformat the md: simplify the img div, add ocr and desc in <figure>.
-    If include_ocr is False, <ocr> tags are omitted from the output.
+    If include_ocr is False, <ocr> tags are omitted from the output; an empty OCR
+    never produces an <ocr> tag.
+    Runs of blank lines are collapsed to one (see collapse_blank_lines).
+
+    Images in `small_images` (below `small_image_threshold`) are never described:
+    - ignore_small_images=True: the whole block is removed from the Markdown.
+    - ignore_small_images=False: a bare <img> reference, plus its <ocr> only when
+      include_ocr is True and the OCR is shorter than SMALL_IMAGE_MAX_OCR_CHARS
+      (longer text on a small crop is most likely a Paddle hallucination).
     """
     pattern = re.compile(
         r'<div[^>]*>\s*<img src="([^"]+)"[^>]*>\s*(.*?)\s*</div>', re.DOTALL
@@ -61,10 +95,17 @@ def reformat_md(
 
     def replacement_logic(match):
         img_src = match.group(1)
+        if img_src in small_images:
+            if ignore_small_images:
+                return ""
+            parts = [f'<img src="{img_src}">']
+            ocr_val = ocr_dict.get(img_src, "").strip()
+            if include_ocr and 0 < len(ocr_val) < SMALL_IMAGE_MAX_OCR_CHARS:
+                parts.append(f"\n<ocr>  \n{ocr_val}  \n</ocr>")
+            return "".join(parts)
+
         if descriptions_dict is not None:
-            desc_val = descriptions_dict.get(
-                img_src, "Too small for description."
-            ).strip()
+            desc_val = descriptions_dict.get(img_src, "").strip()
         else:  # image_description_model = None -> dict is None
             desc_val = ""
 
@@ -74,13 +115,13 @@ def reformat_md(
         ]
         if desc_val:
             parts.append(f"<figcaption>  \n{desc_val}  \n</figcaption>\n")
-        if include_ocr:
-            ocr_val = ocr_dict.get(img_src, "").strip()
+        ocr_val = ocr_dict.get(img_src, "").strip()
+        if include_ocr and ocr_val:  # never an empty <ocr> tag
             parts.append(f"<ocr>  \n{ocr_val}  \n</ocr>\n")
         parts.append("</figure>")
         return "".join(parts)
 
-    return pattern.sub(replacement_logic, md)
+    return collapse_blank_lines(pattern.sub(replacement_logic, md))
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +141,22 @@ def join_pages(pages: Sequence[str]) -> str:
     return PAGE_SEPARATOR.join(pages)
 
 
+def join_marked_pages(pages: Sequence[str]) -> str:
+    """Like join_pages, but each page starts with `<page number="n/n_max" />`.
+
+    The marker is its own HTML block (one blank line around it), so it never merges
+    into the previous page's last paragraph. Blank lines at the edges of a page are
+    dropped. An empty page keeps its marker.
+    """
+    total = len(pages)
+    marked = []
+    for n, page in enumerate(pages, start=1):
+        body = _LEADING_BLANK_LINES.sub("", page).rstrip()
+        marker = f'<page number="{n}/{total}" />'
+        marked.append(f"{marker}\n\n{body}" if body else marker)
+    return "\n\n".join(marked)
+
+
 def prune_pages(pages: Sequence[str], table_format: str) -> list[str]:
     """prune_tables applied page by page."""
     return [
@@ -112,6 +169,8 @@ def reformat_pages(
     descriptions_dict: dict[str, str] | None,
     ocr_dict: dict[str, str],
     include_ocr: bool,
+    small_images: Collection[str] = (),
+    ignore_small_images: bool = True,
 ) -> list[str]:
     """reformat_md applied page by page."""
     return [
@@ -120,6 +179,8 @@ def reformat_pages(
             descriptions_dict=descriptions_dict,
             ocr_dict=ocr_dict,
             include_ocr=include_ocr,
+            small_images=small_images,
+            ignore_small_images=ignore_small_images,
         )
         for page in pages
     ]

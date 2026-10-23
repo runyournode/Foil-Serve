@@ -19,12 +19,14 @@ PaperFormat = Literal["A3", "A4", "A2", "Letter", "Legal", "Tabloid"]
 
 class Settings(BaseSettings):
     requires_auth: bool
-    app_api_keys: List[str] = Field(default_factory=list)
+    app_api_keys: List[str]
     check_vlm_endpoints: bool
-    image_min_size: tuple[int, int]
-    prompts: Dict[str, str] = Field(default_factory=dict)
-    vlm_models: List[VLMModelConfig] = Field(default_factory=list)
-    external_processors: List[ExternalProcessorConfig] = Field(default_factory=list)
+    # An image is small when its width OR its height is below the threshold
+    small_image_threshold: tuple[int, int]
+    ignore_small_images: bool
+    prompts: Dict[str, str]
+    vlm_models: List[VLMModelConfig]
+    external_processors: List[ExternalProcessorConfig]
     max_tasks_between_pipeline_reload: int
     max_concurrent_libreoffice: int
     max_concurrent_excel: int
@@ -34,39 +36,44 @@ class Settings(BaseSettings):
     max_office_file_size_mb: int
     max_excel_file_size_mb: int
     max_unzip_size_mb: int
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
-    libs_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
-    log_file: str | None = None
-    artifact_dir: str = "/var/log/foil/artifacts"
-    save_failed_artifacts: bool = False
-    failed_artifacts_subdir: str = "failed"
-    save_table_conversion_artifacts: bool = False
-    table_conversion_artifacts_subdir: str = "xls2pdf"
-    temp_dir: str = "/tmp/foil-runtime"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+    libs_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+    log_file: str  # "" disables logging to file
+    artifact_dir: str
+    save_failed_artifacts: bool
+    failed_artifacts_subdir: str
+    save_table_conversion_artifacts: bool
+    table_conversion_artifacts_subdir: str
+    temp_dir: str
 
     # OCR output control
     output_paddle_ocr: bool
     output_paddle_ocr_no_img_desc: bool
+    # Mark the start of each page (PDF, office documents, multipage images)
+    add_pdf_page: bool
 
     # Spreadsheet processing
     table_output_format: TableOutputFormat
     excel_mask_cell_errors: bool
-    save_cell_error_artifacts: bool = False
-    cell_error_artifacts_subdir: str = "cell_errors"
+    save_cell_error_artifacts: bool
+    cell_error_artifacts_subdir: str
     excel_max_output_ratio: float
     excel_pdf_fallback_enabled: bool
     excel_min_input_for_fallback_mb: float
     excel_min_output_ratio: float
     excel_pdf_paper_format: PaperFormat
     excel_pdf_landscape: bool
-    # Pictures and charts of the pandas section (defaults keep older configs valid)
-    excel_extract_images: bool = True
-    excel_render_charts: bool = True
-    excel_rasterize_metafiles: bool = True
-    excel_max_images: int = Field(default=200, ge=0)
+    # Pictures and charts of the pandas section
+    excel_extract_images: bool
+    excel_render_charts: bool
+    excel_rasterize_metafiles: bool
+    excel_max_images: int = Field(ge=0)
 
     model_config = SettingsConfigDict(
-        toml_file="config/server_config.toml", extra="ignore"
+        # Every key is required and unknown keys (typos, obsolete settings) are
+        # rejected: the config must fail loudly, never fall back silently
+        toml_file="config/server_config.toml",
+        extra="forbid",
     )
 
     @model_validator(mode="after")
@@ -257,7 +264,7 @@ def get_vlm_client(model_name: str) -> AsyncOpenAIWithInfo:
         temperature=cfg.temperature,
         max_output_tokens=cfg.max_output_tokens,
         max_input_ocr_length=cfg.max_input_ocr_length,
-        extra_body=cfg.extra_body,
+        extra_body=cfg.extra_body or None,
         api_key=cfg.endpoint_api_key,
         base_url=str(cfg.url),
     )

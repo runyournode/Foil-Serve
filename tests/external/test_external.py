@@ -12,6 +12,7 @@ import json
 import httpx
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from external import (
     check_external_processor,
@@ -27,6 +28,8 @@ def make_cfg(**overrides) -> ExternalProcessorConfig:
         name="video",
         enabled=True,
         url="http://processor.test",
+        process_route="/v1/process",
+        health_route="/health",
         endpoint_api_key="secret-key",
         mime_types=["video/mp4"],
         max_concurrent_requests=2,
@@ -34,6 +37,7 @@ def make_cfg(**overrides) -> ExternalProcessorConfig:
         max_retries=2,
         retry_backoff_s=0.0,  # no sleep between attempts in tests
         max_file_size_mb=500,
+        check_on_startup=False,
     )
     defaults.update(overrides)
     return ExternalProcessorConfig(**defaults)
@@ -100,7 +104,7 @@ class TestProcessExternal:
             seen_requests.append(request)
             return httpx.Response(200, json=ok_payload())
 
-        run_process(handler, make_cfg(endpoint_api_key=None))
+        run_process(handler, make_cfg(endpoint_api_key=""))
         assert "Authorization" not in seen_requests[0].headers
 
     def test_retries_on_5xx_then_succeeds(self):
@@ -210,6 +214,13 @@ class TestCheckExternalProcessor:
         self.run_check(handler, make_cfg())
         assert seen_urls == ["http://processor.test/health"]
 
+    def test_no_health_route_is_never_requested(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no request expected")
+
+        with pytest.raises(ValueError, match="no health_route"):
+            self.run_check(handler, make_cfg(health_route=""))
+
     def test_custom_health_route(self):
         seen_urls = []
 
@@ -288,3 +299,124 @@ class TestExternalMimeExt:
     )
     def test_known_and_unknown_types(self, raw_mime, expected):
         assert external_mime_ext(raw_mime) == expected
+
+
+class TestHealthRouteConfig:
+    def test_processor_without_health_route_is_valid(self):
+        assert make_cfg(health_route="").health_route == ""
+
+    def test_startup_check_requires_a_health_route(self):
+        with pytest.raises(ValidationError, match="no `health_route`"):
+            make_cfg(health_route="", check_on_startup=True)
+
+
+class TestHealthEndpoint:
+    """`/health?external_processor_name=...` with processors lacking a health route."""
+
+    @pytest.fixture
+    def api(self, monkeypatch):
+        api = pytest.importorskip("api", reason="PaddleOCR (api.py) not importable")
+        monkeypatch.setattr(
+            api.settings,
+            "external_processors",
+            [make_cfg(name="checked"), make_cfg(name="blind", health_route="")],
+        )
+        return api
+
+    def call(self, api, name, handler):
+        async def _run():
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                state = type("S", (), {"external_http_client": client})
+                request = type("R", (), {"app": type("A", (), {"state": state})})
+                return await api.health_check(
+                    request,
+                    image_description_model_name=None,
+                    external_processor_name=name,
+                )
+
+        return asyncio.run(_run())
+
+    def test_all_lists_unchecked_processors(self, api):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(200)
+
+        assert self.call(api, "all", handler) == {
+            "status": "ok",
+            "unchecked_external_processors": ["blind"],
+        }
+        assert seen == ["http://processor.test/health"]
+
+    def test_named_processor_without_health_route_is_400(self, api):
+        with pytest.raises(HTTPException) as exc_info:
+            self.call(api, "blind", lambda request: httpx.Response(200))
+        assert exc_info.value.status_code == 400
+
+
+class TestThroughProcessDocument:
+    """A MIME type claimed by an external processor is accepted and routed to it.
+
+    Covers the acceptance path end to end (MIME detection with `extra_mimes`,
+    routing before the native checks): a type unknown to foil, and a native type
+    (RTF) that an external processor claims and therefore takes over.
+    """
+
+    MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64
+    RTF = b"{\\rtf1\\ansi Hello {\\b world}.}"
+
+    @pytest.fixture
+    def processing(self, tmp_path, monkeypatch):
+        processing = pytest.importorskip(
+            "processing", reason="PaddleOCR (processing.py) not importable"
+        )
+        from settings import settings
+
+        monkeypatch.setattr(settings, "temp_dir", str(tmp_path))
+        monkeypatch.setattr(settings, "save_failed_artifacts", False)
+        return processing
+
+    def run(self, processing, monkeypatch, content: bytes, claimed: str):
+        import time
+        import types
+        from unittest.mock import MagicMock
+
+        cfg = make_cfg(mime_types=[claimed])
+        monkeypatch.setattr(processing, "external_registry", {claimed: cfg})
+        monkeypatch.setattr(
+            processing, "EXTERNAL_MIME_EXT", {claimed: external_mime_ext(claimed)}
+        )
+        calls = []
+
+        async def _process_external(http_client, cfg, file_content, raw_mime):
+            calls.append(raw_mime)
+            return "# From the external processor", {}, {"language": "fr"}
+
+        monkeypatch.setattr(processing, "process_external", _process_external)
+        state = types.SimpleNamespace(
+            external_sem={cfg.name: asyncio.Semaphore(1)},
+            external_http_client=MagicMock(),
+            pipeline_wrapper=MagicMock(),
+        )
+        request = types.SimpleNamespace(app=types.SimpleNamespace(state=state))
+        result = asyncio.run(
+            processing.process_document(
+                request, content, None, None, time.perf_counter()
+            )
+        )
+        return result, calls
+
+    def test_new_mime_is_accepted(self, processing, monkeypatch):
+        result, calls = self.run(processing, monkeypatch, self.MP4, "video/mp4")
+        assert calls == ["video/mp4"]
+        assert result.page_content == "# From the external processor"
+        assert result.mime_ext == ".mp4"
+        assert result.metadata.language == "fr"
+
+    def test_claimed_native_mime_goes_external(self, processing, monkeypatch):
+        result, calls = self.run(processing, monkeypatch, self.RTF, "text/rtf")
+        assert calls == ["text/rtf"], "the external processor takes precedence"
+        assert result.page_content == "# From the external processor"

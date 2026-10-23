@@ -1,7 +1,7 @@
 services:
   foil_app:
 #    image: ghcr.io/runyournode/foil-serve:main-offline
-    image: ghcr.io/runyournode/foil-serve:sha-9481a8c-offline
+    image: ghcr.io/runyournode/foil-serve:0.1.6-offline
     container_name: foil_app
     gpus: all
     ipc: host

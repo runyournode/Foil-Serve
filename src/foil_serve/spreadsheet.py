@@ -485,24 +485,33 @@ def render_figures(
     kept_images: Collection[str],
     descriptions: Mapping[str, str] | None,
     omitted: int = 0,
+    small_images: Collection[str] = (),
 ) -> str:
     """Markdown for the pictures and charts of one sheet, in on-sheet order.
 
     Same ``<figure>`` shape as the OCR path (``postprocessing.reformat_md``), plus
     a ``<chart>`` block carrying a chart's structural summary. Images missing from
-    ``kept_images`` (too small, over the cap) are left out; a chart without an image
-    still shows its summary.
+    ``kept_images`` (ignored small images, over the cap) are left out; a chart
+    without an image still shows its summary. A kept image listed in
+    ``small_images`` is never described: a small picture is a bare ``<img>``, a
+    small chart keeps its ``<figure>`` (image + summary) without caption.
     """
     blocks: list[str] = []
     for figure in figures:
         image = figure.image if figure.image in kept_images else None
         if image is None and not figure.summary:
             continue
-        parts = ["<figure>"]
+        img_tag = None
         if image is not None:
             alt = " ".join(figure.alt_text.split())
             alt_attr = f' alt="{html.escape(alt)}"' if alt else ""
-            parts.append(f'<img src="{image}"{alt_attr}>')
+            img_tag = f'<img src="{image}"{alt_attr}>'
+            if image in small_images and not figure.summary:
+                blocks.append(img_tag)
+                continue
+        parts = ["<figure>"]
+        if img_tag is not None:
+            parts.append(img_tag)
         if figure.summary:
             summary = "  \n".join(
                 html.escape(_as_lines(figure.summary), quote=False).split("\n")

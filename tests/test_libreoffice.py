@@ -306,3 +306,41 @@ def test_xls_and_ods_end_to_end(lo_server, tmp_path, fixture):
     assert "Series: Revenue, Cost" in result.contexts[chart_1], (
         "LibreOffice-saved charts carry cached series names"
     )
+
+
+RTF_FIXTURE = Path(__file__).parent / "data" / "sample.rtf"
+
+
+def test_rtf_is_detected_as_office_document(tmp_path):
+    from utils import PAGED_EXTS, prepare_input_file
+
+    path, mime, raw_mime = prepare_input_file(RTF_FIXTURE.read_bytes(), tmp_path)
+    assert (mime, raw_mime) == (".rtf", "text/rtf")
+    assert path.suffix == ".rtf"
+    assert mime in PAGED_EXTS, "converted to PDF, so page markers apply"
+
+
+@pytest.mark.skipif(
+    shutil.which("soffice") is None, reason="LibreOffice (soffice) not installed"
+)
+def test_rtf_converts_to_pdf(lo_server, tmp_path):
+    from libreoffice import convert_to_pdf
+
+    src = tmp_path / "input_file.rtf"
+    shutil.copy(RTF_FIXTURE, src)
+    pdf, sheet_map = convert_to_pdf(src, ".rtf", lo_server)
+    assert pdf.read_bytes().startswith(b"%PDF")
+    assert sheet_map is None, "not a spreadsheet"
+
+
+def test_extension_families_are_the_single_source():
+    """Every supported extension comes from one Literal family in utils.py."""
+    from typing import get_args
+
+    from libreoffice import _OFFICE_MIME_EXTS
+    from utils import OFFICE_EXTS, SPREADSHEET_EXTS, MimeExt, mime_def
+
+    assert {ext for ext in mime_def.values() if ext} == set(get_args(MimeExt)), (
+        "mime_def and MimeExt must list the same extensions"
+    )
+    assert _OFFICE_MIME_EXTS == OFFICE_EXTS | SPREADSHEET_EXTS

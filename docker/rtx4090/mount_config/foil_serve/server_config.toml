@@ -1,0 +1,354 @@
+# -------------------------------------------------------------------
+# Logging & artifacts                                               -
+# All paths below default to /var/log/foil/. This directory must    -
+# exist and be writable by the application user.                    -
+# Docker: created by the Dockerfile.                                -
+# Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
+# (No clearing mechanism — manage disk space manually.)             -
+# -------------------------------------------------------------------
+log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
+libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
+log_file = "/var/log/foil/foil.log"  # "" to disable logging to file
+
+# Base directory for debug artifacts. Subdirectories are created automatically.
+artifact_dir = "/var/log/foil/artifacts"
+
+# Save input files and debug artifacts for any failed processing request.
+# A timestamped subdirectory is created under `artifact_dir/failed_artifacts_subdir`.
+save_failed_artifacts = true
+failed_artifacts_subdir = "failed"
+
+# Save artifacts (input spreadsheet + generated PDF) when a sparse spreadsheet
+# triggers fallback to PDF+OCR conversion.
+save_table_conversion_artifacts = false
+table_conversion_artifacts_subdir = "xls2pdf"
+
+# Save artifacts when spreadsheet cells contain errors (#REF!, #N/A, nan, etc.).
+# A timestamped subdirectory is created containing: input file,
+# md with short error labels (before masking), and final md (after masking).
+# Only triggers when at least one error cell is detected.
+save_cell_error_artifacts = false
+cell_error_artifacts_subdir = "cell_errors"
+
+
+# All settings below are required
+# 'default' are recommanded settings but not set in python code
+
+# -------------------------------------------------------------------
+# Safety & Startup checks                                           -
+# -------------------------------------------------------------------
+
+# Auth to use this app, if `requires_auth` is false, keys are ignored
+requires_auth = true
+app_api_keys = [
+    "changeme",
+#    "changeme2",
+]
+
+# Check if all vlm_models declared below are properly reachable on server start-up.
+# If any VLM is not reachable, server will not start
+check_vlm_endpoints = true
+
+# Maximum accepted file size in MB, checked BEFORE writing to disk.
+# Applies to all file types.
+max_file_size_mb = 200
+
+# Per-type size limits (checked after MIME detection).
+# Each is independent from max_file_size_mb; both are enforced.
+max_pdf_file_size_mb = 100
+max_image_file_size_mb = 50
+max_office_file_size_mb = 100
+
+# Maximum accepted Excel file size in MB.
+# For .xlsx (ZIP format): both the compressed (on-disk) size and the actual decompressed
+# size are checked. The decompressed size is measured by reading the real deflate output
+# stream — the ZIP central directory 'file_size' field is attacker-controlled and is NOT
+# used, as a forged value would allow a zip bomb to bypass the check.
+# For .xls (OLE2 binary, not ZIP): only the on-disk size is checked.
+max_excel_file_size_mb = 50
+
+# Maximum allowed decompressed size for ZIP-based files (xlsx, docx, pptx, ods, odt, odp).
+# Phase 1: checked against the ZIP central directory declared sizes (fast, no decompression).
+# If the declared size exceeds this limit, the file is rejected immediately.
+# Phase 2: actual decompression is checked against 1.25× the declared size to detect zip bombs
+max_unzip_size_mb = 2048
+
+# -------------------------------------------------------------------
+# Spreadsheet processing                                            -
+# -------------------------------------------------------------------
+# A spreadsheet (.xls / .xlsx / .ods) can be converted in four ways, chosen per
+# request with the `spreadsheet_mode` query param on /v1/process (and its variants),
+# or with a dedicated route that pins the mode:
+#
+#   auto (default)  pandas cell extraction, falling back to PDF+OCR when the file is
+#                   empty or suspiciously sparse. This is the ONLY mode driven by the
+#                   excel_pdf_fallback_enabled / excel_min_* settings below.
+#                   → POST /v1/process                        (+ /download)
+#   pandas          cell extraction only. Never falls back, whatever those settings say.
+#                   → POST /v1/process/spreadsheet_pandas     (+ /download)
+#   ocr             LibreOffice → PDF → PaddleOCR only. pandas is not run at all.
+#                   → POST /v1/process/spreadsheet_ocr        (+ /download)
+#   both            both conversions, concatenated in a single Markdown document.
+#                   → POST /v1/process/spreadsheet_both       (+ /download)
+#
+# Whatever the mode, a spreadsheet output starts with a header stating the method used
+# and a table of contents giving the line number of every sheet in the document.
+# The mode is ignored for every other file type: the dedicated routes accept PDF,
+# Office, image and text files too, they just process them as usual.
+
+# Table format for all pure-MD table rendering (Excel/ODS sheets and HTML tables from the OCR pipeline).
+# "llm" (default): minimal formatting, reduced tokens (no padding, short separators)
+# "human": aligned columns, full separators (standard tabulate "pipe" format)
+table_output_format = "llm"
+
+# How to handle Excel cell errors (#REF!, #N/A, #VALUE!, #NAME?, #DIV/0!, #NULL!, #NUM!, nan).
+# true (default): error cells become empty strings before rendering.
+# false: error cells show a short label (e.g. #ref, #n/a, #val, #name, #div, #null, #num).
+# In both cases, fully empty rows and columns are stripped from the output.
+# Applies to the pandas conversion only (modes auto, pandas, both).
+excel_mask_cell_errors = true
+
+# Size budget for EACH conversion section of the output, as a ratio of the input file size.
+# A section that exceeds it is removed from the Markdown and replaced by a short note
+# saying why — in "both" mode, a huge pandas section is dropped and the OCR section is
+# still returned (and vice versa). HTTP 413 is returned only when no section survives,
+# which is what the single-section modes (auto, pandas, ocr) always come down to.
+# Example: 5.0 means a 10 MB spreadsheet may yield at most 50 MB of Markdown per section.
+excel_max_output_ratio = 5.0
+
+# -- The three settings below apply to mode "auto" ONLY -------------
+# Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
+# shapes only), convert to PDF and process via Paddle OCR instead. Pictures and
+# charts do not count against the file when `excel_extract_images` is on — see below
+# (which mean possible allucinations... ).
+# Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
+# The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
+excel_pdf_fallback_enabled = true
+# Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
+excel_min_input_for_fallback_mb = 0.25
+# If Markdown output is smaller than this fraction of input size, trigger fallback.
+# Overridable per request with the `excel_min_output_ratio` query param (the request
+# value wins when provided); the param is accepted only on the "auto" routes.
+excel_min_output_ratio = 0.01
+
+
+# -- Pictures and charts: modes "auto", "pandas", "both" ------------
+# The pandas section extracts the pictures and charts of each sheet and lists them
+# under the sheet's table (in on-sheet order), returned in `images` and described
+# by the VLM when `image_description_model_name` is requested.
+# Pictures are read from the file as-is. Their bytes are excluded from the file
+# size in the "auto" sparse check: a small table next to a big picture stays pandas.
+# false: pictures and charts are ignored by the pandas section (previous behaviour).
+excel_extract_images = true
+# Charts are stored as data, not as a bitmap: LibreOffice renders them to PNG.
+# false: a chart is described by its text summary only (type, title, series), no
+# LibreOffice call.
+excel_render_charts = true
+# EMF/WMF pictures cannot be decoded natively on Linux: LibreOffice renders them.
+# false: such pictures are skipped.
+excel_rasterize_metafiles = true
+# Max distinct images extracted per document (pictures + rendered charts). Beyond
+# it, pictures are dropped with a note and charts keep their text summary.
+excel_max_images = 200
+
+
+# -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----
+# Paper format used when converting spreadsheets to PDF.
+# Supported values: "A3", "A4", "A2", "Letter", "Legal", "Tabloid"
+excel_pdf_paper_format = "A3"
+
+# Page orientation for spreadsheet → PDF conversion.
+# true (default): landscape — better for wide spreadsheets with many columns.
+# false: portrait — better for narrow spreadsheets with few columns.
+excel_pdf_landscape = true
+
+
+# -------------------------------------------------------------------
+# OCR output control in Images  (OCR performed by paddle)           -
+# -------------------------------------------------------------------
+# When a VLM image description IS requested:
+# true  → keep <ocr> tags in the final Markdown alongside <figcaption>.
+# false → only <figcaption> (VLM description) is emitted; OCR is still
+#         used internally as context for the VLM prompt.
+output_paddle_ocr = false
+
+# When NO VLM image description is requested:
+# true  → keep <ocr> tags in the final Markdown.
+# false → no <ocr> tags; also skips the OCR-on-images step in the
+#         Paddle pipeline (performance optimization).
+output_paddle_ocr_no_img_desc = false
+
+# Start each page of a paginated document (PDF, office documents converted to PDF,
+# multipage TIFF/WebP) with `<page number="n/n_max" />` in the Markdown.
+# Spreadsheets are never marked: they already have per-sheet headings.
+add_pdf_page = false
+
+
+# -------------------------------------------------------------------
+# Miscellaneous                                                     -
+# -------------------------------------------------------------------
+
+# Directory for temporary files created during request processing.
+# Each request gets a short-lived subdirectory that is cleaned up automatically.
+# Use "/dev/shm" for pure in-memory I/O (ensure sufficient --shm-size in Docker).
+temp_dir = "/tmp/foil-runtime"
+
+# Small images: width OR height (in pixels) below this threshold.
+# Small images are never sent to the VLM for description.
+small_image_threshold = [64, 64]
+# true  → small images are dropped: nothing in the Markdown, not returned in `images`.
+# false → small images are returned in `images` and only referenced in the Markdown
+#         (bare <img>, no <figure>/<figcaption>; their OCR is kept only when OCR output
+#         is enabled and the text is shorter than 40 chars).
+ignore_small_images = true
+
+
+# -------------------------------------------------------------------
+# Ressource managaement                                             -
+# -------------------------------------------------------------------
+
+# paddle pipeline seems to naturally leaks memory outside of python, leading enventually to oom (RAM)
+# Actual work-around is to reload the pipeline every N documents, which takes a few seconds.
+# This is acceptable as main model (PaddleOCR-VL-1.5) is not concerned (externally served by vllm).
+# Increasing this value will reduce overhead reloading the pipeline too often but will have a bigger RAM
+# footprint on your server.
+max_tasks_between_pipeline_reload =  99999
+
+# Max parallel LibreOffice headless processes (docx, pptx, doc, ppt → pdf conversion)
+max_concurrent_libreoffice = 3
+
+# Max parallel Excel → markdown conversions
+max_concurrent_excel = 5
+
+
+# -------------------------------------------------------------------
+# Definition of available vlm models for image description          -
+# -------------------------------------------------------------------
+
+# [[vlm_models]]
+# enabled = <true | false>
+# max_concurrent_requests = <int>
+# temperature = <float>
+# max_output_tokens = <int>
+# max_input_ocr_length = <int — max chars of OCR text injected into the VLM prompt, e.g. 700>
+# name = <"image_description_model_name from the client">
+# url = <"url to the openai endpoint">
+# endpoint_api_key = <"api key" — any non-empty string when the endpoint has no auth>
+# endpoint_name = <exact model name to pass to the openai endpoint">
+# prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
+# extra_body = <provider-specific parameters forwarded as-is to the API call; {} for none>
+#   Examples:
+#     vLLM / Qwen3 thinking:      extra_body = {chat_template_kwargs = {enable_thinking = true}}
+#     OpenRouter thinking:         extra_body = {reasoning = {effort = "high"}}
+#     OpenAI o-series (workaround): extra_body = {reasoning_effort = "high"}  # prefer top-level if supported
+
+[[vlm_models]]
+enabled = true
+# Matches max-num-seqs of the Ministral vLLM
+max_concurrent_requests = 8
+name = "ministral-3-3b"
+temperature = 0.0
+max_output_tokens = 1200  # fits the 5000-token context of the Ministral vLLM
+max_input_ocr_length = 700
+url = "http://foil_vllm-ministral-3-3b:8000/v1"
+endpoint_name = "mistralai/ministral-3-3b"
+endpoint_api_key = 'none'
+prompt = "default"
+extra_body = {}
+
+
+# -------------------------------------------------------------------
+# External processors (e.g. video → markdown backend)               -
+# -------------------------------------------------------------------
+# MIME types listed in `mime_types` are delegated to a remote server exposing
+# the same API as foil-serve (POST /v1/process, GET /health).
+# Each MIME type may be claimed by at most one enabled processor.
+# If a MIME type is also supported natively, the external processor takes
+# precedence (a warning is logged at start-up).
+#
+# [[external_processors]]
+# enabled = <true | false>
+# name = <"identifier used in logs and /health?external_processor_name=...">
+# url = <"base url of the external server">
+# process_route = <processing route on the external server, e.g. "/v1/process">
+# health_route = <health-check route on the external server, e.g. "/health"; "" when it has none
+#                 (then /health cannot check it and check_on_startup must be false)>
+# endpoint_api_key = <api key, sent as `Authorization: Bearer <key>`; "" for no auth header>
+# mime_types = <list of MIME types routed to this processor>
+# max_concurrent_requests = <int — semaphore size; extra requests queue without blocking the event loop>
+# timeout_s = <total HTTP timeout per attempt, in seconds, e.g. 600.0>
+# max_retries = <extra attempts after the first one — transient errors only (timeouts, connection errors, HTTP 5xx); HTTP 4xx are never retried, e.g. 2>
+# retry_backoff_s = <base delay between attempts, doubles after each retry, e.g. 1.0>
+# max_file_size_mb = <int — per-type size limit, like max_pdf_file_size_mb>
+# check_on_startup = <check the processor /health at server start-up; server will not start on failure>
+
+[[external_processors]]
+enabled = false
+name = "video"
+url = "http://localhost:8090"
+process_route = "/v1/process"
+health_route = "/health"
+endpoint_api_key = "changeme"
+mime_types = [
+    "video/mp4",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/webm",
+    "video/x-msvideo",
+    "video/mpeg",
+]
+max_concurrent_requests = 2
+timeout_s = 600.0
+max_retries = 2
+retry_backoff_s = 1.0
+max_file_size_mb = 500
+check_on_startup = false
+
+
+# -------------------------------------------------------------------
+# Prompt definition for image description                           -
+# -------------------------------------------------------------------
+
+[prompts]
+
+default = """
+You are a document analysis expert who specializes in creating text descriptions for images.
+You will receive an image of a picture or figure.  Your job will be to create a short description of the image.
+
+**Instructions:**
+1. Carefully examine the provided image and the provided extracted text.
+2. The extracted text may contain OCR errors, hallucinations, or be entirely irrelevant. Cross-reference it with the visual information. Priority Rule: If there is a conflict between the extracted text and what you visually perceive in the image, prioritize your own visual understanding.
+3. Output a faithful description of the image.  Make sure there is enough specific detail to accurately reconstruct the image.  If the image is a figure or contains numeric data, include the numeric data in the output.
+
+**Strict Instructions:**
+1. **Style Neutrality:** Do not describe colors, font styles (modern, bold), or artistic layouts unless they convey specific data.
+2. **Logos & Simple Text:** If the image is a logo or just stylized text, output ONLY the name of the entity or the exact text found. Do not describe the shapes or colors.
+3. **Data Integrity:** If the image is a chart or table, extract the numeric data and titles.
+4. **No Fluff:** Avoid introductory phrases like "The image depicts" or "In this graphic". Start directly with the description.
+
+
+**Example 1 (Logo with Erroneous OCR):**
+Input:
+```text
+D4SSAULT
+AVIATION
+```
+Output:
+Logo of DASSAULT AVIATION.
+
+**Example 2 (Chart):**
+Input:
+```text
+"Fruit Preference Survey"
+20, 15, 10
+Apples, Bananas, Oranges
+```
+Output:
+A bar chart titled "Fruit Preference Survey" is showing the number of people who prefer different types of fruits.  The x-axis shows the types of fruits, and the y-axis shows the number of people.  The bar chart shows that most people prefer apples, followed by bananas and oranges.  20 people prefer apples, 15 people prefer bananas, and 10 people prefer oranges.
+**Input:**
+```text
+{raw_text}
+```
+"""
+
+another_prompt = "You can define as many prompt as you like. (do not use this one for image descripton :-))"

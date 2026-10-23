@@ -1,0 +1,102 @@
+# Foil-Serve deployment tuned for a single NVIDIA RTX 4090 (24 GB).
+#
+# Optimized for LATENCY, not for VRAM usage:
+#   - vLLM KV caches are fixed (1.5 GB each) and sized for concurrent requests
+#     (32 sequences for PaddleOCR-VL-1.5, 8 for Ministral)
+#   - the Paddle worker is never recycled (max_tasks_between_pipeline_reload = 99999):
+#     no reload overhead, but the app RAM/VRAM footprint keeps the Paddle allocator's peak
+# Leave other GPU workloads stopped while this stack runs.
+#
+#   cd docker/rtx4090 && docker compose up -d --wait
+#   → API http://localhost:8081/docs
+
+services:
+  foil_app:
+    image: ghcr.io/runyournode/foil-serve:0.1.6-offline
+    container_name: foil_app
+    gpus: all
+    ipc: host
+    expose:
+      - "8080"
+    ports:
+      - "8081:8080"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - APP_PORT=8080 # must match CMD if you override (default: 8080)
+    volumes:
+      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:Z,ro
+      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:Z,ro
+      # [optional] logs + artifacts (log file, failed/, xls2pdf/, cell_errors/)
+      - ./mount_runtime/foil_serve/logs:/var/log/foil:Z
+    restart: unless-stopped
+    depends_on:
+      foil_vllm-PaddleOCR-VL-1.5:
+        condition: service_healthy
+      foil_vllm-ministral-3-3b:
+        condition: service_healthy
+
+
+  # Hard Req : PaddleOCR-VL-1.5 served by vllm
+  foil_vllm-PaddleOCR-VL-1.5:
+    image: docker.io/vllm/vllm-openai:v0.32.0
+    container_name: foil_vllm-PaddleOCR-VL-1.5
+    gpus: all
+    ipc: host
+    expose:
+      - "8000"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - PORT=8000  # must match CMD
+    volumes:
+      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
+    command: ["--port", "8000", "--config", "/config/config.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+      ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+
+  # Soft Req : image description (cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit)
+  foil_vllm-ministral-3-3b:
+    image: docker.io/vllm/vllm-openai:v0.32.0
+    container_name: foil_vllm-ministral-3-3b
+    gpus: all
+    ipc: host
+    expose:
+      - "8000"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=0
+      - PORT=8000  # must match CMD
+    volumes:
+      - ./mount_config/vllm/Ministral-3-3B-Instruct-2512-AWQ-4bit.yaml:/config/config.yaml:Z,ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
+    command: ["--port", "8000", "--config", "/config/config.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+      ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+networks:
+  foil-net:
+    driver: bridge

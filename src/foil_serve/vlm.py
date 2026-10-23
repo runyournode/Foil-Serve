@@ -130,10 +130,13 @@ async def describe_images(
     ocrs: dict[str, str],
     semaphore: asyncio.Semaphore,
 ) -> tuple[dict[str, str], float]:
-    """Describe every image that has OCR context, concurrently.
+    """Describe, concurrently, every image that has a key in `ocrs`.
 
-    Images without an OCR entry are skipped: the pipeline did not treat them as
-    figures, so there is no context to feed the prompt.
+    `ocrs` maps each image referenced in the Markdown to its prompt context: the
+    OCR text of a Paddle figure block, or the alt text / chart summary of a
+    spreadsheet object. The value may be an empty string — such images are still
+    described. Images with no key are not referenced by any figure block, so there
+    is nowhere to put their description: they are skipped (but still returned).
 
     Returns (descriptions, total_seconds) where total_seconds is the sum of the
     individual call durations — it does not account for concurrency.

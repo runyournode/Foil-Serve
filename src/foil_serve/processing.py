@@ -32,9 +32,15 @@ from libreoffice import (
     is_office_mime_ext,
 )
 from pipeline import PaddlePipelineWrapper
-from postprocessing import extract_raw_ocr, join_pages, prune_pages, reformat_pages
+from postprocessing import (
+    extract_raw_ocr,
+    join_marked_pages,
+    join_pages,
+    prune_pages,
+    reformat_pages,
+)
 from schemas import Metadata, SpreadsheetMode
-from settings import AsyncOpenAIWithInfo, external_registry, settings, vlm_registry
+from settings import AsyncOpenAIWithInfo, external_registry, settings
 from spreadsheet import (
     EmptySpreadsheetError,
     SheetAnchor,
@@ -58,6 +64,7 @@ from spreadsheet_drawings import (
     survey_drawings,
 )
 from utils import (
+    PAGED_EXTS,
     SPREADSHEET_EXTS,
     TEXT_EXTS,
     ZIP_BASED_EXTS,
@@ -478,6 +485,7 @@ def _pandas_section(
     state: _SpreadsheetState,
     kept_images: Collection[str],
     descriptions: Mapping[str, str] | None,
+    small_images: Collection[str] = (),
 ) -> tuple[str, tuple[SheetAnchor, ...]]:
     """The pandas section: each sheet's table, then its pictures and charts."""
     objects = state.objects
@@ -491,6 +499,7 @@ def _pandas_section(
                 kept_images,
                 descriptions,
                 omitted=objects.omitted.get(sheet, 0),
+                small_images=small_images,
             )
     return assemble_sections(merge_sheet_bodies(state.tables, figures_md, sheet_order))
 
@@ -636,25 +645,33 @@ async def _post_process(
 
 
 def _encode_images(
-    job: _Job, imgs: dict[str, EncodedImage], model_name: Optional[str]
-) -> dict[str, str]:
-    """Drop images below the minimum size, then base64 the rest.
+    job: _Job, imgs: dict[str, EncodedImage]
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Base64 the images and list the small ones (width OR height below
+    `small_image_threshold`).
+
+    Small images are never described. With `ignore_small_images` they are also
+    dropped here, so they are not returned; otherwise they are returned and only
+    referenced in the Markdown.
 
     Images are already JPEG-encoded and content-named where they were produced, so
     each distinct image appears once here — and is described and returned once.
     """
     if not imgs:
-        return {}
-    vlm_config = vlm_registry.get(model_name or "")
-    min_w, min_h = (
-        vlm_config.min_size if vlm_config is not None else settings.image_min_size
-    )
+        return {}, frozenset()
+    min_w, min_h = settings.small_image_threshold
     with job.timer.track():
-        return {
+        small = frozenset(
+            name
+            for name, image in imgs.items()
+            if image.width < min_w or image.height < min_h
+        )
+        imgs_b64 = {
             name: image.b64
             for name, image in imgs.items()
-            if image.width >= min_w and image.height >= min_h
+            if not (settings.ignore_small_images and name in small)
         }
+    return imgs_b64, small
 
 
 # ---------------------------------------------------------------------------
@@ -768,10 +785,12 @@ async def process_document(
     if native is not None:
         # A shared name means identical bytes: the union is also a dedup.
         imgs = imgs | native.images
-    imgs_b64 = _encode_images(job, imgs, image_description_model_name)
+    imgs_b64, small_images = _encode_images(job, imgs)
 
     # ── Phase 5 : image description (async, external VLM) ────────────────────
-    if has_vlm and imgs_b64:
+    # Small images are never described.
+    to_describe = {k: v for k, v in imgs_b64.items() if k not in small_images}
+    if has_vlm and to_describe:
         assert client is not None and image_description_model_name is not None
         # Paddle figures get their OCR text as context; pictures and charts read
         # from a spreadsheet get their alt text / chart summary.
@@ -779,7 +798,7 @@ async def process_document(
         descriptions, img_desc_time = await describe_images(
             client=client,
             model_name=image_description_model_name,
-            imgs_b64=imgs_b64,
+            imgs_b64=to_describe,
             ocrs=contexts,
             semaphore=job.state.img_desc_sem.get(image_description_model_name),
         )
@@ -798,12 +817,14 @@ async def process_document(
                 descriptions_dict=descriptions,
                 ocr_dict=ocrs,
                 include_ocr=include_ocr,
+                small_images=small_images,
+                ignore_small_images=settings.ignore_small_images,
             )
 
     if is_spreadsheet:
         with job.timer.track():
             pandas_md, pandas_anchors = (
-                _pandas_section(sheet, imgs_b64.keys(), descriptions)
+                _pandas_section(sheet, imgs_b64.keys(), descriptions, small_images)
                 if sheet.keep_pandas
                 else (None, ())
             )
@@ -825,12 +846,16 @@ async def process_document(
             job, method, pandas_md, pandas_anchors, ocr_md, ocr_anchors
         )
     else:
-        page_content = join_pages(pages)
-        if not page_content.strip():
+        if not any(page.strip() for page in pages):
             raise HTTPException(
                 status_code=422,
                 detail=f"Processing produced no content ({job.mime})",
             )
+        page_content = (
+            join_marked_pages(pages)
+            if settings.add_pdf_page and job.mime in PAGED_EXTS
+            else join_pages(pages)
+        )
 
     return ProcessedResult(
         page_content=page_content,

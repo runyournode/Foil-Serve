@@ -239,7 +239,9 @@ async def health_check(
     """
     Check if server is up (doesn't check if vllm serving PaddleOCR-VL-1.5 is reachable).
     Optionally also check if vlm endpoints and/or external processors are available
-    (both query params support the special value "all").
+    (both query params support the special value "all"). An external processor
+    without a `health_route` cannot be checked: 400 when named, listed under
+    `unchecked_external_processors` with "all".
     """
     if image_description_model_name:
         try:
@@ -260,13 +262,23 @@ async def health_check(
                 },
             )
 
+    unchecked: list[str] = []
     if external_processor_name:
         processors = {p.name: p for p in settings.external_processors}
+        proc = processors.get(external_processor_name)
+        if proc is not None and not proc.health_route:
+            raise HTTPException(
+                status_code=400,
+                detail=f"external_processor_name: '{external_processor_name}' has no "
+                "health_route, it cannot be checked.",
+            )
         try:
             if external_processor_name == "all":
-                targets = list(processors.values())
-            elif external_processor_name in processors:
-                targets = [processors[external_processor_name]]
+                targets = [p for p in processors.values() if p.health_route]
+                # Processors without a health route are listed, never reported healthy
+                unchecked = [p.name for p in processors.values() if not p.health_route]
+            elif proc is not None:
+                targets = [proc]
             else:
                 raise ValueError(
                     f"external_processor_name: '{external_processor_name}' is not configured."
@@ -285,4 +297,6 @@ async def health_check(
                 },
             )
 
+    if unchecked:
+        return {"status": "ok", "unchecked_external_processors": unchecked}
     return {"status": "ok"}

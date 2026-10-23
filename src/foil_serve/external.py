@@ -160,7 +160,12 @@ async def process_external(
 async def check_external_processor(
     http_client: httpx.AsyncClient, cfg: ExternalProcessorConfig
 ) -> None:
-    """Check the external processor health endpoint. Raises RuntimeError on failure."""
+    """Check the external processor health endpoint. Raises RuntimeError on failure.
+
+    Callers must skip processors without a `health_route` (nothing to check).
+    """
+    if not cfg.health_route:
+        raise ValueError(f"External processor '{cfg.name}' has no health_route.")
     url = str(cfg.url).rstrip("/") + "/" + cfg.health_route.lstrip("/")
     try:
         response = await http_client.get(url, timeout=10.0)

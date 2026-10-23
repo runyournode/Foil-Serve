@@ -101,7 +101,7 @@ Categories: Jan … Jun (6 points)
 | `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML tables → Markdown or simplified HTML, optional VLM image description |
 | `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 | `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables, LibreOffice → PDF → PaddleOCR-VL, or both — see *Spreadsheet conversion strategies* | Cell error masking, pictures and charts extraction, header + table of contents, per-section size budget, optional VLM image description |
-| `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
+| `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp`, `.rtf` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 
 
 **PDF conversion:** when converting `.docx` and `.doc` files to PDF via LibreOffice, tracked changes (revisions) are automatically accepted, so the output reflects the final state of the document. Inline comments are **not** captured in the conversion.
@@ -237,6 +237,13 @@ cd docker/
 docker compose up -d
 ```
 
+#### RTX 4090 variant
+`./docker/rtx4090` is the same stack tuned for a single RTX 4090 (24 GB): bigger vLLM batches and fixed KV caches, worker never recycled. It is optimized for latency, not for VRAM usage.
+```bash
+cd docker/rtx4090/
+docker compose up -d --wait
+```
+
 ---
 
 ## ⚙️ Configuration
@@ -256,15 +263,24 @@ endpoint_api_key = "sk-..."
 temperature = 0.0
 max_output_tokens = 4000
 max_input_ocr_length = 700      # max chars of OCR text injected into the VLM prompt
-min_size = [64, 64]             # minimum image dimensions to process (pixels)
 max_concurrent_requests = 10
 prompt = "default"              # key from [prompts] section or a direct prompt string
 extra_body = {chat_template_kwargs = {enable_thinking = false}} # optional extra body parameter (e.g. disable thinking on vllm)
 ```
 
+### Small images (`server_config.toml`)
+
+```toml
+small_image_threshold = [64, 64]  # small = width OR height below this (pixels); never described by the VLM
+ignore_small_images = true        # true: dropped from the Markdown and `images`
+                                  # false: returned, referenced by a bare <img> (OCR kept if < 40 chars)
+```
+
 ### Spreadsheet processing (`server_config.toml`)
 
-| Setting | Default | Applies to | Description |
+Every `server_config.toml` key is required and unknown keys are rejected: the server refuses to start rather than fall back to a hidden default.
+
+| Setting | Shipped value | Applies to | Description |
 |---|---|---|---|
 | `table_output_format` | `"llm"` | all | `"llm"` compact or `"human"` aligned — also used for HTML tables from the OCR pipeline |
 | `excel_mask_cell_errors` | `true` | pandas | Mask error cells with an empty string, or label them (`#ref`, `#n/a`, …) |
@@ -283,10 +299,11 @@ extra_body = {chat_template_kwargs = {enable_thinking = false}} # optional extra
 
 Controls whether `<ocr>` tags (Paddle OCR text on images) appear in the final Markdown:
 
-| Setting | Default | Description |
+| Setting | Shipped value | Description |
 |---|---|---|
 | `output_paddle_ocr` | `false` | When VLM image description **is** requested: keep `<ocr>` tags alongside `<figcaption>`. |
 | `output_paddle_ocr_no_img_desc` | `true` | When **no** VLM is requested: keep `<ocr>` tags. If `false`, the OCR-on-images pipeline step is skipped entirely (performance optimization). |
+| `add_pdf_page` | `false` | Start each page of a paginated document (PDF, office documents, multipage TIFF/WebP) with `<page number="n/n_max" />`. Spreadsheets and single images are never marked. |
 
 When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and the image-block OCR step is skipped, reducing processing time.
 
@@ -342,7 +359,7 @@ uv run pytest tests/live/ -v  # end-to-end, needs a running server (skipped othe
 `tests/live/` talks to an actual instance and is skipped automatically when none answers on `$FOIL_SERVE_URL` (default `http://127.0.0.1:8081`). It covers what the offline suite structurally cannot — chiefly that the sheet → page map LibreOffice reports lines up with the pages PaddleOCR returns. See `tests/README.md` for the full layout and for the fixture generator.
 
 ### Memory management & worker recycling
-PaddleOCR is not thread-safe and leaks GPU/CPU memory over time. The current workaround uses a `spawn`-based multiprocessing pool (`processes=1`) that recycles the worker process every N documents (`max_tasks_between_pipeline_reload` in `server_config.toml`, default 5). Each recycle takes a few seconds while the pipeline reloads.
+PaddleOCR is not thread-safe and leaks GPU/CPU memory over time. The current workaround uses a `spawn`-based multiprocessing pool (`processes=1`) that recycles the worker process every N documents (`max_tasks_between_pipeline_reload` in `server_config.toml`). Each recycle takes a few seconds while the pipeline reloads.
 
 The root cause of the memory leak has not been fully identified — feel free to investigate 🔍
 

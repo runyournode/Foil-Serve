@@ -1,0 +1,21 @@
+model: PaddlePaddle/PaddleOCR-VL-1.5
+served-model-name:
+  - PaddlePaddle/PaddleOCR-VL-1.5
+  - PaddleOCR-VL-1.5-0.9B
+trust-remote-code: True  # keep true even if vllm says it's ignored
+
+# Required for vllm>=0.32.0: PaddleX sends per-request mm_processor_kwargs (rejected with HTTP 400 otherwise)
+trust-request-mm-kwargs: True
+
+limit_mm_per_prompt: {image: 1}
+max_num_seqs: 32
+max-num-batched-tokens: 32768
+max-model-len: 16384
+
+no-enable-prefix-caching: True
+mm-processor-cache-gb: 0
+
+# Fixed KV cache size: gpu-memory-utilization alone leaves too little KV for a 16384-token request
+# once weights and CUDA graphs are loaded. It is then only used for the free-VRAM check at startup.
+kv-cache-memory-bytes: 1500000000
+gpu-memory-utilization: 0.05

@@ -31,28 +31,17 @@ class UnsupportedMimeTypeError(Exception):
 #  MIME type detection
 # -----------------------------------
 
-MimeExt = Literal[
-    ".pdf",
-    ".docx",
-    ".doc",
-    ".odt",
-    ".xlsx",
-    ".xls",
-    ".ods",
-    ".pptx",
-    ".ppt",
-    ".odp",
-    ".png",
-    ".jpg",
-    ".bmp",
-    ".webp",
-    ".tiff",
-    ".txt",
-    ".json",
-    ".csv",
-    ".xml",
-    ".md",
-]
+# Supported extensions, one family per Literal: the single source for MimeExt and
+# for the runtime sets below (OFFICE_EXTS, SPREADSHEET_EXTS, …), also used by
+# libreoffice.py. Adding a format means adding it here, and to `mime_def`.
+# Documents LibreOffice converts to PDF
+OfficeDocExt = Literal[".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".rtf"]
+SpreadsheetExt = Literal[".xlsx", ".xls", ".ods"]
+ImageExt = Literal[".png", ".jpg", ".bmp", ".webp", ".tiff"]
+# Read as plain text — no pipeline
+TextExt = Literal[".txt", ".json", ".csv", ".xml", ".md"]
+
+MimeExt = Literal[".pdf", OfficeDocExt, SpreadsheetExt, ImageExt, TextExt]
 
 # Maps MIME type strings to file extensions.
 # Keys also define which MIME types are natively accepted for processing (additional mime can be supported by external processor).
@@ -70,6 +59,9 @@ mime_def: dict[str, MimeExt | None] = {
     "application/vnd.oasis.opendocument.text": ".odt",
     "application/vnd.oasis.opendocument.spreadsheet": ".ods",
     "application/vnd.oasis.opendocument.presentation": ".odp",
+    # Rich Text Format — opened by LibreOffice Writer
+    "text/rtf": ".rtf",
+    "application/rtf": ".rtf",
     # Images — passed directly to the pipeline (except TIFF and WebP: converted to PDF first)
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -430,13 +422,15 @@ def prepare_input_file(
 #  Type-specific input size limits
 # -----------------------------------
 
-# Extensions read as plain text — no pipeline, no size limit beyond the global one.
-TEXT_EXTS: frozenset[str] = frozenset({".txt", ".json", ".csv", ".xml", ".md"})
-SPREADSHEET_EXTS: frozenset[str] = frozenset({".xls", ".xlsx", ".ods"})
-IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".bmp", ".webp", ".tiff"})
-OFFICE_EXTS: frozenset[str] = frozenset(
-    {".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"}
-)
+# Runtime views of the Literal families above (never listed twice).
+# Text: no pipeline, no size limit beyond the global one.
+TEXT_EXTS: frozenset[str] = frozenset(get_args(TextExt))
+SPREADSHEET_EXTS: frozenset[str] = frozenset(get_args(SpreadsheetExt))
+IMAGE_EXTS: frozenset[str] = frozenset(get_args(ImageExt))
+OFFICE_EXTS: frozenset[str] = frozenset(get_args(OfficeDocExt))
+# Paginated inputs: each PDF page (native, converted office document, multipage
+# image) is a page of the source document. Spreadsheets have their own sheet anchors.
+PAGED_EXTS: frozenset[str] = frozenset({".pdf", ".tiff", ".webp"}) | OFFICE_EXTS
 # ZIP containers: a declared size can be forged, so these get the two-phase bomb check.
 ZIP_BASED_EXTS: frozenset[str] = frozenset(
     {".docx", ".pptx", ".odt", ".odp", ".xlsx", ".ods"}

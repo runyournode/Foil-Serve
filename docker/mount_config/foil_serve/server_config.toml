@@ -8,7 +8,7 @@
 # -------------------------------------------------------------------
 log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
 libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
-log_file = "/var/log/foil/foil.log"  # Comment to disable logging to file
+log_file = "/var/log/foil/foil.log"  # "" to disable logging to file
 
 # Base directory for debug artifacts. Subdirectories are created automatically.
 artifact_dir = "/var/log/foil/artifacts"
@@ -118,7 +118,8 @@ excel_max_output_ratio = 5.0
 
 # -- The three settings below apply to mode "auto" ONLY -------------
 # Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
-# images, shapes only), convert to PDF and process via Paddle OCR instead
+# shapes only), convert to PDF and process via Paddle OCR instead. Pictures and
+# charts do not count against the file when `excel_extract_images` is on — see below
 # (which mean possible allucinations... ).
 # Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
 # The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
@@ -129,6 +130,26 @@ excel_min_input_for_fallback_mb = 0.25
 # Overridable per request with the `excel_min_output_ratio` query param (the request
 # value wins when provided); the param is accepted only on the "auto" routes.
 excel_min_output_ratio = 0.01
+
+
+# -- Pictures and charts: modes "auto", "pandas", "both" ------------
+# The pandas section extracts the pictures and charts of each sheet and lists them
+# under the sheet's table (in on-sheet order), returned in `images` and described
+# by the VLM when `image_description_model_name` is requested.
+# Pictures are read from the file as-is. Their bytes are excluded from the file
+# size in the "auto" sparse check: a small table next to a big picture stays pandas.
+# false: pictures and charts are ignored by the pandas section (previous behaviour).
+excel_extract_images = true
+# Charts are stored as data, not as a bitmap: LibreOffice renders them to PNG.
+# false: a chart is described by its text summary only (type, title, series), no
+# LibreOffice call.
+excel_render_charts = true
+# EMF/WMF pictures cannot be decoded natively on Linux: LibreOffice renders them.
+# false: such pictures are skipped.
+excel_rasterize_metafiles = true
+# Max distinct images extracted per document (pictures + rendered charts). Beyond
+# it, pictures are dropped with a note and charts keep their text summary.
+excel_max_images = 200
 
 
 # -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----
@@ -157,6 +178,11 @@ output_paddle_ocr = false
 #         Paddle pipeline (performance optimization).
 output_paddle_ocr_no_img_desc = true
 
+# Start each page of a paginated document (PDF, office documents converted to PDF,
+# multipage TIFF/WebP) with `<page number="n/n_max" />` in the Markdown.
+# Spreadsheets are never marked: they already have per-sheet headings.
+add_pdf_page = false
+
 
 # -------------------------------------------------------------------
 # Miscellaneous                                                     -
@@ -167,9 +193,14 @@ output_paddle_ocr_no_img_desc = true
 # Use "/dev/shm" for pure in-memory I/O (ensure sufficient --shm-size in Docker).
 temp_dir = "/tmp/foil-runtime"
 
-# Minimum image size to be included in the response (in pixels)
-# If image image_description_model_name is requested, `[[vlm_models]].min_size` takes precedence over this value
-image_min_size = [64, 64]
+# Small images: width OR height (in pixels) below this threshold.
+# Small images are never sent to the VLM for description.
+small_image_threshold = [64, 64]
+# true  → small images are dropped: nothing in the Markdown, not returned in `images`.
+# false → small images are returned in `images` and only referenced in the Markdown
+#         (bare <img>, no <figure>/<figcaption>; their OCR is kept only when OCR output
+#         is enabled and the text is shorter than 40 chars).
+ignore_small_images = true
 
 
 # -------------------------------------------------------------------
@@ -197,16 +228,15 @@ max_concurrent_excel = 5
 # [[vlm_models]]
 # enabled = <true | false>
 # max_concurrent_requests = <int>
-# min_size = <Optional min image size to process | [64, 64]>
 # temperature = <float>
 # max_output_tokens = <int>
-# max_input_ocr_length = <Optional max chars of OCR text injected into the VLM prompt | 700>
+# max_input_ocr_length = <int — max chars of OCR text injected into the VLM prompt, e.g. 700>
 # name = <"image_description_model_name from the client">
 # url = <"url to the openai endpoint">
-# endpoint_api_key = <Optional api key | None>
+# endpoint_api_key = <"api key" — any non-empty string when the endpoint has no auth>
 # endpoint_name = <exact model name to pass to the openai endpoint">
 # prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
-# extra_body = <Optional provider-specific parameters forwarded as-is to the API call | unset>
+# extra_body = <provider-specific parameters forwarded as-is to the API call; {} for none>
 #   Examples:
 #     vLLM / Qwen3 thinking:      extra_body = {chat_template_kwargs = {enable_thinking = true}}
 #     OpenRouter thinking:         extra_body = {reasoning = {effort = "high"}}
@@ -216,7 +246,6 @@ max_concurrent_excel = 5
 enabled = true
 max_concurrent_requests = 20
 name = "ministral-3-3b"
-min_size = [64, 64]
 temperature = 0.0
 max_output_tokens = 5000
 max_input_ocr_length = 700
@@ -224,6 +253,7 @@ url = "http://foil_vllm-ministral-3-3b:8000/v1"
 endpoint_name = "mistralai/ministral-3-3b"
 endpoint_api_key = 'none'
 prompt = "default"
+extra_body = {}
 
 
 # -------------------------------------------------------------------
@@ -239,21 +269,24 @@ prompt = "default"
 # enabled = <true | false>
 # name = <"identifier used in logs and /health?external_processor_name=...">
 # url = <"base url of the external server">
-# process_route = <Optional processing route on the external server | "/v1/process">
-# health_route = <Optional health-check route on the external server | "/health">
-# endpoint_api_key = <Optional api key, sent as `Authorization: Bearer <key>` | None>
+# process_route = <processing route on the external server, e.g. "/v1/process">
+# health_route = <health-check route on the external server, e.g. "/health"; "" when it has none
+#                 (then /health cannot check it and check_on_startup must be false)>
+# endpoint_api_key = <api key, sent as `Authorization: Bearer <key>`; "" for no auth header>
 # mime_types = <list of MIME types routed to this processor>
 # max_concurrent_requests = <int — semaphore size; extra requests queue without blocking the event loop>
-# timeout_s = <Optional total HTTP timeout per attempt, in seconds | 600.0>
-# max_retries = <Optional extra attempts after the first one — transient errors only (timeouts, connection errors, HTTP 5xx); HTTP 4xx are never retried | 2>
-# retry_backoff_s = <Optional base delay between attempts, doubles after each retry | 1.0>
+# timeout_s = <total HTTP timeout per attempt, in seconds, e.g. 600.0>
+# max_retries = <extra attempts after the first one — transient errors only (timeouts, connection errors, HTTP 5xx); HTTP 4xx are never retried, e.g. 2>
+# retry_backoff_s = <base delay between attempts, doubles after each retry, e.g. 1.0>
 # max_file_size_mb = <int — per-type size limit, like max_pdf_file_size_mb>
-# check_on_startup = <Optional check the processor /health at server start-up; server will not start on failure | false>
+# check_on_startup = <check the processor /health at server start-up; server will not start on failure>
 
 [[external_processors]]
 enabled = false
 name = "video"
 url = "http://localhost:8090"
+process_route = "/v1/process"
+health_route = "/health"
 endpoint_api_key = "changeme"
 mime_types = [
     "video/mp4",

@@ -19,3 +19,7 @@ docker/mount_runtime/**
 !docker/mount_runtime/foil_serve/
 !docker/mount_runtime/foil_serve/logs/
 !docker/mount_runtime/foil_serve/logs/.gitkeep
+docker/rtx4090/mount_runtime/**
+!docker/rtx4090/mount_runtime/foil_serve/
+!docker/rtx4090/mount_runtime/foil_serve/logs/
+!docker/rtx4090/mount_runtime/foil_serve/logs/.gitkeep

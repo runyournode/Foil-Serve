@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl, model_validator
 
 
 class SpreadsheetMode(StrEnum):
@@ -19,40 +19,51 @@ class SpreadsheetMode(StrEnum):
 class ExternalProcessorConfig(BaseModel):
     """Used internally — external foil-compatible processing backend (e.g. video)"""
 
+    model_config = ConfigDict(extra="forbid")  # unknown keys must fail loudly
+
     name: str  # identifier used in logs, semaphores and /health checks
     enabled: bool
     url: HttpUrl  # base URL of the external server
-    process_route: str = "/v1/process"  # processing route on the external server
-    health_route: str = "/health"  # health-check route on the external server
-    endpoint_api_key: str | None = None  # sent as `Authorization: Bearer <key>`
+    process_route: str  # processing route on the external server
+    # health-check route on the external server; "" = the server has none
+    health_route: str
+    endpoint_api_key: str  # sent as `Authorization: Bearer <key>`; "" = no auth header
     mime_types: list[str]  # MIME types routed to this processor (e.g. "video/mp4")
     max_concurrent_requests: int
-    timeout_s: float = 600.0  # total HTTP timeout per attempt
-    max_retries: int = 2  # extra attempts after the first one (transient errors only)
-    retry_backoff_s: float = 1.0  # base delay; doubles after each failed attempt
+    timeout_s: float  # total HTTP timeout per attempt
+    max_retries: int  # extra attempts after the first one (transient errors only)
+    retry_backoff_s: float  # base delay; doubles after each failed attempt
     max_file_size_mb: int
-    check_on_startup: bool = False  # ping the processor /health during lifespan
+    check_on_startup: bool  # ping the processor /health during lifespan
+
+    @model_validator(mode="after")
+    def health_route_for_startup_check(self) -> "ExternalProcessorConfig":
+        if self.check_on_startup and not self.health_route:
+            raise ValueError(
+                f"Invalid `server_config.toml`: external processor '{self.name}' has "
+                "`check_on_startup = true` but no `health_route`."
+            )
+        return self
 
 
 class VLMModelConfig(BaseModel):
     """Used internally"""
 
+    model_config = ConfigDict(extra="forbid")  # unknown keys must fail loudly
+
     name: str  # == `image_description_model_name` in route query
     enabled: bool
-    min_size: tuple[int, int] = (64, 64)
     temperature: float
     max_output_tokens: int
     url: HttpUrl
     max_concurrent_requests: int
     endpoint_name: str  # exact model name to pass to the openai endpoint
-    endpoint_api_key: str | None = None
+    endpoint_api_key: str
     prompt: str  # Default prompt key or full prompt string
-    max_input_ocr_length: int = (
-        700  # Max chars of OCR text injected into the VLM prompt
-    )
-    extra_body: dict | None = (
-        None  # Provider-specific extra parameters passed as-is to the API call (e.g. thinking level)
-    )
+    max_input_ocr_length: int  # Max chars of OCR text injected into the VLM prompt
+    # Provider-specific extra parameters passed as-is to the API call (e.g. thinking
+    # level); {} = none
+    extra_body: dict
 
 
 class Metadata(BaseModel):

@@ -14,14 +14,13 @@ from typing import Literal, TypeIs, get_args
 from pydantic import TypeAdapter, ValidationError
 
 from settings import PaperFormat
+from utils import OFFICE_EXTS, SPREADSHEET_EXTS, OfficeDocExt, SpreadsheetExt
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 # File types LibreOffice converts to PDF for us.
-OfficeMimeExt = Literal[
-    ".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp", ".xls", ".xlsx", ".ods"
-]
+OfficeMimeExt = Literal[OfficeDocExt, SpreadsheetExt]
 _OFFICE_MIME_EXTS = frozenset(get_args(OfficeMimeExt))
 
 
@@ -822,7 +821,7 @@ def convert_to_pdf(
     if not file_path.exists():
         raise FileNotFoundError(str(file_path))
 
-    if mime in (".xls", ".xlsx", ".ods"):
+    if mime in SPREADSHEET_EXTS:
         try:
             sheet_map = lo_server.convert_spreadsheet(
                 file_path,
@@ -832,7 +831,7 @@ def convert_to_pdf(
             )
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
-    elif mime in (".docx", ".doc", ".pptx", ".ppt", ".odt", ".odp"):
+    elif mime in OFFICE_EXTS:
         try:
             lo_server.convert_general(file_path, generated_pdf)
         except Exception as e:

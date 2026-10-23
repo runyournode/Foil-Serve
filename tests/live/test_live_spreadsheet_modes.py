@@ -262,7 +262,7 @@ class TestSparseFallback:
 
 class TestPicturesAndCharts:
     """`drawings.*`: a table with two charts on `Data`, two pictures on `Pics`
-    (one of them a 32x32 icon, below image_min_size)."""
+    (one of them a 32x32 icon, below small_image_threshold)."""
 
     @pytest.mark.parametrize(
         "fixture", ["drawings.xlsx", "drawings.ods", "drawings.xls"]

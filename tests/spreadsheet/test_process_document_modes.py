@@ -262,7 +262,7 @@ class TestPicturesAndCharts:
         result = _process(request_stub, "drawings.xlsx", SpreadsheetMode.PANDAS)
         md = result.page_content
 
-        assert len(result.images) == 1, "the 32x32 icon is below image_min_size"
+        assert len(result.images) == 1, "the 32x32 icon is below small_image_threshold"
         (picture,) = result.images
         assert _NAME_RE.match(picture), "images are named after their content"
         data = _section(md, "Data")
@@ -279,6 +279,27 @@ class TestPicturesAndCharts:
         for label, line in rows:
             assert lines[line - 1] == f"## {label}"
         assert not _CELL_RANGE_RE.search(md), "no cell reference in the output"
+
+    def test_small_images_are_referenced_when_not_ignored(
+        self, request_stub, fake_vlm, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "ignore_small_images", False)
+        result = _process(
+            request_stub,
+            "drawings.xlsx",
+            SpreadsheetMode.PANDAS,
+            model="fake-vlm",
+            client=MagicMock(),
+        )
+        assert len(result.images) == 2, "the picture and the 32x32 icon"
+        described = {name for name, _ in fake_vlm}
+        (icon,) = set(result.images) - described
+        assert len(described) == 1, "the icon is never sent to the VLM"
+
+        md = result.page_content
+        assert icon in _srcs(md), "the icon is referenced"
+        assert f'<figure>\n<img src="{icon}"' not in md, "bare <img>, no <figure>"
+        assert f"Description of {icon}." not in md
 
     def test_rendered_charts_are_described_with_their_summary(
         self, request_stub, fake_render, fake_vlm

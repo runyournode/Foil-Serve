@@ -625,6 +625,26 @@ class TestMarkdown:
             "the per-document image limit was reached."
         )
 
+    def test_render_figures_small_images_referenced(self):
+        """ignore_small_images=False: small images are kept but never captioned."""
+        figures = [
+            Figure("picture", "imgs/icon.jpg", "Logo", ""),
+            Figure("chart", "imgs/c.jpg", "", "Pie chart"),
+        ]
+        md = render_figures(
+            figures,
+            kept_images={"imgs/icon.jpg", "imgs/c.jpg"},
+            descriptions={},
+            small_images={"imgs/icon.jpg", "imgs/c.jpg"},
+        )
+        assert md == (
+            '<img src="imgs/icon.jpg" alt="Logo">\n\n'
+            "<figure>\n"
+            '<img src="imgs/c.jpg">\n'
+            "<chart>  \nPie chart  \n</chart>\n"
+            "</figure>"
+        )
+
     def test_merge_follows_the_workbook_order(self):
         bodies = merge_sheet_bodies(
             tables=[("Data", "|a|\n|-|\n|1|"), ("Notes", "")],

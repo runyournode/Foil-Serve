@@ -91,7 +91,9 @@ def _worker_predict(
         _worker_pipeline is not None
     )  # set by _init_worker before the pool submits any task
     output = _worker_pipeline.predict(
-        file_path, use_ocr_for_image_block=use_ocr_for_image_block
+        file_path,
+        use_ocr_for_image_block=use_ocr_for_image_block,
+        layout_shape_mode="rect",
     )
     ctx = (
         contextlib.closing(output)
@@ -112,8 +114,9 @@ def _worker_predict(
             # pages. Encoding here also ships JPEG bytes, not raw pixels, to the parent.
             md, encoded = name_by_content(md, img)
             imgs.update(encoded)
-            if md:
-                mds.append(md)
+            # Empty pages are kept: list index == PDF page index (page markers,
+            # spreadsheet sheet → page map).
+            mds.append(md)
             for pil_img in img.values():
                 pil_img.close()
             img.clear()

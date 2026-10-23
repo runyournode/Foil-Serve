@@ -494,7 +494,7 @@ def gen_ods_multi_sheet():
 #  24. Pictures and charts next to real tables.
 #      Data: a table + a bar chart (top) and a line chart (lower down).
 #      Pics: a caption cell, an RGBA picture, and a 32x32 icon below it — the icon
-#      is under image_min_size, so it must not reach the response.
+#      is under small_image_threshold, so it must not reach the response.
 #      openpyxl writes charts WITHOUT cached values: summaries degrade to
 #      "series N" here, the .ods/.xls variants below (saved by LibreOffice) have them.
 # ─────────────────────────────────────────────────────────────────────────────
