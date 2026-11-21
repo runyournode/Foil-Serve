@@ -18,7 +18,13 @@ import psutil
 from pydantic import TypeAdapter, ValidationError
 
 from settings import PaperFormat
-from utils import OFFICE_EXTS, SPREADSHEET_EXTS, OfficeDocExt, SpreadsheetExt
+from utils import (
+    OFFICE_EXTS,
+    SPREADSHEET_EXTS,
+    OfficeDocExt,
+    SpreadsheetExt,
+    UnreadableDocument,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -128,7 +134,12 @@ PAPER_SIZES: dict[PaperFormat, tuple[int, int]] = {
 # — server-side request forgery, and a stall until the connection times out) and run no
 # macro; the load itself updates no link. NOT DisableActiveContent: it disables every
 # embedded OLE object, and charts ARE OLE objects (they would vanish from the PDF).
+# Exit code of a UNO script whose document LibreOffice cannot open (corrupted file).
+_UNREADABLE_EXIT_CODE = 3
+
 _UNO_HARDENING = """
+UNREADABLE_EXIT_CODE = __UNREADABLE_EXIT_CODE__
+
 def harden(ctx):
     from com.sun.star.beans import PropertyValue as _PV
     provider = ctx.ServiceManager.createInstanceWithContext(
@@ -145,6 +156,21 @@ def harden(ctx):
     access.commitChanges()
 
 
+def load_or_exit(desktop, file_url, props):
+    # Open the document, or exit with UNREADABLE_EXIT_CODE when LibreOffice cannot
+    # (it returns None, or raises IOException / IllegalArgumentException).
+    import sys
+    try:
+        doc = desktop.loadComponentFromURL(file_url, "_blank", 0, props)
+    except Exception as e:
+        print(f"cannot open the document: {e!r}", file=sys.stderr)
+        sys.exit(UNREADABLE_EXIT_CODE)
+    if doc is None:
+        print("cannot open the document: LibreOffice returned no component", file=sys.stderr)
+        sys.exit(UNREADABLE_EXIT_CODE)
+    return doc
+
+
 def safe_load_props():
     from com.sun.star.beans import PropertyValue as _PV
     props = []
@@ -155,7 +181,7 @@ def safe_load_props():
         prop.Value = value
         props.append(prop)
     return tuple(props)
-"""
+""".replace("__UNREADABLE_EXIT_CODE__", str(_UNREADABLE_EXIT_CODE))
 
 
 class LibreOfficeUnavailable(RuntimeError):
@@ -463,6 +489,10 @@ class LibreOfficeServer:
                 f"  stdout: {(e.output or '').strip()}\n"
                 f"  stderr: {(e.stderr or '').strip()}"
             )
+            if e.returncode == _UNREADABLE_EXIT_CODE:
+                raise UnreadableDocument(
+                    f"LibreOffice cannot open the document: {(e.stderr or '').strip()[-200:]}"
+                ) from e
             server_died = self._process is None or self._process.poll() is not None
             if e.returncode < 0 or server_died:
                 # The UNO client died of a signal (e.g. SIGSEGV in the bridge) or
@@ -515,9 +545,7 @@ def convert():
     hidden = PropertyValue()
     hidden.Name = "Hidden"
     hidden.Value = True
-    doc = desktop.loadComponentFromURL(
-        file_url, "_blank", 0, (hidden, *safe_load_props())
-    )
+    doc = load_or_exit(desktop, file_url, (hidden, *safe_load_props()))
 
     # Accepter toutes les révisions (Writer uniquement)
     if doc.supportsService("com.sun.star.text.TextDocument"):
@@ -602,9 +630,7 @@ def convert():
     hidden = PropertyValue()
     hidden.Name = "Hidden"
     hidden.Value = True
-    doc = desktop.loadComponentFromURL(
-        file_url, "_blank", 0, (hidden, *safe_load_props())
-    )
+    doc = load_or_exit(desktop, file_url, (hidden, *safe_load_props()))
 
     # Set each sheet to {paper_format} {orientation}, fit all columns to 1 page width
     sheets = doc.getSheets()
@@ -671,9 +697,7 @@ def convert():
     hidden.Name = "Hidden"
     hidden.Value = True
 
-    doc = desktop.loadComponentFromURL(
-        file_url, "_blank", 0, (hidden, *safe_load_props())
-    )
+    doc = load_or_exit(desktop, file_url, (hidden, *safe_load_props()))
 
     xlsx_filter = PropertyValue()
     xlsx_filter.Name = "FilterName"
@@ -801,10 +825,7 @@ def render():
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
 
     file_url = uno.systemPathToFileUrl({file_path.resolve().as_posix()!r})
-    doc = desktop.loadComponentFromURL(
-        file_url, "_blank", 0,
-        (prop("Hidden", True), prop("MacroExecutionMode", 0), prop("UpdateDocMode", 0)),
-    )
+    doc = load_or_exit(desktop, file_url, (prop("Hidden", True), *safe_load_props()))
     rendered = []
     failures = 0
     try:
@@ -1068,14 +1089,14 @@ def convert_to_pdf(
                 paper_format=paper_format or "A3",
                 landscape=landscape,
             )
-        except LibreOfficeUnavailable:
+        except (LibreOfficeUnavailable, UnreadableDocument):
             raise
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
     elif mime in OFFICE_EXTS:
         try:
             lo_server.convert_general(file_path, generated_pdf)
-        except LibreOfficeUnavailable:
+        except (LibreOfficeUnavailable, UnreadableDocument):
             raise
         except Exception as e:
             raise RuntimeError(f"LibreOffice error: {e}") from e

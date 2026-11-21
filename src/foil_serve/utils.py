@@ -19,6 +19,11 @@ from schemas import Metadata
 logger = logging.getLogger(__name__)
 
 
+class UnreadableDocument(ValueError):
+    """The file has a supported type but cannot be opened (truncated, corrupted):
+    the client's fault, answered with HTTP 422."""
+
+
 class UnsupportedMimeTypeError(Exception):
     """Raised when the detected MIME type is not in mime_def."""
 

@@ -47,7 +47,7 @@ app_api_keys = [
 
 # Check if all vlm_models declared below are properly reachable on server start-up.
 # If any VLM is not reachable, server will not start
-check_vlm_endpoints = false  # the image-description VLM is external on a 3070 (see [[vlm_models]])
+check_vlm_endpoints = true
 
 # Maximum accepted file size in MB, checked BEFORE writing to disk.
 # Applies to all file types.
@@ -233,7 +233,7 @@ vlm_description_cache_mb = 200
 # Measured on an RTX 3070 (layout batch 1, 900 MB cap each, vLLM 10 sequences), pages/s
 # under load: 1 worker 0.84, 2 → 1.09, 3-4 → ~1.2. Bigger GPUs: not measured, re-run a load
 # test (tuning guide at the end of pipeline_config.yaml). Shared GPU: cap VRAM explicitly.
-pipeline_workers = 3  # RTX 3070 bench: 1 → 0.84, 2 → 1.09, 3 → 1.18 pages/s under load; a 4th adds nothing
+pipeline_workers = 1  # full stack on 8 GB (PaddleOCR-VL + Ministral + 1 worker: 7.4 GB peak). OCR only (no Ministral): 3
 
 # A worker's RSS grows with the largest document it has processed: the memory Paddle
 # frees stays in the glibc heap (fragmentation; no real leak found on the test corpus).
@@ -274,7 +274,7 @@ pipeline_task_timeout_s = 600  # per page range (20 pages, ~25-60 s on a 3070): 
 # concurrent requests: p95 96 s → 53 s, +40 % throughput with a cap). Lower values slow a
 # document processed alone (3070, 10 sequences: 3 → 0.62 pages/s, 5 → 0.75, 10 → 0.84)
 # without helping throughput under load.
-pipeline_vlm_max_concurrency = 10  # = max_num_seqs of the vLLM below, NOT divided by the 3 workers
+pipeline_vlm_max_concurrency = 8  # = max_num_seqs of the PaddleOCR-VL vLLM, NOT divided by the workers
 
 # Long documents are sent to the workers in consecutive ranges of this many pages, one
 # task each: every range goes back to the end of the queue, so small documents get a
@@ -338,12 +338,12 @@ max_concurrent_excel = 5
 [[vlm_models]]
 enabled = true
 # Matches max-num-seqs of the Ministral vLLM
-max_concurrent_requests = 8
+max_concurrent_requests = 2  # = llama.cpp parallel slots (-np 2)
 name = "ministral-3-3b"
 temperature = 0.0
 max_output_tokens = 1200  # fits the 5000-token context of the Ministral vLLM
 max_input_ocr_length = 700
-url = "http://host.docker.internal:1234/v1"  # external VLM (e.g. LM Studio on the host): no room for it on an 8 GB GPU
+url = "http://foil_llamacpp-ministral:8080/v1"  # Ministral-3-3B Q4_K_M on llama.cpp (see compose.yaml)
 endpoint_name = "mistralai/ministral-3-3b"
 endpoint_api_key = 'none'
 prompt = "default"

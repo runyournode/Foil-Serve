@@ -22,7 +22,7 @@ import psutil
 from page_images import iter_pages, page_count
 from postprocessing import join_pages, name_by_content
 from settings import settings, setup_logging
-from utils import EncodedImage
+from utils import EncodedImage, UnreadableDocument
 from worker_pool import WorkerCrashed, WorkerPool, WorkerTaskTimeout
 
 if TYPE_CHECKING:
@@ -368,7 +368,10 @@ class PaddlePipelineWrapper:
         PipelineUnavailable
             503 when a worker died during the document, 504 on timeout (per range).
         """
-        count = await asyncio.to_thread(page_count, Path(file_path))
+        try:
+            count = await asyncio.to_thread(page_count, Path(file_path))
+        except Exception as e:  # pdfium / Pillow cannot parse it: a corrupted file
+            raise UnreadableDocument(f"cannot read the document: {e}") from e
         chunk = settings.pipeline_chunk_pages or count or 1
         md_pages: list[str] = []
         imgs: dict[str, EncodedImage] = {}

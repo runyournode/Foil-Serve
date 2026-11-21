@@ -80,6 +80,7 @@ from utils import (
     is_native_mime_ext,
     prepare_input_file,
     read_text_smart,
+    UnreadableDocument,
 )
 from vlm import describe_images
 
@@ -170,6 +171,9 @@ class _Job:
             yield
         except HTTPException:
             raise
+        except UnreadableDocument as e:
+            await self.save_artifact(e)
+            raise HTTPException(status_code=422, detail=f"{detail}: {e}") from e
         except (PipelineUnavailable, LibreOfficeUnavailable) as e:
             await self.save_artifact(e)
             raise HTTPException(
