@@ -16,7 +16,6 @@ import pandas as pd
 from tabulate import tabulate
 from xlrd.biffh import XLRDError
 
-from libreoffice import LibreOfficeServer
 
 from schemas import SpreadsheetMode
 from settings import TableOutputFormat, settings
@@ -314,20 +313,25 @@ def is_encrypted_xls_error(exc: Exception) -> bool:
     return isinstance(exc, XLRDError) and "encrypted" in str(exc).lower()
 
 
+class LegacyEncryptedXlsError(Exception):
+    """A legacy-encrypted .xls (empty password): LibreOffice must convert it to .xlsx
+    first (`LibreOfficeServer.convert_xls_to_xlsx`), then `excel2txt` reads the .xlsx."""
+
+
 def excel2txt(
     path: Path,
     table_format: TableOutputFormat,
     raw_mime: str,
-    lo_server: LibreOfficeServer,
 ) -> SpreadsheetConversion:
-    """Try _excel2txt
-    On legacy-encrypted .xls, try convert via LibreOffice and retry (it could be empty password encrypted).
+    """See _excel2txt.
+
+    Raises LegacyEncryptedXlsError on a legacy-encrypted .xls: the conversion to .xlsx
+    needs a LibreOffice instance, which the caller acquires (it may have to wait).
 
     Args:
         path: Path to the spreadsheet file.
         table_format: "human" or "llm".
         raw_mime: Detected MIME extension (.xls, .xlsx, .ods).
-        lo_server: LibreOffice server instance for XLS → XLSX conversion.
 
     Returns:
         A SpreadsheetConversion. See _excel2txt for details.
@@ -337,10 +341,7 @@ def excel2txt(
     except XLRDError as e:
         if raw_mime != ".xls" or not is_encrypted_xls_error(e):
             raise
-        logger.warning("Legacy-encrypted XLS — converting to XLSX via LibreOffice")
-        xlsx_path = path.with_suffix(".xlsx")
-        lo_server.convert_xls_to_xlsx(path, xlsx_path)
-        return _excel2txt(xlsx_path, table_format=table_format, raw_mime=raw_mime)
+        raise LegacyEncryptedXlsError(f"legacy-encrypted XLS: {e}") from e
 
 
 # ---------------------------------------------------------------------------

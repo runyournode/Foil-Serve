@@ -23,3 +23,15 @@ docker/rtx4090/mount_runtime/**
 !docker/rtx4090/mount_runtime/foil_serve/
 !docker/rtx4090/mount_runtime/foil_serve/logs/
 !docker/rtx4090/mount_runtime/foil_serve/logs/.gitkeep
+docker/rtx3070/mount_runtime/**
+!docker/rtx3070/mount_runtime/foil_serve/
+!docker/rtx3070/mount_runtime/foil_serve/logs/
+!docker/rtx3070/mount_runtime/foil_serve/logs/.gitkeep
+docker/a100/mount_runtime/**
+!docker/a100/mount_runtime/foil_serve/
+!docker/a100/mount_runtime/foil_serve/logs/
+!docker/a100/mount_runtime/foil_serve/logs/.gitkeep
+docker/mount_runtime_dev/
+
+# Local working notes
+.claude-work/

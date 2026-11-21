@@ -25,9 +25,8 @@ warnings.filterwarnings(
 
 from api import router
 from external import EXTERNAL_MIME_EXT, check_external_processor
-from libreoffice import LibreOfficeServer
+from libreoffice import LibreOfficePool
 from pipeline import PaddlePipelineWrapper
-from postprocessing import join_pages
 from settings import (
     validate_endpoint,
     settings,
@@ -36,7 +35,8 @@ from settings import (
     setup_logging,
     align_uvicorn_logging,
 )
-from utils import EncodedImage, MimeExt, mime_def
+from utils import MimeExt, mime_def
+from vlm import DescriptionCache
 
 _log_file_handler = setup_logging()
 
@@ -62,6 +62,13 @@ async def lifespan(_app: FastAPI):
         for model_name in vlm_registry.keys():
             await validate_endpoint(model_name)
 
+    # Descriptions reused across documents, for byte-identical VLM requests only
+    _app.state.vlm_description_cache = (
+        DescriptionCache(settings.vlm_description_cache_mb)
+        if settings.vlm_description_cache_mb > 0
+        else None
+    )
+
     # Semaphores per VLM model
     _app.state.img_desc_sem = {
         model_name: asyncio.Semaphore(model_config.max_concurrent_requests)
@@ -71,7 +78,6 @@ async def lifespan(_app: FastAPI):
     # Semaphores for resource-intensive pre-processing steps.
     # asyncio.Semaphore suspends the coroutine (not the thread) when full,
     # so the event loop stays free → /health always responds, /process queues without rejecting.
-    _app.state.libreoffice_sem = asyncio.Semaphore(settings.max_concurrent_libreoffice)
     _app.state.excel_sem = asyncio.Semaphore(settings.max_concurrent_excel)
 
     # ── External processors (e.g. video) ──────────────────────────────────────
@@ -94,43 +100,40 @@ async def lifespan(_app: FastAPI):
             await check_external_processor(_app.state.external_http_client, proc)
             logger.info(f"External processor '{proc.name}' health check passed.")
 
-    # ── LibreOffice persistent server ─────────────────────────────────────────
-    libreoffice_server = LibreOfficeServer(runtime_dir=settings.temp_dir)
-    await asyncio.to_thread(libreoffice_server.start)
-    _app.state.libreoffice_server = libreoffice_server
+    # ── LibreOffice instances ─────────────────────────────────────────────────
+    # One conversion per instance, each instance restarted after every use.
+    libreoffice_pool = LibreOfficePool(
+        settings.max_concurrent_libreoffice,
+        runtime_dir=settings.temp_dir,
+        conversion_timeout_s=settings.libreoffice_conversion_timeout_s,
+    )
+    await libreoffice_pool.start()
+    _app.state.libreoffice_pool = libreoffice_pool
 
-    # ── PaddleOCR pipeline wrapper ────────────────────────────────────────────
+    # ── PaddleOCR pipeline workers ────────────────────────────────────────────
+    # Workers start one by one; the first one runs the connection test once (OCR +
+    # image extraction on test_pipeline.jpeg: model weights + PaddleOCR-VL vLLM).
     config_path = (Path(__file__).parent / "config" / "pipeline_config.yaml").as_posix()
     pipeline_wrapper = PaddlePipelineWrapper(config_path)
     _app.state.pipeline_wrapper = pipeline_wrapper
-
-    # ── Pipeline connection test (runs once at startup) ───────────────────────
     test_img = Path(__file__).parent / "init" / "test_pipeline.jpeg"
-    logger.info("Testing pipeline connection with test_pipeline.jpeg ...")
+    logger.info(
+        f"Starting {settings.pipeline_workers} pipeline worker(s), "
+        "connection test on test_pipeline.jpeg ..."
+    )
     try:
-        pages: list[str]
-        imgs: dict[str, EncodedImage]
-        pages, imgs, _ = await pipeline_wrapper.run(test_img.as_posix())
-        txt = join_pages(pages)
-        if "know about magic" not in txt.lower():
-            raise RuntimeError(f"Pipeline was executed but OCR was way too bad: {txt=}")
-        if not isinstance(next(iter(imgs.values()), None), EncodedImage):
-            raise RuntimeError(
-                f"Pipeline was executed but no image was extracted: {imgs=}"
-            )
-        del pages, txt, imgs
+        await pipeline_wrapper.start(test_img.as_posix())
         logger.info("Pipeline connection test passed.")
     except Exception as e:
         logger.error(f"Pipeline connection test FAILED: {e}")
-        pipeline_wrapper.shutdown(wait=False)
-        libreoffice_server.stop()
+        libreoffice_pool.stop()
         raise RuntimeError(f"Pipeline connection test failed at startup: {e}") from e
 
     yield
 
     # ── Clean shutdown ────────────────────────────────────────────────────────
     pipeline_wrapper.shutdown(wait=True)
-    libreoffice_server.stop()
+    libreoffice_pool.stop()
     await _app.state.external_http_client.aclose()
 
 

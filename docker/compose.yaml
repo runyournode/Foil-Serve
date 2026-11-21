@@ -1,10 +1,11 @@
 services:
   foil_app:
 #    image: ghcr.io/runyournode/foil-serve:main-offline
-    image: ghcr.io/runyournode/foil-serve:0.1.6-offline
+    image: ghcr.io/runyournode/foil-serve:0.1.7-offline
     container_name: foil_app
     gpus: all
     ipc: host
+    init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
 #    extra_hosts:  # if services are not on docker stack (you'll also need to change port)
 #      - "foil_vllm-ministral-3-3b:host-gateway"
 #      - "foil_vllm-PaddleOCR-VL-1.5:host-gateway"
@@ -27,13 +28,13 @@ services:
       foil_vllm-PaddleOCR-VL-1.5:
         condition: service_healthy
       # [Optional] other vlm endpoint in the stack
-      foil_vllm-ministral-3-3b:
-        condition: service_healthy
+      #foil_vllm-ministral-3-3b:
+      #  condition: service_healthy
 
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
-    image: docker.io/vllm/vllm-openai:v0.28.0  # v0.18.0 -> ok
+    image: docker.io/vllm/vllm-openai:v0.33.0
     container_name: foil_vllm-PaddleOCR-VL-1.5
     gpus: all
     ipc: host
@@ -46,6 +47,7 @@ services:
     environment:
       - HF_HUB_OFFLINE=1
       - PORT=8000  # must match CMD
+      - VLLM_WSL2_ENABLE_PIN_MEMORY=1
     volumes:
       - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
@@ -65,7 +67,7 @@ services:
 
   # Soft Req : mistralai/ministral-3-3b
   foil_vllm-ministral-3-3b:
-    image: docker.io/vllm/vllm-openai:v0.28.0  # v0.18.0-cu130 -> ok, v0.22.1 -> KO
+    image: docker.io/vllm/vllm-openai:v0.33.0
     container_name: foil_vllm-ministral-3-3b
     ipc: host
     gpus: all

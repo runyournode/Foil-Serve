@@ -21,17 +21,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from PIL import Image as PILImage
 from fastapi import HTTPException, Request
 
 from debug import ArtifactContext, save_table_conversion_artifacts
 from external import EXTERNAL_MIME_EXT, merge_external_metadata, process_external
 from libreoffice import (
-    LibreOfficeServer,
+    LibreOfficePool,
+    LibreOfficeUnavailable,
     SheetPageMap,
     convert_to_pdf,
     is_office_mime_ext,
 )
-from pipeline import PaddlePipelineWrapper
+from page_images import iter_pages, page_count
+from pipeline import PaddlePipelineWrapper, PipelineUnavailable
 from postprocessing import (
     extract_raw_ocr,
     join_marked_pages,
@@ -43,6 +46,7 @@ from schemas import Metadata, SpreadsheetMode
 from settings import AsyncOpenAIWithInfo, external_registry, settings
 from spreadsheet import (
     EmptySpreadsheetError,
+    LegacyEncryptedXlsError,
     SheetAnchor,
     SpreadsheetConversion,
     assemble_sections,
@@ -73,7 +77,6 @@ from utils import (
     check_file_size,
     check_input_size,
     check_zip_uncompressed_size,
-    image_to_pdf,
     is_native_mime_ext,
     prepare_input_file,
     read_text_smart,
@@ -160,12 +163,18 @@ class _Job:
         """Turn an unexpected error into an HTTPException, saving a failure artifact.
 
         HTTPExceptions raised inside pass through untouched — they already carry
-        the right status code.
+        the right status code. A backend that could not run the document (worker or
+        LibreOffice crash: 503, retryable; timeout: 504) keeps its own status.
         """
         try:
             yield
         except HTTPException:
             raise
+        except (PipelineUnavailable, LibreOfficeUnavailable) as e:
+            await self.save_artifact(e)
+            raise HTTPException(
+                status_code=e.status_code, detail=f"{detail}: {e}"
+            ) from e
         except Exception as e:
             await self.save_artifact(e)
             raise HTTPException(status_code=status, detail=f"{detail}: {e}") from e
@@ -337,17 +346,10 @@ async def _convert_with_pandas(
     conversion: SpreadsheetConversion | None = None
     async with job.state.excel_sem:
         async with job.failing_with(f"Spreadsheet conversion error ({job.mime})"):
-            with job.timer.track():
-                try:
-                    conversion = await asyncio.to_thread(
-                        excel2txt,
-                        path=job.prepared_path,
-                        table_format=settings.table_output_format,
-                        raw_mime=job.mime,
-                        lo_server=job.state.libreoffice_server,
-                    )
-                except EmptySpreadsheetError:
-                    pass  # no cell data at all, before any cleaning — decided below
+            try:
+                conversion = await _excel2txt(job)
+            except EmptySpreadsheetError:
+                pass  # no cell data at all, before any cleaning — decided below
         if settings.excel_extract_images:
             with job.timer.track():
                 state.survey = await asyncio.to_thread(
@@ -406,6 +408,34 @@ async def _convert_with_pandas(
     return state
 
 
+async def _excel2txt(job: _Job) -> SpreadsheetConversion:
+    """pandas conversion; a legacy-encrypted .xls (empty password) is first turned
+    into .xlsx by LibreOffice, whose wait is excluded from active time."""
+    path = job.prepared_path
+    try:
+        with job.timer.track():
+            return await asyncio.to_thread(
+                excel2txt,
+                path=path,
+                table_format=settings.table_output_format,
+                raw_mime=job.mime,
+            )
+    except LegacyEncryptedXlsError:
+        logger.warning("Legacy-encrypted XLS — converting to XLSX via LibreOffice")
+    xlsx_path = path.with_suffix(".xlsx")
+    lo_pool: LibreOfficePool = job.state.libreoffice_pool
+    async with lo_pool.acquire() as lo:
+        with job.timer.track():
+            await asyncio.to_thread(lo.convert_xls_to_xlsx, path, xlsx_path)
+    with job.timer.track():
+        return await asyncio.to_thread(
+            excel2txt,
+            path=xlsx_path,
+            table_format=settings.table_output_format,
+            raw_mime=job.mime,
+        )
+
+
 async def _extract_objects(
     job: _Job, state: _SpreadsheetState, mode: SpreadsheetMode, tmpdir: Path
 ) -> None:
@@ -431,7 +461,8 @@ async def _extract_objects(
         render_charts=settings.excel_render_charts,
         rasterize_metafiles=settings.excel_rasterize_metafiles,
     ):
-        async with job.state.libreoffice_sem:
+        lo_pool: LibreOfficePool = job.state.libreoffice_pool
+        async with lo_pool.acquire() as lo:
             with job.timer.track():
                 try:
                     drawings, rendered = await asyncio.to_thread(
@@ -439,7 +470,7 @@ async def _extract_objects(
                         path=job.prepared_path,
                         mime=job.mime,
                         survey=survey,
-                        lo_server=job.state.libreoffice_server,
+                        lo_server=lo,
                         work_dir=tmpdir,
                         render_charts=settings.excel_render_charts,
                         rasterize_metafiles=settings.excel_rasterize_metafiles,
@@ -553,7 +584,7 @@ def _finalize_spreadsheet(
 
 
 # ---------------------------------------------------------------------------
-#  Phase 2 — anything the pipeline cannot read directly becomes a PDF
+#  Phase 2 — office documents and spreadsheets become a PDF
 # ---------------------------------------------------------------------------
 
 
@@ -562,31 +593,25 @@ async def _to_pipeline_input(
 ) -> tuple[Path, SheetPageMap]:
     """Return the file to hand the pipeline, plus a sheet→page map for spreadsheets.
 
-    TIFF/WebP go through Pillow (TIFF may be multipage, WebP is not supported by
-    Paddle); Office and spreadsheet formats go through LibreOffice, whose
-    semaphore wait is excluded from active time. PDFs and plain images are passed
-    through untouched.
+    Office and spreadsheet formats go through LibreOffice, whose wait is excluded
+    from active time. PDFs and images (any frame count) are passed through untouched:
+    the pipeline workers render their pages.
     """
-    if job.mime in (".tiff", ".webp"):
-        async with job.failing_with(f"Image to PDF conversion error ({job.mime})"):
-            with job.timer.track():
-                return await asyncio.to_thread(
-                    image_to_pdf, path=job.prepared_path, output_dir=tmpdir
-                ), None
-
     if not is_office_mime_ext(job.mime):
-        return job.prepared_path, None  # .pdf, .png, .jpg, .bmp
+        # .pdf and every image (multipage TIFF, WebP included): the pipeline workers
+        # render them page by page themselves (page_images.py).
+        return job.prepared_path, None
 
-    lo_server: LibreOfficeServer = job.state.libreoffice_server
+    lo_pool: LibreOfficePool = job.state.libreoffice_pool
     label = "Spreadsheet" if is_spreadsheet else "Office"
-    async with job.state.libreoffice_sem:
+    async with lo_pool.acquire() as lo:
         async with job.failing_with(f"{label} to PDF conversion error ({job.mime})"):
             with job.timer.track():
                 pdf_path, sheet_page_map = await asyncio.to_thread(
                     convert_to_pdf,
                     file_path=job.prepared_path,
                     mime=job.mime,
-                    lo_server=lo_server,
+                    lo_server=lo,
                     paper_format=settings.excel_pdf_paper_format
                     if is_spreadsheet
                     else None,
@@ -621,6 +646,38 @@ async def _run_pipeline(
         )
     job.timer.add(duration)
     return pages, imgs
+
+
+# Longest side of a whole page sent to the VLM: the VLM downscales anyway.
+_WHOLE_PAGE_MAX_SIDE = 2048
+
+
+def _render_whole_pages(path: Path) -> tuple[list[str], dict[str, EncodedImage]]:
+    pages: list[str] = []
+    imgs: dict[str, EncodedImage] = {}
+    for array in iter_pages(
+        path, 0, page_count(path), settings.pipeline_max_page_megapixels
+    ):
+        img = PILImage.fromarray(array[:, :, ::-1])  # BGR → RGB
+        img.thumbnail((_WHOLE_PAGE_MAX_SIDE, _WHOLE_PAGE_MAX_SIDE))
+        image = EncodedImage.from_pil(img)
+        imgs[image.name] = image
+        # The markup of a Paddle figure: phases 4–6 treat it like any crop.
+        pages.append(
+            f'<div style="text-align: center;"><img src="{image.name}" '
+            'alt="Image" width="100%" /></div>'
+        )
+    return pages, imgs
+
+
+async def _whole_pages_as_figures(
+    job: _Job, pipeline_input: Path
+) -> tuple[list[str], dict[str, EncodedImage]]:
+    """One figure per page, the page itself as the image (no OCR context)."""
+    logger.info(f"Pipeline found no content ({job.mime}): whole pages sent to the VLM")
+    async with job.failing_with("Page rendering error"):
+        with job.timer.track():
+            return await asyncio.to_thread(_render_whole_pages, pipeline_input)
 
 
 async def _post_process(
@@ -775,6 +832,16 @@ async def process_document(
             # ── Phase 3 : pipeline.predict() — serialized in a dedicated worker
             pages, imgs = await _run_pipeline(job, pipeline_input, need_image_ocr)
 
+            # Nothing found at all (a photo, a drawing without text): when a
+            # description is requested, the whole pages go to the VLM instead.
+            if (
+                has_vlm
+                and not is_spreadsheet
+                and not any(page.strip() for page in pages)
+                and 0 < len(pages) <= settings.empty_document_vlm_max_pages
+            ):
+                pages, imgs = await _whole_pages_as_figures(job, pipeline_input)
+
     # tmpdir cleaned up; the worker is done and no longer needs the file.
 
     # ── Phase 4 : post-processing ────────────────────────────────────────────
@@ -801,6 +868,7 @@ async def process_document(
             imgs_b64=to_describe,
             ocrs=contexts,
             semaphore=job.state.img_desc_sem.get(image_description_model_name),
+            cache=job.state.vlm_description_cache,
         )
     else:
         descriptions, img_desc_time = None, 0.0

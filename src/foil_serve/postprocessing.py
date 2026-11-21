@@ -2,6 +2,8 @@ import re
 import logging
 from collections.abc import Collection, Mapping, Sequence
 
+from PIL import Image as PILImage
+from PIL import ImageChops
 from PIL.Image import Image
 
 from table_utils import prune_tables
@@ -13,6 +15,39 @@ logger = logging.getLogger(__name__)
 SMALL_IMAGE_MAX_OCR_CHARS = 40
 
 
+# A pixel is background when no channel is further than this from white (scan noise)
+_BACKGROUND_TOLERANCE = 10
+# Kept around the content once the background is cut
+_TRIM_MARGIN_PX = 2
+
+
+def trim_background(img: Image) -> Image:
+    """Cut the white margins around the content of a crop.
+
+    PaddleX boxes leave more or less white around a figure: the same logo boxed
+    twice gives two crops of different sizes. Once trimmed, identical drawings are
+    identical pixels, hence one content name — one image returned, described once —
+    and the crops are smaller. A uniform image is returned unchanged.
+    """
+    rgb = img.convert("RGB")
+    diff = ImageChops.difference(rgb, PILImage.new("RGB", rgb.size, (255, 255, 255)))
+    red, green, blue = diff.split()
+    farthest = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    bbox = farthest.point(lambda v: 255 if v > _BACKGROUND_TOLERANCE else 0).getbbox()
+    if bbox is None:
+        return img
+    left, top, right, bottom = bbox
+    box = (
+        max(0, left - _TRIM_MARGIN_PX),
+        max(0, top - _TRIM_MARGIN_PX),
+        min(img.width, right + _TRIM_MARGIN_PX),
+        min(img.height, bottom + _TRIM_MARGIN_PX),
+    )
+    if box == (0, 0, img.width, img.height):
+        return img
+    return img.crop(box)
+
+
 def name_by_content(
     md: str, images: Mapping[str, Image]
 ) -> tuple[str, dict[str, EncodedImage]]:
@@ -20,12 +55,13 @@ def name_by_content(
 
     PaddleX names a crop after its box only (no page number): two different images
     at the same place on two pages would share a name. Content names fix that, and
-    make identical crops collapse into one image. References are rewritten in their
-    quoted form, so a name that merely contains another one is left alone.
+    make identical crops collapse into one image (white margins are trimmed first,
+    see `trim_background`). References are rewritten in their quoted form, so a name
+    that merely contains another one is left alone.
     """
     encoded: dict[str, EncodedImage] = {}
     for old_name, img in images.items():
-        image = EncodedImage.from_pil(img)
+        image = EncodedImage.from_pil(trim_background(img))
         encoded[image.name] = image
         md = md.replace(f'"{old_name}"', f'"{image.name}"')
     return md, encoded

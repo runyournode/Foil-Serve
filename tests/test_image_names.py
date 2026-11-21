@@ -7,6 +7,7 @@ two pages hold a picture at the same place.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import re
@@ -20,6 +21,18 @@ from PIL import Image
 from postprocessing import name_by_content
 from settings import settings
 from utils import EncodedImage
+
+
+class _FakeLibreOfficePool:
+    """LibreOfficePool stand-in: every acquire() yields the same mock instance."""
+
+    def __init__(self, server) -> None:
+        self.server = server
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        yield self.server
+
 
 _NAME_RE = re.compile(r"^imgs/[0-9a-f]{16}\.jpg$")
 
@@ -137,9 +150,9 @@ def request_stub(tmp_path, monkeypatch):
     state = types.SimpleNamespace(
         pipeline_wrapper=wrapper,
         excel_sem=asyncio.Semaphore(1),
-        libreoffice_sem=asyncio.Semaphore(1),
-        libreoffice_server=MagicMock(),
+        libreoffice_pool=_FakeLibreOfficePool(MagicMock()),
         img_desc_sem={},
+        vlm_description_cache=None,
     )
     return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
 
@@ -147,7 +160,7 @@ def request_stub(tmp_path, monkeypatch):
 def test_each_distinct_image_is_returned_and_described_once(request_stub, monkeypatch):
     sent: list[tuple[str, str]] = []
 
-    async def _describe(client, model_name, imgs_b64, ocrs, semaphore):
+    async def _describe(client, model_name, imgs_b64, ocrs, semaphore, cache=None):
         described = {name: ocrs[name] for name in imgs_b64 if name in ocrs}
         sent.extend(described.items())
         return {name: f"Description of {name}." for name in described}, 1.0

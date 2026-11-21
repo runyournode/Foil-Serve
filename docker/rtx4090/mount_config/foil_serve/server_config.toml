@@ -202,20 +202,113 @@ small_image_threshold = [64, 64]
 #         is enabled and the text is shorter than 40 chars).
 ignore_small_images = true
 
+# When the pipeline finds nothing at all in a document (a photo or a drawing without
+# text: no block detected) and an image description is requested, its whole pages are
+# sent to the VLM as figures instead of answering 422 "no content". Only for documents
+# of at most this many pages (a long run of blank scanned pages stays a 422);
+# 0 = disabled. Spreadsheets are not concerned.
+empty_document_vlm_max_pages = 5
+
+# Image descriptions reused across documents, in MB of RAM (0 = disabled). A
+# description is reused ONLY for a byte-identical VLM request: same endpoint, model,
+# generation parameters, prompt text (context included: OCR, alt text, chart summary)
+# and image bytes — never on an approximate match. A logo shared by many documents is
+# then described once. Side channel to know when clients do not trust each other: a
+# hit answers at once (img_desc_time 0), so a client that submits an exact image it
+# guesses can learn another client already sent it.
+vlm_description_cache_mb = 200
+
 
 # -------------------------------------------------------------------
 # Ressource managaement                                             -
 # -------------------------------------------------------------------
 
-# paddle pipeline seems to naturally leaks memory outside of python, leading enventually to oom (RAM)
-# Actual work-around is to reload the pipeline every N documents, which takes a few seconds.
-# This is acceptable as main model (PaddleOCR-VL-1.5) is not concerned (externally served by vllm).
-# Increasing this value will reduce overhead reloading the pipeline too often but will have a bigger RAM
-# footprint on your server.
-max_tasks_between_pipeline_reload =  99999
+# -- PaddleOCR pipeline workers --------------------------------------
+# The pipeline (orientation + layout models, crops, Markdown) runs in dedicated worker
+# processes; the VLM part is served by vLLM. Each worker holds its own copy of the
+# layout models in VRAM (~1.2 GB idle, more under load: cap it with
+# `pipeline_worker_vram_limit_mb`) and processes one
+# document at a time: N workers = N documents in parallel.
+# A worker only helps when there are at least as many concurrent requests as workers.
+# Measured on an RTX 3070 (layout batch 1, 900 MB cap each, vLLM 10 sequences), pages/s
+# under load: 1 worker 0.84, 2 → 1.09, 3-4 → ~1.2. Bigger GPUs: not measured, re-run a load
+# test (tuning guide at the end of pipeline_config.yaml). Shared GPU: cap VRAM explicitly.
+pipeline_workers = 3  # 3070 bench: throughput grows up to 3 workers; a 4090 feeds vLLM faster (re-measure: add workers while vLLM idles)
 
-# Max parallel LibreOffice headless processes (docx, pptx, doc, ppt → pdf conversion)
+# A worker's RSS grows with the largest document it has processed: the memory Paddle
+# frees stays in the glibc heap (fragmentation; no real leak found on the test corpus).
+# `pipeline_malloc_trim` hands it back to the OS after every document (measured: 3.9 GB →
+# 2.1 GB after 100-page PDFs, ~0.15 s per document; VRAM and models untouched).
+# No effect outside glibc.
+pipeline_malloc_trim = true
+
+# Measured over 57 tasks (mixed corpus + 100-page PDFs, malloc_trim on): the RSS after a
+# task stays flat at ~2.3 GB — no leak, recycling is a safety net only. Size host RAM
+# with the PEAK (see pipeline_chunk_pages), compare max_worker_rss_mb with the RSS after.
+# Safety net: a worker is recycled (models reloaded, a few seconds) after
+# `max_tasks_between_pipeline_reload` documents (0 = never) OR as soon as its RSS reaches
+# `max_worker_rss_mb` (0 = never). The RSS threshold reloads only when needed.
+# With N >= 2 workers, at most N-1 reload at the same time: the service never stops.
+max_tasks_between_pipeline_reload = 0  # no leak measured (RSS after a task flat at ~2.3 GB over 57 tasks)
+max_worker_rss_mb = 5000  # safety net: a worker sits at ~2.3-2.6 GB after a task
+
+# VRAM cap per worker for Paddle's allocator (FLAGS_gpu_memory_limit_mb), 0 = no cap.
+# Without a cap a worker keeps growing into whatever VRAM is free (measured on an 8 GB
+# RTX 3070: ~1.2 GB per idle worker, the GPU full under load): set it on a GPU shared
+# with vLLM or another service, so that the sum of all caps stays predictable.
+# The need is set by the layout batch (`LayoutDetection.batch_size` in
+# pipeline_config.yaml), measured per worker: batch 8 → 4.3 GB, 4 → 2.5, 2 → 1.4,
+# 1 → 0.8 GB. Set the cap a bit above it (batch 2 → 1500, batch 1 → 900); below it,
+# multi-page documents fail with HTTP 500 (out of memory). See the tuning guide at the
+# end of pipeline_config.yaml.
+# Size it from the peak VRAM of one worker under load, with margin.
+pipeline_worker_vram_limit_mb = 3000  # layout batch 4 needs ~2.5 GB; 3 x 3 GB + 2 vLLM ~9 GB fits in 24 GB
+
+# A document running longer than this kills its worker and fails with HTTP 504 (0 = no limit).
+pipeline_task_timeout_s = 600  # per page range
+
+# Max in-flight VLM requests per worker (0 = `max_concurrency` of pipeline_config.yaml, 256).
+# With 2+ workers, set it to about `max_num_seqs` x vLLM replicas (not divided by the
+# number of workers). Uncapped, one worker floods vLLM's FIFO queue with a big document's
+# crops and the other workers' documents wait behind them (RTX 3070, 2 workers, 4
+# concurrent requests: p95 96 s → 53 s, +40 % throughput with a cap). Lower values slow a
+# document processed alone (3070, 10 sequences: 3 → 0.62 pages/s, 5 → 0.75, 10 → 0.84)
+# without helping throughput under load.
+pipeline_vlm_max_concurrency = 32  # = max_num_seqs of the PaddleOCR-VL vLLM (single replica), NOT divided by the workers
+
+# Long documents are sent to the workers in consecutive ranges of this many pages, one
+# task each: every range goes back to the end of the queue, so small documents get a
+# worker between two ranges of a big one (no head-of-line blocking, even with 1
+# worker). The task timeout and a worker's peak RSS also become per range.
+# Pages are independent for the pipeline: the output does not depend on the split.
+# Cost for a big document processed ALONE (RTX 3070, 100 pages, 1 worker): 115 s in one
+# task, 124 s in ranges of 40, 140 s in ranges of 20 (one VLM wave barrier per range);
+# under load (several requests, several workers) the barriers are filled by others.
+# Worker peak RSS (RTX 3070, layout batch 1): ~2.3 GB + ~12-15 MB per page of the range
+# (20 pages → 2.6 GB, 40 → 2.8 GB, 100 → 3.4 GB; layout batch 8: +0.5-0.7 GB).
+# 0 = whole document in one task.
+pipeline_chunk_pages = 20
+
+# Pixel budget per page, in megapixels (0 = no cap). Pages are rendered by foil (PDF at
+# 144 dpi, images at their native size, multipage TIFF / WebP included); a page above
+# the budget is rendered / downscaled to it. 16 Mpx = A2 at 144 dpi: the VLM brings
+# every crop down to ~1 Mpx anyway, and vLLM's Pillow refuses images above ~179 Mpx.
+pipeline_max_page_megapixels = 16
+
+# LibreOffice instances (docx, pptx, doc, ppt, odt, odp, rtf, spreadsheets → pdf; .xls
+# decryption; spreadsheet chart rendering). Each instance runs ONE conversion at a time
+# (concurrent conversions inside one soffice are serialized anyway, and can livelock
+# it), and is restarted after every use, in the background (~1 s; the first start on a
+# new profile takes ~15 s): every conversion starts on a fresh soffice, no memory
+# accumulates over documents, a wedged or crashed conversion never affects another
+# one. A long conversion holds one instance only. RAM: size it as instances x the peak
+# of your largest documents (a 47 MB docx: ~2 GB), plus the pipeline workers.
 max_concurrent_libreoffice = 3
+
+# Wall-clock limit of one LibreOffice conversion, in seconds (0 = none). Beyond it the
+# request fails with HTTP 504 and its instance is replaced; a crash answers 503.
+# Leave room for legitimately slow documents (some take 15-20 min).
+libreoffice_conversion_timeout_s = 2700
 
 # Max parallel Excel → markdown conversions
 max_concurrent_excel = 5

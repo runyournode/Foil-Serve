@@ -1,0 +1,79 @@
+# Dev stack: runs the dev image (pushes to the `dev` branch publish dev-offline) with its own
+# containers and network. Image description VLMs are served externally (LM Studio,
+# http://192.168.1.10:1234/v1, see [[vlm_models]] in mount_config/foil_serve/server_config.toml),
+# so only PaddleOCR-VL-1.5 is served by vllm here.
+#
+#   docker compose -f docker/compose.dev.yaml up -d
+#   → API http://localhost:8081/docs
+#
+# Reuses the config of mount_config/ (server_config.toml, pipeline_config.yaml), runtime files
+# (logs, artifacts) go to mount_runtime_dev/.
+# Note: same host ports (8081, 8000) and GPU as the main stack of compose.yaml — run one at a time.
+
+name: foil-serve-dev
+
+services:
+  foil_dev_app:
+    image: ghcr.io/runyournode/foil-serve:dev-offline
+    container_name: foil_dev_app
+    gpus: all
+    ipc: host
+    init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
+    expose:
+      - "8080"
+    ports:
+      - "8081:8080"
+    networks:
+      - foil-dev-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - APP_PORT=8080 # must match CMD if you override (default: 8080)
+    volumes:
+      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:Z,ro
+      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:Z,ro
+      # [optional] logs + artifacts (log file, failed/, xls2pdf/, cell_errors/)
+      - ./mount_runtime_dev/foil_serve/logs:/var/log/foil:Z
+    restart: unless-stopped
+    depends_on:
+      foil_dev_vllm-PaddleOCR-VL-1.5:
+        condition: service_healthy
+
+
+  # Hard Req : PaddleOCR-VL-1.5 served by vllm
+  foil_dev_vllm-PaddleOCR-VL-1.5:
+    image: docker.io/vllm/vllm-openai:v0.33.0
+    container_name: foil_dev_vllm-PaddleOCR-VL-1.5
+    gpus: all
+    ipc: host
+    expose:
+      - "8000"
+    ports:  # dev only
+      - "8000:8000"
+    networks:
+      foil-dev-net:
+        # pipeline_config.yaml points to server_url = http://foil_vllm-PaddleOCR-VL-1.5:8000/v1
+        aliases:
+          - foil_vllm-PaddleOCR-VL-1.5
+    environment:
+      - HF_HUB_OFFLINE=1
+      - PORT=8000  # must match CMD
+      - VLLM_WSL2_ENABLE_PIN_MEMORY=1
+    volumes:
+      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
+    command: ["--port", "8000", "--config", "/config/config.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+      ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+networks:
+  foil-dev-net:
+    driver: bridge

@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -7,10 +9,12 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeIs, get_args
 
+import psutil
 from pydantic import TypeAdapter, ValidationError
 
 from settings import PaperFormat
@@ -118,42 +122,105 @@ PAPER_SIZES: dict[PaperFormat, tuple[int, int]] = {
 }
 
 
+# Prepended to every UNO script (each runs in the system Python, see _run_uno_script).
+# Documents are untrusted input: before loading one, the instance is set to fetch
+# nothing (a linked image or section pointing to http://... made soffice connect to it
+# — server-side request forgery, and a stall until the connection times out) and run no
+# macro; the load itself updates no link. NOT DisableActiveContent: it disables every
+# embedded OLE object, and charts ARE OLE objects (they would vanish from the PDF).
+_UNO_HARDENING = """
+def harden(ctx):
+    from com.sun.star.beans import PropertyValue as _PV
+    provider = ctx.ServiceManager.createInstanceWithContext(
+        "com.sun.star.configuration.ConfigurationProvider", ctx
+    )
+    node = _PV()
+    node.Name = "nodepath"
+    node.Value = "/org.openoffice.Office.Common/Security/Scripting"
+    access = provider.createInstanceWithArguments(
+        "com.sun.star.configuration.ConfigurationUpdateAccess", (node,)
+    )
+    access.setPropertyValue("BlockUntrustedRefererLinks", True)
+    access.setPropertyValue("DisableMacrosExecution", True)
+    access.commitChanges()
+
+
+def safe_load_props():
+    from com.sun.star.beans import PropertyValue as _PV
+    props = []
+    # MacroExecutionMode NEVER_EXECUTE (0), UpdateDocMode NO_UPDATE (0)
+    for name, value in (("MacroExecutionMode", 0), ("UpdateDocMode", 0)):
+        prop = _PV()
+        prop.Name = name
+        prop.Value = value
+        props.append(prop)
+    return tuple(props)
+"""
+
+
+class LibreOfficeUnavailable(RuntimeError):
+    """A conversion could not finish (timeout or crash): not the document's fault.
+
+    Carries the HTTP status the API should answer with: 504 on timeout, 503 when
+    LibreOffice crashed (retryable: the next conversion runs on a fresh instance).
+    """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class LibreOfficeServer:
     """
-    Manages a persistent LibreOffice UNO server for Office-to-PDF conversion.
+    One LibreOffice UNO server (soffice headless), used by one conversion at a time.
 
-    The server is started once at app startup and reused for all conversions,
-    avoiding the ~3s spawn overhead on every document. If soffice crashes during
-    a conversion, it is automatically restarted before retrying.
+    Instances are owned by a `LibreOfficePool`: a conversion gets an instance for
+    itself, and the instance is restarted after every use. Nothing is ever shared
+    between two conversions, so a restart can never kill someone else's work.
 
-    Transport: soffice listens on a UNO **pipe**, which on Linux is a Unix domain
-    socket created by the osl library (conventionally `/tmp/OSL_PIPE_<euid>_<name>`,
-    though the exact directory is osl-internal). No TCP port is exposed. The pipe
-    name is unique per start and namespaced with `PIPE_PREFIX`; the real socket
-    path is resolved from the kernel via /proc/net/unix rather than assumed.
+    Isolation between instances (several run at once):
+    - its own user profile `<runtime_dir>/lo_profile_<slot>` — two live soffice on one
+      profile would hand their work over to each other;
+    - its own UNO **pipe** (Unix domain socket created by the osl library,
+      conventionally `/tmp/OSL_PIPE_<euid>_<name>`), with a unique, namespaced name
+      (`PIPE_PREFIX`); the real socket path is read from the kernel (/proc/net/unix);
+    - its own process group: `/usr/bin/soffice` is a shell script that execs
+      oosplash, which forks soffice.bin. Killing the started pid alone would leave
+      soffice.bin running (orphaned, at 100 % CPU when wedged): the whole group is
+      killed.
 
-    Crash recovery: the soffice PID is written to a file inside `runtime_dir` so
-    stale processes from a previous app crash are killed at next startup. Residual
-    socket files left by a hard crash are removed by `_sweep_dead_pipes()`.
+    Crash recovery: processes left by a previous run of the app on this slot's profile
+    are killed at start; residual sockets with no listener are removed by
+    `_sweep_dead_pipes()` (run once, by the pool, before the other instances start).
     """
 
-    def __init__(self, runtime_dir: str = "/tmp/foil-runtime") -> None:
+    def __init__(
+        self,
+        runtime_dir: str = "/tmp/foil-runtime",
+        slot: int = 0,
+        conversion_timeout_s: float = 0,
+    ) -> None:
+        self.slot = slot
         self._process: subprocess.Popen | None = None
         self._pipe_name: str | None = None
         # Real filesystem path of the bound UNO socket, resolved from the kernel
         # at readiness (see _resolve_socket_path). None until soffice is ready.
         self._socket_path: Path | None = None
+        self._profile_dir = Path(runtime_dir).resolve() / f"lo_profile_{slot}"
+        self._conversion_timeout_s = conversion_timeout_s
+        # stop() (event loop) and a restart (worker thread) may run at the same time:
+        # the lock and `_stopped` keep a restart from starting soffice after a stop.
         self._lock = threading.Lock()
-        self._pid_file = Path(runtime_dir) / "soffice.pid"
+        self._stopped = False
 
     @staticmethod
-    def _make_pipe_name() -> str:
+    def _make_pipe_name(slot: int = 0) -> str:
         """Build a unique, namespaced UNO pipe name (see PIPE_PREFIX).
 
         Uniqueness guarantees a fresh run never collides with a residual socket
         from a crashed run, and lets the cleanup sweep recognise our own sockets.
         """
-        return f"{PIPE_PREFIX}{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        return f"{PIPE_PREFIX}{os.getpid()}_{slot}_{uuid.uuid4().hex[:8]}"
 
     def _resolve_socket_path(self) -> Path | None:
         """Ask the kernel where our UNO socket is actually bound.
@@ -184,8 +251,9 @@ class LibreOfficeServer:
         real socket path rather than assumed. Only our own namespaced sockets
         (PIPE_PREFIX) for the current euid are considered, and our own live socket
         is skipped. A socket that still accepts a connection belongs to a live
-        soffice (e.g. another worker) and is left untouched; only sockets with no
-        listener are unlinked.
+        soffice (e.g. another instance) and is left untouched; only sockets with no
+        listener are unlinked. The pool runs it once, before the other instances
+        start: a socket caught between bind() and listen() could look dead.
         """
         if self._socket_path is None:
             return
@@ -207,42 +275,25 @@ class LibreOfficeServer:
                 except OSError:
                     pass
 
-    @staticmethod
-    def _is_soffice_process(pid: int) -> bool:
-        """Check via /proc/{pid}/cmdline that the process is actually a LibreOffice headless server."""
-        try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_text()
-            # cmdline should be something like (on Ubuntu 24.04 at least):
-            # `'/usr/lib/libreoffice/program/oosplash\x00--headless\x00--norestore\x00--accept=pipe,name=foil_soffice_...;urp;\x00'`
-            t_headless = "headless" in cmdline
-            t_pipe = "pipe" in cmdline and "name=" in cmdline
-            t_libre_office = "libreoffice" in cmdline
-            t_soffice = "soffice" in cmdline
-            return t_headless and t_pipe and (t_libre_office or t_soffice)
-        except OSError:
-            return False
-
     def _cleanup_stale_processes(self) -> None:
-        """Kill stale soffice processes from previous app runs using the PID file."""
-        if not self._pid_file.exists():
-            return
-        try:
-            pid = int(self._pid_file.read_text().strip())
-            if not LibreOfficeServer._is_soffice_process(pid):
-                logger.warning(
-                    f"PID {pid} from PID file is not a soffice process — skipping kill"
-                )
-                return
-            try:
-                os.kill(pid, signal.SIGTERM)
-                logger.info(f"Killed stale soffice process (pid={pid})")
-                time.sleep(0.5)
-            except ProcessLookupError:
-                pass  # process already gone
-        except (ValueError, OSError):
-            pass
-        finally:
-            self._pid_file.unlink(missing_ok=True)
+        """Kill the processes a previous run of the app left on this slot's profile.
+
+        A profile belongs to one slot, and the slot is not running yet: any process
+        whose command line names it is ours and stale. Processes of other slots, or
+        other LibreOffice users, are never matched.
+        """
+        marker = self._profile_dir.as_uri()
+        for proc in psutil.process_iter(["cmdline"]):
+            cmdline = proc.info["cmdline"] or []
+            if any(marker in arg for arg in cmdline):
+                try:
+                    proc.kill()
+                    proc.wait(5)
+                    logger.info(
+                        f"Killed stale soffice process (pid={proc.pid}, slot {self.slot})"
+                    )
+                except psutil.Error:
+                    pass
 
     @staticmethod
     def _drain_stderr(process: subprocess.Popen) -> None:
@@ -253,9 +304,9 @@ class LibreOfficeServer:
             if "javaldx" in line:
                 continue
             if line:
-                logger.warning("soffice stderr: %s", line)
+                logger.warning(f"soffice stderr: {line}")
 
-    def _wait_ready(self, timeout: float = 15.0) -> None:
+    def _wait_ready(self, timeout: float = 30.0) -> None:
         """Poll the UNO pipe until soffice accepts connections, caching the resolved path.
 
         The socket location is read from the kernel (_resolve_socket_path); no path
@@ -263,6 +314,12 @@ class LibreOfficeServer:
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            proc = self._process
+            if proc is None or proc.poll() is not None:
+                raise RuntimeError(
+                    f"soffice exited during start (slot {self.slot}, "
+                    f"exit code {proc.returncode if proc else None})"
+                )
             candidate = self._resolve_socket_path()
             if candidate is not None:
                 try:
@@ -273,78 +330,116 @@ class LibreOfficeServer:
                     return
                 except OSError:
                     pass
-            time.sleep(0.3)
+            time.sleep(0.1)
         raise RuntimeError(
             f"soffice did not become ready within {timeout}s (pipe {self._pipe_name})"
         )
 
-    def start(self) -> None:
-        """Cleanup stale process, spawn soffice on a fresh UNO pipe, wait for readiness."""
-        self._cleanup_stale_processes()
+    def start(self, sweep: bool = False) -> None:
+        """Spawn soffice on a fresh UNO pipe and wait for readiness.
 
+        `sweep`: also remove residual sockets of crashed runs (see _sweep_dead_pipes).
+        """
         # noinspection PyDeprecation
         if not shutil.which("soffice"):
             raise RuntimeError("soffice not found in PATH")
+        self._cleanup_stale_processes()
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        # Left by a killed instance of this slot (nothing else uses the profile)
+        (self._profile_dir / ".lock").unlink(missing_ok=True)
 
-        self._pipe_name = self._make_pipe_name()
-        self._process = subprocess.Popen(
-            [
-                "soffice",
-                "--headless",
-                "--norestore",
-                f"--accept=pipe,name={self._pipe_name};urp;",
-            ],
-            stderr=subprocess.PIPE,
-        )
+        t0 = time.perf_counter()
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(f"soffice slot {self.slot} is stopped")
+            self._pipe_name = self._make_pipe_name(self.slot)
+            self._process = subprocess.Popen(
+                [
+                    "soffice",
+                    "--headless",
+                    "--norestore",  # no document recovery
+                    "--nodefault",  # no empty document at start
+                    "--nolockcheck",  # the profile is ours: its .lock is removed above
+                    f"-env:UserInstallation={self._profile_dir.as_uri()}",
+                    f"--accept=pipe,name={self._pipe_name};urp;",
+                ],
+                stderr=subprocess.PIPE,
+                start_new_session=True,  # own process group: killed as a whole
+                # No printing here: without this, the first document an instance
+                # loads waits for the CUPS printer list — 30 s when localhost:631
+                # drops packets instead of refusing (WSL2), paid by EVERY conversion
+                # since instances are restarted after each use.
+                env={**os.environ, "SAL_DISABLE_CUPS": "1"},
+            )
+            process = self._process
 
         # Drain soffice stderr in a background thread, filtering out the
         # harmless "javaldx" warning (Java is not used and not required).
         threading.Thread(
-            target=self._drain_stderr,
-            args=(self._process,),
-            daemon=True,
+            target=self._drain_stderr, args=(process,), daemon=True
         ).start()
 
-        # Persist PID so a future crash recovery can clean it up
-        self._pid_file.write_text(str(self._process.pid))
-        logger.info(
-            f"soffice started (pid={self._process.pid}, pipe={self._pipe_name})"
-        )
-
-        self._wait_ready()  # resolves and caches self._socket_path
-        # Now that the real socket directory is known, clean up residual sockets
-        # left by crashed runs (never our own live socket).
-        self._sweep_dead_pipes()
-        logger.info(
-            f"soffice ready on pipe {self._pipe_name} (socket {self._socket_path})"
-        )
-
-    def _restart(self) -> None:
-        """Restart soffice after a crash."""
-        logger.warning("soffice crashed, restarting...")
-        # noinspection PyBroadException
         try:
-            if self._process:
-                self._process.terminate()
-        except Exception:
-            pass
-        self._pid_file.unlink(missing_ok=True)
-        # Drop the pipe socket of the crashed instance if it lingered.
-        if self._socket_path is not None:
-            self._socket_path.unlink(missing_ok=True)
-            self._socket_path = None
+            self._wait_ready()  # resolves and caches self._socket_path
+        except BaseException:
+            self._kill()
+            raise
+        if sweep:
+            self._sweep_dead_pipes()
+        logger.info(
+            f"soffice slot {self.slot} ready in {time.perf_counter() - t0:.1f}s "
+            f"(pid={process.pid}, socket {self._socket_path})"
+        )
+
+    def restart(self) -> None:
+        """Replace the running soffice with a fresh one (state, memory: all gone)."""
+        self._kill()
         self.start()
 
-    def _ensure_running(self) -> None:
-        """Restart soffice if it has crashed. Thread-safe: the lock prevents
-        concurrent restart attempts when multiple threads detect a crash."""
-        with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                self._restart()
+    def _kill(self) -> None:
+        """Stop this instance's whole process group: SIGTERM, then SIGKILL.
 
-    @staticmethod
-    def _run_uno_script(uno_script: str, label: str = "UNO") -> None:
-        """Execute a UNO Python script via the system Python, piped through stdin."""
+        A wedged soffice may ignore SIGTERM, and soffice.bin may outlive oosplash (the
+        started process): the group is signalled until it is empty.
+        """
+        with self._lock:
+            proc, self._process = self._process, None
+            socket_path, self._socket_path = self._socket_path, None
+        if proc is not None:
+            pgid = proc.pid  # session leader: its pid is the group id
+            for sig, grace_s in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+                try:
+                    os.killpg(pgid, sig)
+                except ProcessLookupError:
+                    break  # group already empty
+                deadline = time.monotonic() + grace_s
+                while _group_alive(pgid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if not _group_alive(pgid):
+                    break
+            else:
+                logger.error(
+                    f"soffice group {pgid} (slot {self.slot}) survived SIGKILL"
+                )
+            proc.poll()  # the leader may already be reaped by _group_alive
+        # Our own pipe socket, in case soffice did not clean it up on exit.
+        if socket_path is not None:
+            socket_path.unlink(missing_ok=True)
+
+    def _ensure_running(self) -> None:
+        """Start soffice if it is not running (died while idle)."""
+        if self._process is None or self._process.poll() is not None:
+            logger.warning(f"soffice slot {self.slot} is not running, restarting...")
+            self.restart()
+
+    def _run_uno_script(self, uno_script: str, label: str = "UNO") -> None:
+        """Execute a UNO Python script via the system Python, piped through stdin.
+
+        Bounded by `conversion_timeout_s` (0 = none). A timeout or a crash raises
+        `LibreOfficeUnavailable`: the instance is in an unknown state, but the pool
+        restarts it after every use anyway.
+        """
+        timeout = self._conversion_timeout_s or None
         try:
             result = subprocess.run(
                 # Use the system Python (/usr/bin/python3) rather than "python3"
@@ -354,20 +449,34 @@ class LibreOfficeServer:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=timeout,
             )
-            if result.stdout:
-                logger.debug("%s stdout: %s", label, result.stdout.strip())
-            if result.stderr:
-                logger.warning("%s stderr: %s", label, result.stderr.strip())
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"{label} timed out after {timeout:.0f}s (slot {self.slot})")
+            raise LibreOfficeUnavailable(
+                f"{label}: LibreOffice conversion timed out after {timeout:.0f}s",
+                status_code=504,
+            ) from e
         except subprocess.CalledProcessError as e:
             logger.error(
-                "%s script failed (exit code %d):\n  stdout: %s\n  stderr: %s",
-                label,
-                e.returncode,
-                (e.output or "").strip(),
-                (e.stderr or "").strip(),
+                f"{label} script failed (exit code {e.returncode}, slot {self.slot}):\n"
+                f"  stdout: {(e.output or '').strip()}\n"
+                f"  stderr: {(e.stderr or '').strip()}"
             )
+            server_died = self._process is None or self._process.poll() is not None
+            if e.returncode < 0 or server_died:
+                # The UNO client died of a signal (e.g. SIGSEGV in the bridge) or
+                # soffice itself is gone: not the document's fault.
+                raise LibreOfficeUnavailable(
+                    f"{label}: LibreOffice crashed "
+                    f"({'soffice died' if server_died else f'signal {-e.returncode}'})",
+                    status_code=503,
+                ) from e
             raise
+        if result.stdout:
+            logger.debug(f"{label} stdout: {result.stdout.strip()}")
+        if result.stderr:
+            logger.warning(f"{label} stderr: {result.stderr.strip()}")
 
     def _build_uno_script_general(self, file_path: Path, output_pdf: Path) -> str:
         """
@@ -384,6 +493,7 @@ class LibreOfficeServer:
         return f"""
 import uno
 from com.sun.star.beans import PropertyValue
+{_UNO_HARDENING}
 
 def convert():
     localContext = uno.getComponentContext()
@@ -394,6 +504,7 @@ def convert():
     ctx = resolver.resolve(
         "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
+    harden(ctx)
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
 
@@ -404,7 +515,9 @@ def convert():
     hidden = PropertyValue()
     hidden.Name = "Hidden"
     hidden.Value = True
-    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+    doc = desktop.loadComponentFromURL(
+        file_url, "_blank", 0, (hidden, *safe_load_props())
+    )
 
     # Accepter toutes les révisions (Writer uniquement)
     if doc.supportsService("com.sun.star.text.TextDocument"):
@@ -468,6 +581,7 @@ convert()
 import json
 import uno
 from com.sun.star.beans import PropertyValue
+{_UNO_HARDENING}
 
 def convert():
     localContext = uno.getComponentContext()
@@ -478,6 +592,7 @@ def convert():
     ctx = resolver.resolve(
         "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
+    harden(ctx)
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
 
@@ -487,7 +602,9 @@ def convert():
     hidden = PropertyValue()
     hidden.Name = "Hidden"
     hidden.Value = True
-    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+    doc = desktop.loadComponentFromURL(
+        file_url, "_blank", 0, (hidden, *safe_load_props())
+    )
 
     # Set each sheet to {paper_format} {orientation}, fit all columns to 1 page width
     sheets = doc.getSheets()
@@ -532,6 +649,7 @@ convert()
         return f"""
 import uno
 from com.sun.star.beans import PropertyValue
+{_UNO_HARDENING}
 
 def convert():
     localContext = uno.getComponentContext()
@@ -542,6 +660,7 @@ def convert():
     ctx = resolver.resolve(
         "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
+    harden(ctx)
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
 
@@ -552,7 +671,9 @@ def convert():
     hidden.Name = "Hidden"
     hidden.Value = True
 
-    doc = desktop.loadComponentFromURL(file_url, "_blank", 0, (hidden,))
+    doc = desktop.loadComponentFromURL(
+        file_url, "_blank", 0, (hidden, *safe_load_props())
+    )
 
     xlsx_filter = PropertyValue()
     xlsx_filter.Name = "FilterName"
@@ -591,6 +712,7 @@ convert()
 import json
 import uno
 from com.sun.star.beans import PropertyValue
+{_UNO_HARDENING}
 
 CHART_CLSID = "12DCAE26-281F-416F-A234-C3086127382E"
 RASTER_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/tiff", "image/webp")
@@ -674,6 +796,7 @@ def render():
     ctx = resolver.resolve(
         "uno:pipe,name={self._pipe_name};urp;StarOffice.ComponentContext"
     )
+    harden(ctx)
     smgr = ctx.ServiceManager
     desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
 
@@ -783,22 +906,138 @@ render()
         return _read_sheet_map(sheet_map_path)
 
     def stop(self) -> None:
-        """Terminate soffice and remove the PID file."""
-        if self._process:
-            # noinspection PyBroadException
+        """Kill soffice for good: a restart running meanwhile will not start it again."""
+        with self._lock:
+            self._stopped = True
+        self._kill()
+        logger.info(f"soffice slot {self.slot} stopped")
+
+
+class LibreOfficePool:
+    """`size` LibreOffice instances, each used by one conversion at a time.
+
+    - `acquire()` hands a conversion an instance for itself (FIFO wait when all are
+      busy, without blocking the event loop).
+    - When the conversion is over — success, failure, timeout or cancelled caller —
+      the instance is restarted in the background and only then goes back to the
+      queue: every conversion starts on a fresh soffice (no memory accumulated over
+      documents, no state left by a wedged or crashed conversion), and the restart
+      cost stays off the request's path unless every instance is busy.
+    - A long conversion holds one instance only: the others keep serving.
+
+    No lock is needed between conversions: an instance is never shared, so a restart
+    never interrupts anyone else's work.
+    """
+
+    def __init__(
+        self, size: int, runtime_dir: str, conversion_timeout_s: float
+    ) -> None:
+        if size < 1:
+            raise ValueError(f"LibreOfficePool size must be >= 1, got {size}")
+        self._servers = [
+            LibreOfficeServer(
+                runtime_dir, slot=i, conversion_timeout_s=conversion_timeout_s
+            )
+            for i in range(size)
+        ]
+        self._idle: asyncio.Queue[LibreOfficeServer] | None = None
+        self._background: set[asyncio.Task] = set()
+        self._closed = False
+        self._retry_delay_s = 2.0  # first wait after a failed restart, then doubled
+
+    async def start(self) -> None:
+        """Start every instance (the first one alone, then the others together)."""
+        self._idle = asyncio.Queue()
+        first, *others = self._servers
+        try:
+            # Residual sockets are swept once, by the first instance, before the
+            # others start (a socket between bind() and listen() would look dead).
+            await asyncio.to_thread(first.start, True)
+            # The others together: a first start on a new profile takes ~15 s.
+            await asyncio.gather(
+                *(asyncio.to_thread(server.start) for server in others)
+            )
+            for server in self._servers:
+                self._idle.put_nowait(server)
+        except BaseException:
+            self.stop()
+            raise
+
+    @contextlib.asynccontextmanager
+    async def acquire(self) -> AsyncIterator[LibreOfficeServer]:
+        """Exclusive use of one instance for the duration of the block."""
+        if self._idle is None or self._closed:
+            raise RuntimeError("LibreOffice pool is not running")
+        server = await self._idle.get()
+        try:
+            yield server
+        finally:
+            self._recycle_in_background(server)
+
+    def _recycle_in_background(self, server: LibreOfficeServer) -> None:
+        if self._closed:
+            return
+        task = asyncio.create_task(self._recycle(server))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _recycle(self, server: LibreOfficeServer) -> None:
+        assert self._idle is not None
+        delay = self._retry_delay_s
+        while not self._closed:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                self._process.kill()
-            finally:
-                self._process = None
-        self._pid_file.unlink(missing_ok=True)
-        # Remove our pipe socket in case soffice did not clean it up on exit.
-        if self._socket_path is not None:
-            self._socket_path.unlink(missing_ok=True)
-            self._socket_path = None
-        logger.info("soffice stopped")
+                # A conversion thread of a cancelled caller may still be talking to
+                # the old soffice: it fails once it is killed, nobody waits for it.
+                await asyncio.to_thread(server.restart)
+                break
+            except Exception as e:
+                logger.error(
+                    f"soffice slot {server.slot} restart failed: {e!r} — "
+                    f"retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+        else:
+            return
+        self._idle.put_nowait(server)
+
+    def stop(self) -> None:
+        """Kill every instance (a restart still running will not start it again)."""
+        self._closed = True
+        for task in self._background:
+            task.cancel()
+        for server in self._servers:
+            server.stop()
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether process group `pgid` still has a live (non-zombie) member.
+
+    Reaps the members that are our children first. When the app is PID 1 in a
+    container (uvicorn, no init), the orphaned soffice.bin is re-parented to us: left
+    unreaped, every restart would leave a zombie behind. Zombies with another parent
+    are that parent's business and do not count as alive.
+    """
+    while True:
+        try:
+            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            break
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    for proc in psutil.process_iter():
+        try:
+            if os.getpgid(proc.pid) == pgid and proc.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except (OSError, psutil.Error):
+            continue
+    return False
 
 
 def convert_to_pdf(
@@ -829,11 +1068,15 @@ def convert_to_pdf(
                 paper_format=paper_format or "A3",
                 landscape=landscape,
             )
+        except LibreOfficeUnavailable:
+            raise
         except Exception as e:
             raise RuntimeError(f"LibreOffice spreadsheet→PDF error: {e}") from e
     elif mime in OFFICE_EXTS:
         try:
             lo_server.convert_general(file_path, generated_pdf)
+        except LibreOfficeUnavailable:
+            raise
         except Exception as e:
             raise RuntimeError(f"LibreOffice error: {e}") from e
     else:

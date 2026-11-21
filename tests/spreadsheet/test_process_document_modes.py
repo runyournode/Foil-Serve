@@ -10,6 +10,7 @@ skipped when that import is not available.
 """
 
 import asyncio
+import contextlib
 import re
 import time
 import types
@@ -24,6 +25,18 @@ from fastapi import HTTPException
 from libreoffice import RenderedShape
 from schemas import SpreadsheetMode
 from settings import settings
+
+
+class _FakeLibreOfficePool:
+    """LibreOfficePool stand-in: every acquire() yields the same mock instance."""
+
+    def __init__(self, server) -> None:
+        self.server = server
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        yield self.server
+
 
 processing = pytest.importorskip(
     "processing", reason="PaddleOCR (processing.py) not importable"
@@ -55,10 +68,10 @@ def request_stub():
     state = types.SimpleNamespace(
         pipeline_wrapper=MagicMock(),
         excel_sem=asyncio.Semaphore(1),
-        libreoffice_sem=asyncio.Semaphore(1),
         # The PDF conversion finds no output file and fails, so reaching it is observable.
-        libreoffice_server=lo_server,
+        libreoffice_pool=_FakeLibreOfficePool(lo_server),
         img_desc_sem={},
+        vlm_description_cache=None,
     )
     return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
 
@@ -232,7 +245,7 @@ def _install_render(request_stub, colors: list[tuple[int, int, int]]) -> list:
             shapes.append(RenderedShape("Data", "chart", index, name, png))
         return shapes
 
-    request_stub.app.state.libreoffice_server.render_drawings.side_effect = _render
+    request_stub.app.state.libreoffice_pool.server.render_drawings.side_effect = _render
     return calls
 
 
@@ -247,7 +260,7 @@ def fake_vlm(monkeypatch):
     """Replaces the VLM fan-out; records the context of every image sent to it."""
     sent: list[tuple[str, str]] = []
 
-    async def _describe(client, model_name, imgs_b64, ocrs, semaphore):
+    async def _describe(client, model_name, imgs_b64, ocrs, semaphore, cache=None):
         described = {name: ocrs[name] for name in imgs_b64 if name in ocrs}
         sent.extend(described.items())
         return {name: f"Description of {name}." for name in described}, 3.0

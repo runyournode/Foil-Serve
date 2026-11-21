@@ -6,6 +6,7 @@ kept by the pipeline so that page n of the output is page n of the source.
 """
 
 import asyncio
+import contextlib
 import io
 import time
 import types
@@ -16,6 +17,17 @@ from PIL import Image
 
 from postprocessing import join_marked_pages
 from settings import settings
+
+
+class _FakeLibreOfficePool:
+    """LibreOfficePool stand-in: every acquire() yields the same mock instance."""
+
+    def __init__(self, server) -> None:
+        self.server = server
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        yield self.server
 
 
 class TestJoinMarkedPages:
@@ -61,9 +73,9 @@ def request_stub(tmp_path, monkeypatch):
     state = types.SimpleNamespace(
         pipeline_wrapper=wrapper,
         excel_sem=asyncio.Semaphore(1),
-        libreoffice_sem=asyncio.Semaphore(1),
-        libreoffice_server=MagicMock(),
+        libreoffice_pool=_FakeLibreOfficePool(MagicMock()),
         img_desc_sem={},
+        vlm_description_cache=None,
     )
     return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
 

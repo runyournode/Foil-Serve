@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from unittest.mock import MagicMock
 
 from spreadsheet import (
     _excel2txt,
@@ -394,14 +393,10 @@ class TestMultiTableSparse:
 class TestExcel2TxtWrapper:
     def test_delegates_to_internal(self):
         """excel2txt returns the same result as _excel2txt for a normal file."""
-        lo_server = MagicMock()
         md = excel2txt(
             FIXTURES / "multi_table_independent.xlsx",
             table_format="llm",
             raw_mime=".xlsx",
-            lo_server=lo_server,
         ).markdown
         headers = _sheet_headers(md)
         assert headers == ["Employees", "Products", "Orders"]
-        # LibreOffice server should not be called for a normal .xlsx
-        lo_server.convert_xls_to_xlsx.assert_not_called()

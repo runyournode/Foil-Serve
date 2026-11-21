@@ -12,7 +12,7 @@ from typing import Literal, TypeIs, get_args
 import chardet
 import magic
 import zstandard
-from PIL.Image import Image, open as pil_open
+from PIL.Image import Image
 
 from schemas import Metadata
 
@@ -185,28 +185,6 @@ def check_zip_uncompressed_size(path: Path, max_bytes: int) -> None:
                             f"exceeds 1.25x declared size "
                             f"({declared_total / 1024**2:.1f} MB) — zip bomb detected"
                         )
-
-
-def image_to_pdf(path: Path, output_dir: Path) -> Path:
-    """
-    Convert an image file to PDF using Pillow. Supports multi-page formats (e.g. TIFF)
-    and formats not natively supported by the Paddle pipeline (e.g. WebP).
-    """
-    img = pil_open(path)
-    pages: list[Image] = []
-    try:
-        while True:
-            pages.append(img.copy().convert("RGB"))
-            img.seek(img.tell() + 1)
-    except EOFError:
-        pass
-    finally:
-        img.close()
-    pdf_path = output_dir / "converted.pdf"
-    pages[0].save(pdf_path, save_all=True, append_images=pages[1:])
-    for p in pages:
-        p.close()
-    return pdf_path
 
 
 # -----------------------------------

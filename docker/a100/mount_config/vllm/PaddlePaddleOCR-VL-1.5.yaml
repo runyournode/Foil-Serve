@@ -1,0 +1,24 @@
+model: PaddlePaddle/PaddleOCR-VL-1.5
+served-model-name:
+  - PaddlePaddle/PaddleOCR-VL-1.5
+  - PaddleOCR-VL-1.5-0.9B
+trust-remote-code: True  # keep true even if vllm says it's ignored
+
+# Required for vllm>=0.31: PaddleX sends per-request mm_processor_kwargs (rejected with HTTP 400 otherwise)
+trust-request-mm-kwargs: True
+
+limit_mm_per_prompt: {image: 1}
+# Many concurrent crops: 8 workers x pipeline_vlm_max_concurrency 128 can be in flight.
+max_num_seqs: 128
+max-num-batched-tokens: 32768
+max-model-len: 16384
+
+no-enable-prefix-caching: True
+mm-processor-cache-gb: 0
+
+# The GPU is shared with another vLLM (12-14 GB): every budget is fixed, nothing grows
+# into "free" VRAM. Fixed KV cache (~256k tokens for this 0.3B language model, enough
+# for 128 sequences of ~2k tokens); gpu-memory-utilization is then only used for the
+# free-VRAM check at startup (0.15 x 80 GB = 12 GB must be free).
+kv-cache-memory-bytes: 6000000000
+gpu-memory-utilization: 0.15

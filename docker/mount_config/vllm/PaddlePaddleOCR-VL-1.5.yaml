@@ -3,6 +3,9 @@ served-model-name:
   - PaddlePaddle/PaddleOCR-VL-1.5
   - PaddleOCR-VL-1.5-0.9B
 trust-remote-code: True  # keep true even if vllm says it's ignored
+
+# Required for vllm>=0.31: PaddleX sends per-request mm_processor_kwargs (rejected with HTTP 400 otherwise)
+trust-request-mm-kwargs: True
 #max-num-batched-tokens: 16384  # default
 
 # ---non default - dev-only---
@@ -16,4 +19,8 @@ max-model-len: 16384
 
 no-enable-prefix-caching: True
 mm-processor-cache-gb: 0
-gpu-memory-utilization: 0.35
+# Fixed KV cache (~21.7k tokens). vLLM >= 0.33 profiles its batched vision encoder with a
+# larger activation peak: the former `gpu-memory-utilization: 0.35` leaves it a negative KV
+# budget on an 8 GB GPU. gpu-memory-utilization is then only the free-VRAM check at startup.
+kv-cache-memory-bytes: 400000000
+gpu-memory-utilization: 0.05

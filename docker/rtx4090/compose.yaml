@@ -3,8 +3,9 @@
 # Optimized for LATENCY, not for VRAM usage:
 #   - vLLM KV caches are fixed (1.5 GB each) and sized for concurrent requests
 #     (32 sequences for PaddleOCR-VL-1.5, 8 for Ministral)
-#   - the Paddle worker is never recycled (max_tasks_between_pipeline_reload = 99999):
-#     no reload overhead, but the app RAM/VRAM footprint keeps the Paddle allocator's peak
+#   - 3 pipeline workers, layout batch 4, VRAM capped at 3 GB each, never recycled
+#     (no leak measured; max_worker_rss_mb as a safety net). Host RAM: ~16 GB free.
+#   - NOT measured on a 4090: derived from the RTX 3070 bench — re-run it.
 # Leave other GPU workloads stopped while this stack runs.
 #
 #   cd docker/rtx4090 && docker compose up -d --wait
@@ -12,10 +13,11 @@
 
 services:
   foil_app:
-    image: ghcr.io/runyournode/foil-serve:0.1.6-offline
+    image: ghcr.io/runyournode/foil-serve:0.1.7-offline
     container_name: foil_app
     gpus: all
     ipc: host
+    init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
     expose:
       - "8080"
     ports:
@@ -40,7 +42,7 @@ services:
 
   # Hard Req : PaddleOCR-VL-1.5 served by vllm
   foil_vllm-PaddleOCR-VL-1.5:
-    image: docker.io/vllm/vllm-openai:v0.32.0
+    image: docker.io/vllm/vllm-openai:v0.33.0
     container_name: foil_vllm-PaddleOCR-VL-1.5
     gpus: all
     ipc: host
@@ -70,7 +72,7 @@ services:
 
   # Soft Req : image description (cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit)
   foil_vllm-ministral-3-3b:
-    image: docker.io/vllm/vllm-openai:v0.32.0
+    image: docker.io/vllm/vllm-openai:v0.33.0
     container_name: foil_vllm-ministral-3-3b
     gpus: all
     ipc: host

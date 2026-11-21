@@ -27,8 +27,19 @@ class Settings(BaseSettings):
     prompts: Dict[str, str]
     vlm_models: List[VLMModelConfig]
     external_processors: List[ExternalProcessorConfig]
-    max_tasks_between_pipeline_reload: int
-    max_concurrent_libreoffice: int
+    max_tasks_between_pipeline_reload: int = Field(ge=0)
+    pipeline_workers: int = Field(ge=1)
+    max_worker_rss_mb: int = Field(ge=0)
+    pipeline_task_timeout_s: int = Field(ge=0)
+    pipeline_vlm_max_concurrency: int = Field(ge=0)
+    pipeline_malloc_trim: bool
+    pipeline_worker_vram_limit_mb: int = Field(ge=0)
+    pipeline_chunk_pages: int = Field(ge=0)
+    pipeline_max_page_megapixels: float = Field(ge=0)
+    empty_document_vlm_max_pages: int = Field(ge=0)
+    vlm_description_cache_mb: float = Field(ge=0)
+    max_concurrent_libreoffice: int = Field(ge=1)
+    libreoffice_conversion_timeout_s: int = Field(ge=0)
     max_concurrent_excel: int
     max_file_size_mb: int
     max_pdf_file_size_mb: int

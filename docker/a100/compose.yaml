@@ -1,0 +1,87 @@
+# Foil-Serve deployment PROPOSAL for one NVIDIA A100 80 GB, Xeon, 100+ GB of RAM.
+# NOT MEASURED on an A100: derived from the RTX 3070 measurements (bench of the 0.1.7
+# cycle) — validate with the bench before production (vLLM `num_requests_running` /
+# `_waiting`, GPU %, worker RSS lines in foil.log).
+#
+# The GPU is shared with ANOTHER vLLM (12-14 GB, not in this stack): every budget here
+# is fixed, nothing grows into "free" VRAM.
+#   other vLLM                        12-14 GB  (must itself use a fixed budget)
+#   PaddleOCR-VL vLLM (this stack)    ~10 GB    (weights ~2 GB + KV 6 GB + graphs)
+#   8 pipeline workers x 3000 MB cap   24 GB    (layout batch 4)
+#   total                             ~48 GB of 80: room to add workers if vLLM idles
+# Start the other vLLM first, or make sure both fit: each checks free VRAM at startup.
+#
+# Image descriptions: a Qwen VLM on ANOTHER server ([[vlm_models]] "qwen": edit url /
+# endpoint_name in mount_config/foil_serve/server_config.toml).
+#
+# RAM (host): 8 workers x ~3 GB (peak) + 6 LibreOffice instances x up to ~3 GB
+# + vLLM ~6 GB + API ~2 GB ≈ 50 GB.
+#
+# CPU: vLLM's EngineCore is single-threaded and CPU-bound on fast GPUs (vLLM PR #61458:
+# ~1 core at full speed). Use vLLM >= 0.33 (batched PaddleOCR-VL vision encoder:
+# +34-85 % throughput on H100). If EngineCore still sits at 100 % of a core, run a 2nd
+# PaddleOCR-VL vLLM replica behind a round-robin proxy and set
+# pipeline_vlm_max_concurrency to max_num_seqs x 2.
+#
+#   cd docker/a100 && docker compose up -d --wait
+#   → API http://localhost:8081/docs
+
+services:
+  foil_app:
+    image: ghcr.io/runyournode/foil-serve:0.1.7-offline
+    container_name: foil_app
+    gpus: all
+    ipc: host
+    init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
+    expose:
+      - "8080"
+    ports:
+      - "8081:8080"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - APP_PORT=8080 # must match CMD if you override (default: 8080)
+    volumes:
+      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:Z,ro
+      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:Z,ro
+      # [optional] logs + artifacts (log file, failed/, xls2pdf/, cell_errors/)
+      - ./mount_runtime/foil_serve/logs:/var/log/foil:Z
+    restart: unless-stopped
+    depends_on:
+      foil_vllm-PaddleOCR-VL-1.5:
+        condition: service_healthy
+
+
+  # Hard Req : PaddleOCR-VL-1.5 served by vllm
+  foil_vllm-PaddleOCR-VL-1.5:
+    image: docker.io/vllm/vllm-openai:v0.33.0
+    container_name: foil_vllm-PaddleOCR-VL-1.5
+    gpus: all
+    ipc: host
+    expose:
+      - "8000"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - PORT=8000  # must match CMD
+    volumes:
+      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
+    command: ["--port", "8000", "--config", "/config/config.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+      ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+networks:
+  foil-net:
+    driver: bridge
