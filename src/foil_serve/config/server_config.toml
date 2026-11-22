@@ -9,6 +9,11 @@
 log_level = "DEBUG"         # DEBUG | INFO | WARNING | ERROR
 libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
 log_file = "/var/log/foil/foil.log"  # "" to disable logging to file
+# Rotation of log_file: a new file once it reaches log_max_mb (0 = never rotate),
+# log_backup_count older files kept (foil.log.1 … foil.log.N). Only the API process
+# writes the file; the pipeline workers send it their records.
+log_max_mb = 50
+log_backup_count = 5
 
 # Base directory for debug artifacts. Subdirectories are created automatically.
 artifact_dir = "/var/log/foil/artifacts"

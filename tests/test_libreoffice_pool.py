@@ -145,6 +145,31 @@ def test_failed_restart_is_retried():
     pool.stop()
 
 
+def test_cancelled_wait_loses_no_instance():
+    server = _FakeServer(0)
+    pool = _fake_pool(server)
+
+    async def scenario():
+        await pool.start()
+        async with pool.acquire():
+            waiter = asyncio.create_task(_hold(pool))
+            await asyncio.sleep(0.02)  # blocked: the only instance is in use
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        async with asyncio.timeout(5):
+            async with pool.acquire():  # the instance came back after its restart
+                pass
+
+    _run(scenario())
+    pool.stop()
+
+
+async def _hold(pool):
+    async with pool.acquire():
+        await asyncio.sleep(10)
+
+
 def test_acquire_after_stop_raises():
     pool = _fake_pool(_FakeServer(0))
 

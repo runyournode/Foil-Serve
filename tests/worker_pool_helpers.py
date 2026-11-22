@@ -70,3 +70,30 @@ def raise_after(delay_s: float, msg: str) -> None:
     """Fail after `delay_s` (lets a test cancel the caller first)."""
     time.sleep(delay_s)
     raise ValueError(msg)
+
+
+def fake_predict(file_path: str, start: int, stop: int, use_ocr: bool, max_mp: float):
+    """Stand-in for pipeline._worker_predict: each page '<stem>:<page>@<pid>@<t0>@<t1>'."""
+    from pathlib import Path
+
+    t0 = time.time()
+    time.sleep(0.15)
+    t1 = time.time()
+    stem = Path(file_path).stem
+    pages = [f"{stem}:{i}@{os.getpid()}@{t0}@{t1}" for i in range(start, stop)]
+    return pages, {}, t1 - t0
+
+
+def init_queue_logging(queue) -> None:
+    """Worker init: log records go to `queue` (settings.setup_worker_logging)."""
+    from settings import setup_worker_logging
+
+    setup_worker_logging(queue)
+    init_ok()
+
+
+def log_message(message: str) -> int:
+    import logging
+
+    logging.getLogger("worker_test").warning(message)
+    return os.getpid()

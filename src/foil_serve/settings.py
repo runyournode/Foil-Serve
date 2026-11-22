@@ -2,6 +2,7 @@ from typing import List, Annotated, Dict, Literal
 from enum import StrEnum
 import asyncio
 import logging
+import logging.handlers
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
@@ -50,6 +51,8 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
     libs_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
     log_file: str  # "" disables logging to file
+    log_max_mb: int = Field(ge=0)  # size that triggers a rotation (0 = never rotate)
+    log_backup_count: int = Field(ge=0)  # rotated files kept
     artifact_dir: str
     save_failed_artifacts: bool
     failed_artifacts_subdir: str
@@ -165,7 +168,12 @@ _FILE_DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 def setup_logging() -> logging.FileHandler | None:
-    """Configure the root logger. Safe to call from both main and worker processes."""
+    """Configure the root logger of the API process: console + rotating log file.
+
+    Only the API process writes the log file. Pipeline workers send their records to
+    it (`setup_worker_logging`): with several processes rotating the same file, each
+    one would rename it on its own and records would be lost or misplaced.
+    """
     root = logging.getLogger()
     root.setLevel(logging.getLevelName(settings.log_level))
 
@@ -184,7 +192,11 @@ def setup_logging() -> logging.FileHandler | None:
         log_path = Path(settings.log_file)
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(settings.log_file)
+            fh = logging.handlers.RotatingFileHandler(
+                settings.log_file,
+                maxBytes=settings.log_max_mb * 1024 * 1024,
+                backupCount=settings.log_backup_count,
+            )
         except OSError as e:
             raise OSError(
                 f"Cannot open log file '{settings.log_file}': {e}. "
@@ -194,11 +206,26 @@ def setup_logging() -> logging.FileHandler | None:
         fh.setFormatter(logging.Formatter(_FILE_FMT, datefmt=_FILE_DATE_FMT))
         root.addHandler(fh)
 
+    _quiet_libs()
+    return fh
+
+
+def _quiet_libs() -> None:
     libs_level = logging.getLevelName(settings.libs_log_level)
-    for lib in ("httpx", "openai", "httpcore"):
+    # httpx2: pulled in by huggingface_hub; logs one INFO line per HTTP request
+    for lib in ("httpx", "httpx2", "openai", "httpcore"):
         logging.getLogger(lib).setLevel(libs_level)
 
-    return fh
+
+def setup_worker_logging(queue) -> None:
+    """Configure the root logger of a pipeline worker: every record goes to `queue`,
+    written by the API process (see `setup_logging`). No file handle of its own."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.addHandler(logging.handlers.QueueHandler(queue))
+    root.setLevel(logging.getLevelName(settings.log_level))
+    _quiet_libs()
 
 
 def align_uvicorn_logging(file_handler: logging.FileHandler | None) -> None:

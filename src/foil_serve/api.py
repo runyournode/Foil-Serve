@@ -7,6 +7,7 @@ differ only by the mode they pass and the text of their docstring.
 """
 
 import asyncio
+import logging
 import time
 from typing import Annotated, Any, Awaitable, Callable, Optional
 
@@ -19,6 +20,8 @@ from schemas import ProcessedDocument, SpreadsheetMode
 from security import verify_api_key
 from settings import AsyncOpenAIWithInfo, settings, validate_endpoint, vlm_registry
 from utils import build_tar_zst
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -38,15 +41,60 @@ async def _run(
     spreadsheet_mode: SpreadsheetMode,
     excel_min_output_ratio: Optional[float] = None,
 ) -> ProcessedResult:
-    return await process_document(
+    return await _cancel_on_disconnect(
         request,
-        file_content,
-        image_description_model_name,
-        client,
-        t0_wall=time.perf_counter(),
-        spreadsheet_mode=spreadsheet_mode,
-        excel_min_output_ratio=excel_min_output_ratio,
+        process_document(
+            request,
+            file_content,
+            image_description_model_name,
+            client,
+            t0_wall=time.perf_counter(),
+            spreadsheet_mode=spreadsheet_mode,
+            excel_min_output_ratio=excel_min_output_ratio,
+        ),
     )
+
+
+# Answered to a client that is gone (nginx's "client closed request"): never read.
+_CLIENT_CLOSED_REQUEST = 499
+
+
+async def _cancel_on_disconnect(
+    request: Request, work: Awaitable[ProcessedResult]
+) -> ProcessedResult:
+    """Run `work`, cancelled as soon as the client disconnects.
+
+    Without this, a request whose client gave up (gateway timeout) keeps a pipeline
+    worker / LibreOffice instance busy for nobody. Cancellation takes it out of the
+    worker and LibreOffice queues, kills a running LibreOffice conversion (its
+    instance is replaced), stops the image descriptions, and starts no further page
+    range; a range a worker is already running finishes there.
+    """
+    task = asyncio.ensure_future(work)
+    disconnected = False
+
+    async def watch() -> None:
+        nonlocal disconnected
+        while True:
+            # The body is already read: the next ASGI message is the disconnect.
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                disconnected = True
+                task.cancel()
+                return
+
+    watcher = asyncio.create_task(watch())
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if not disconnected:
+            raise  # the server itself is cancelling us (shutdown)
+        logger.warning("Client disconnected: processing cancelled")
+        raise HTTPException(
+            status_code=_CLIENT_CLOSED_REQUEST, detail="Client closed the request"
+        ) from None
+    finally:
+        watcher.cancel()
 
 
 def _as_json(result: ProcessedResult) -> ProcessedDocument:

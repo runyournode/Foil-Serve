@@ -9,6 +9,9 @@ import ctypes
 import ctypes.util
 import gc
 import logging
+import logging.handlers
+import multiprocessing
+import multiprocessing.queues
 import os
 import threading
 import time
@@ -21,7 +24,7 @@ import psutil
 
 from page_images import iter_pages, page_count
 from postprocessing import join_pages, name_by_content
-from settings import settings, setup_logging
+from settings import settings, setup_worker_logging
 from utils import EncodedImage, UnreadableDocument
 from worker_pool import WorkerCrashed, WorkerPool, WorkerTaskTimeout
 
@@ -111,12 +114,16 @@ def _peak_rss_mb() -> float | None:
 
 
 def _init_worker(
-    config_path: str, vlm_max_concurrency: int, malloc_trim: bool, vram_limit_mb: int
+    config_path: str,
+    vlm_max_concurrency: int,
+    malloc_trim: bool,
+    vram_limit_mb: int,
+    log_queue: "multiprocessing.queues.Queue",
 ) -> None:
     """Load the pipeline once in a new worker process."""
     global _worker_pipeline, _worker_malloc_trim
-    # Worker is a spawned process — configure logging independently
-    setup_logging()
+    # Records go to the API process, the only writer of the (rotating) log file
+    setup_worker_logging(log_queue)
     if malloc_trim:
         _worker_malloc_trim = _glibc_malloc_trim()
         if _worker_malloc_trim is None:
@@ -270,6 +277,13 @@ def _worker_predict(
     return mds, imgs, elapsed
 
 
+def _raise_first_failure(tasks: list[asyncio.Task]) -> None:
+    """Re-raise the error of the first finished range that failed, if any."""
+    for task in tasks:
+        if task.done() and task.exception() is not None:
+            raise task.exception()  # type: ignore[misc]
+
+
 def _check_smoke_result(result: PipelineOutput) -> None:
     """Raise unless the startup test image was read correctly."""
     pages, imgs, _ = result
@@ -310,6 +324,12 @@ class PaddlePipelineWrapper:
     """
 
     def __init__(self, config_path: str) -> None:
+        # Worker log records, written by the API process's handlers (console + file)
+        self._log_queue = multiprocessing.get_context("spawn").Queue()
+        self._log_listener = logging.handlers.QueueListener(
+            self._log_queue, *logging.getLogger().handlers, respect_handler_level=True
+        )
+        self._log_listener_started = False
         self._pool = WorkerPool(
             settings.pipeline_workers,
             _init_worker,
@@ -318,6 +338,7 @@ class PaddlePipelineWrapper:
                 settings.pipeline_vlm_max_concurrency,
                 settings.pipeline_malloc_trim,
                 settings.pipeline_worker_vram_limit_mb,
+                self._log_queue,
             ),
             max_tasks=settings.max_tasks_between_pipeline_reload,
             max_rss_mb=settings.max_worker_rss_mb,
@@ -328,6 +349,9 @@ class PaddlePipelineWrapper:
     async def start(self, smoke_image: str) -> None:
         """Start the workers one by one; the first one must read `smoke_image` correctly
         (checked once: model weights present, PaddleOCR-VL vLLM reachable)."""
+        if not self._log_listener_started:
+            self._log_listener.start()
+            self._log_listener_started = True
         await self._pool.start(
             smoke=(
                 _worker_predict,
@@ -342,12 +366,18 @@ class PaddlePipelineWrapper:
         """
         Runs the pipeline on every page of `file_path` (PDF or image), in free workers.
 
-        A document longer than `pipeline_chunk_pages` is sent in consecutive page
-        ranges, one task each, one after the other: each task goes back to the end of
-        the queue, so a small document waiting behind a big one gets a worker between
-        two ranges, even with a single worker. Pages are independent for the pipeline
-        (no cross-page restructuring is used), so the output does not depend on the
-        split.
+        A document longer than `pipeline_chunk_pages` is sent in page ranges, one task
+        each. Scheduling is fair and work-conserving:
+        - an idle worker is taken at once: a big document alone runs on every free
+          worker in parallel;
+        - when none is idle, the document first waits for one of its own ranges to
+          finish, then queues (FIFO): a document with work in progress never stands
+          ahead of one that has none, so workers go round-robin between documents and
+          a small document waits for one range to end, not for a big document.
+        Pages are independent for the pipeline (no cross-page restructuring is used),
+        so the output does not depend on the split. If the caller is cancelled (client
+        gone), no further range is started; ranges already running finish in their
+        worker (a range cannot be interrupted without killing the worker).
 
         The tmpdir holding file_path must remain alive in the caller until this coroutine
         returns. The calling coroutine is suspended (await) without blocking the event loop.
@@ -373,24 +403,46 @@ class PaddlePipelineWrapper:
         except Exception as e:  # pdfium / Pillow cannot parse it: a corrupted file
             raise UnreadableDocument(f"cannot read the document: {e}") from e
         chunk = settings.pipeline_chunk_pages or count or 1
+        ranges = [(s, min(s + chunk, count)) for s in range(0, count, chunk)] or [
+            (0, 1)
+        ]
+        tasks: list[asyncio.Task] = []
+        try:
+            for start, stop in ranges:
+                slot = self._pool.try_acquire()
+                if slot is None:
+                    # No idle worker: wait for one of this document's ranges to end
+                    # before standing in line, so a document with work in progress
+                    # never queues ahead of one that has none (round-robin between
+                    # documents). An idle worker, though, is taken at once: a big
+                    # document alone spreads its ranges over every free worker.
+                    active = [t for t in tasks if not t.done()]
+                    if active:
+                        await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    _raise_first_failure(tasks)
+                    slot = await self._pool.acquire()
+                tasks.append(
+                    self._pool.start_on(
+                        slot,
+                        _worker_predict,
+                        file_path,
+                        start,
+                        stop,
+                        use_ocr_for_image_block,
+                        settings.pipeline_max_page_megapixels,
+                    )
+                )
+            # shield: a cancelled caller never cancels a range a worker is running
+            outputs = await asyncio.gather(*(asyncio.shield(t) for t in tasks))
+        except WorkerCrashed as e:
+            raise PipelineUnavailable(str(e), status_code=503) from e
+        except WorkerTaskTimeout as e:
+            raise PipelineUnavailable(str(e), status_code=504) from e
+
         md_pages: list[str] = []
         imgs: dict[str, EncodedImage] = {}
         elapsed = 0.0
-        for start in range(0, max(count, 1), chunk):
-            stop = min(start + chunk, count) if count else 1
-            try:
-                pages, chunk_imgs, duration = await self._pool.submit(
-                    _worker_predict,
-                    file_path,
-                    start,
-                    stop,
-                    use_ocr_for_image_block,
-                    settings.pipeline_max_page_megapixels,
-                )
-            except WorkerCrashed as e:
-                raise PipelineUnavailable(str(e), status_code=503) from e
-            except WorkerTaskTimeout as e:
-                raise PipelineUnavailable(str(e), status_code=504) from e
+        for pages, chunk_imgs, duration in outputs:  # range order: page order
             md_pages.extend(pages)
             imgs.update(chunk_imgs)  # content names: identical crops collapse
             elapsed += duration
@@ -403,3 +455,6 @@ class PaddlePipelineWrapper:
         wait=False : workers are killed immediately.
         """
         self._pool.shutdown(wait=wait)
+        if self._log_listener_started:
+            self._log_listener.stop()  # flushes what the workers sent last
+            self._log_listener_started = False

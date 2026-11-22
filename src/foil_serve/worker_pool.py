@@ -167,6 +167,9 @@ class WorkerPool:
         # workers must never stack up.
         self._spawn_lock: asyncio.Lock | None = None
         self._reloading = 0
+        self._waiting = (
+            0  # callers blocked in acquire(): try_acquire() never jumps them
+        )
         self._background: set[asyncio.Task] = set()
         self._closed = False
         # One thread per slot: a slot waits on at most one blocking call at a time.
@@ -234,16 +237,42 @@ class WorkerPool:
         here. Raises `WorkerCrashed` if the worker dies, `WorkerTaskTimeout` on
         timeout. Waits (without blocking the event loop) while every slot is busy.
         """
-        if self._idle is None or self._closed:
-            raise RuntimeError(f"{self.name} pool is not running")
-        slot = await self._idle.get()
+        slot = await self.acquire()
         # The task owns the slot until the worker answered, even if the caller is
         # cancelled meanwhile (shield): the slot is never released mid-reply.
+        return await asyncio.shield(self.start_on(slot, fn, *args))
+
+    async def acquire(self) -> _Slot:
+        """Wait for a free slot, first come first served. The caller must hand it to
+        `start_on` without awaiting anything in between (or the slot is lost)."""
+        if self._idle is None or self._closed:
+            raise RuntimeError(f"{self.name} pool is not running")
+        self._waiting += 1
+        try:
+            # Cancelled while waiting: the queue keeps its slot (asyncio.Queue
+            # removes an item only when the getter actually resumes).
+            return await self._idle.get()
+        finally:
+            self._waiting -= 1
+
+    def try_acquire(self) -> _Slot | None:
+        """A free slot right now, or None — never ahead of a caller already waiting."""
+        if self._idle is None or self._closed or self._waiting:
+            return None
+        try:
+            return self._idle.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    def start_on(self, slot: _Slot, fn: Callable[..., Any], *args: Any) -> asyncio.Task:
+        """Run `fn(*args)` on an acquired slot; the slot goes back once the worker
+        answered (or is respawned). Await the task through `asyncio.shield` to keep
+        the slot safe from a cancelled caller."""
         task = asyncio.create_task(self._run_on_slot(slot, fn, args))
         # A cancelled caller never reads the task's outcome: retrieve it here so a
         # failure is not reported as "Task exception was never retrieved".
         task.add_done_callback(_retrieve_exception)
-        return await asyncio.shield(task)
+        return task
 
     async def _run_on_slot(
         self, slot: _Slot, fn: Callable[..., Any], args: tuple

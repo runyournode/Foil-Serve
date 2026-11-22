@@ -7,7 +7,6 @@
   small document is served between two ranges of a big one
 """
 
-import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -15,9 +14,7 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image
 
-import pipeline
 from page_images import PDF_RENDER_SCALE, iter_pages, page_count
-from settings import settings
 
 
 def _pages(path: Path, max_mp: float = 0) -> list[np.ndarray]:
@@ -108,69 +105,3 @@ def test_pdf_page_range(tmp_path):
     assert page_count(path) == 5
     widths = [p.shape[1] for p in iter_pages(path, 2, 4, 0)]
     assert widths == [round(102 * PDF_RENDER_SCALE), round(103 * PDF_RENDER_SCALE)]
-
-
-# ── chunking ─────────────────────────────────────────────────────────────────
-
-
-class _OneWorkerPool:
-    """Fake pool with a single FIFO slot; pages come back as '<file>:<page>'."""
-
-    def __init__(self) -> None:
-        self._slot = asyncio.Lock()  # FIFO waiters, like the idle-slot queue
-        self.calls: list[tuple[str, int, int]] = []
-
-    async def submit(self, fn, file_path, start, stop, *_):
-        async with self._slot:
-            self.calls.append((Path(file_path).stem, start, stop))
-            await asyncio.sleep(0.01)
-            pages = [f"{Path(file_path).stem}:{i}" for i in range(start, stop)]
-            return pages, {f"imgs/{Path(file_path).stem}{start}.jpg": object()}, 1.0
-
-
-def _wrapper(pool) -> pipeline.PaddlePipelineWrapper:
-    wrapper = pipeline.PaddlePipelineWrapper.__new__(pipeline.PaddlePipelineWrapper)
-    wrapper._pool = pool
-    return wrapper
-
-
-def test_chunks_keep_page_order_and_merge(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "pipeline_chunk_pages", 2)
-    path = _blank_pdf(tmp_path / "doc.pdf", *[(100, 100)] * 5)
-    pool = _OneWorkerPool()
-    pages, imgs, elapsed = asyncio.run(_wrapper(pool).run(str(path)))
-    assert pages == [f"doc:{i}" for i in range(5)]
-    assert [(s, e) for _, s, e in pool.calls] == [(0, 2), (2, 4), (4, 5)]
-    assert len(imgs) == 3 and elapsed == 3.0
-
-
-def test_small_document_served_between_ranges(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "pipeline_chunk_pages", 20)
-    big = _blank_pdf(tmp_path / "big.pdf", *[(100, 100)] * 60)
-    small = _blank_pdf(tmp_path / "small.pdf", (100, 100))
-    pool = _OneWorkerPool()
-    wrapper = _wrapper(pool)
-
-    async def scenario():
-        big_task = asyncio.create_task(wrapper.run(str(big)))
-        await asyncio.sleep(0.005)  # the big document holds the worker
-        small_pages, _, _ = await wrapper.run(str(small))
-        big_pages, _, _ = await big_task
-        return big_pages, small_pages
-
-    big_pages, small_pages = asyncio.run(scenario())
-    assert small_pages == ["small:0"] and len(big_pages) == 60
-    assert [(name, s) for name, s, _ in pool.calls] == [
-        ("big", 0),
-        ("small", 0),
-        ("big", 20),
-        ("big", 40),
-    ]
-
-
-def test_no_chunking_when_zero(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "pipeline_chunk_pages", 0)
-    path = _blank_pdf(tmp_path / "doc.pdf", *[(100, 100)] * 7)
-    pool = _OneWorkerPool()
-    asyncio.run(_wrapper(pool).run(str(path)))
-    assert [(s, e) for _, s, e in pool.calls] == [(0, 7)]
