@@ -98,8 +98,7 @@ Categories: Jan … Jun (6 points)
 | Format | Conversion | Post-processing |
 |---|---|---|
 | `.txt`, `.json`, `.csv`, `.xml`, `.md` | Pass-through (smart encoding detection) | — |
-| `.pdf`, `.png`, `.jpg`, `.bmp` | PaddleOCR-VL natively | HTML tables → Markdown or simplified HTML, optional VLM image description |
-| `.tiff` (incl. multi-page), `.webp` | Pillow → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
+| `.pdf`, `.png`, `.jpg`, `.bmp`, `.tiff` (incl. multi-page), `.webp` | Pages rendered by foil (PDF at 144 dpi, images at native size, `pipeline_max_page_megapixels` cap) → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 | `.xls`, `.xlsx`, `.ods` | Pandas → Markdown tables, LibreOffice → PDF → PaddleOCR-VL, or both — see *Spreadsheet conversion strategies* | Cell error masking, pictures and charts extraction, header + table of contents, per-section size budget, optional VLM image description |
 | `.docx`, `.doc`, `.pptx`, `.ppt`, `.odt`, `.odp`, `.rtf` | LibreOffice → PDF → PaddleOCR-VL | HTML tables → Markdown or simplified HTML, optional VLM image description |
 
@@ -174,6 +173,17 @@ curl -X POST "http://localhost:8081/v1/process?spreadsheet_mode=both" \
 
 **Image names are content-addressed:** `imgs/` + the first 16 hex characters of the sha256 of the JPEG bytes returned. An image repeated in the document (a logo on every page or sheet) is returned once and described by the VLM once, and every `<img src>` referencing it uses the same name. Names are stable identifiers: a client can store and serve images by name, and check a file with `sha256sum`.
 
+### Error codes
+
+| Status | When |
+|---|---|
+| `422` | Unsupported, empty or unreadable document (corrupted PDF, file LibreOffice cannot open) |
+| `413` | File above a size limit, or no spreadsheet section within `excel_max_output_ratio` |
+| `411` | Upload without `Content-Length` |
+| `503` + `Retry-After` | Upload budget full (`max_inflight_upload_mb`), or a pipeline worker / LibreOffice instance crashed: retry later |
+| `504` | Page range or LibreOffice conversion over its timeout |
+| `499` | Client disconnected: the processing was cancelled |
+
 ### Response metadata fields
 
 | Field | Type | Description |
@@ -228,21 +238,21 @@ cd src/foil_serve && uv run --no-sync uvicorn main:app --host 0.0.0.0 --port 808
 
 ### Option 2 — Docker (air-gapped)
 
-A ready-to-use stack (foil-serve + 2× vLLM services) is available in `./docker`.  
-Paddle native models are included in the foil-serve `-offline` image, but you will still need to download the models for the vllm servers (PaddleOCR-VL-1.5 and any model used for image description).  
+Paddle native models are included in the foil-serve `-offline` image; the models served by vLLM (PaddleOCR-VL-1.5, and any model used for image description) must be in the host's Hugging Face cache.
 
-#### Run the docker stack
+| Directory | Target | Stack |
+|---|---|---|
+| `docker/` | any GPU | foil + PaddleOCR-VL vLLM + Ministral vLLM |
+| `docker/rtx3070/` | RTX 3070, 8 GB (measured) | foil + PaddleOCR-VL vLLM, VLM on another server |
+| `docker/rtx4090/` | RTX 4090, 24 GB | foil + PaddleOCR-VL vLLM + Ministral vLLM |
+| `docker/a100/` | A100 with 65 GB available | foil + PaddleOCR-VL vLLM, VLM on another server |
+| `docker/h100/` | H100 with 20 GB available | foil + PaddleOCR-VL vLLM, VLM on another server |
+
 ```bash
-cd docker/
-docker compose up -d
+cd docker/rtx3070 && docker compose up -d --wait   # → http://localhost:8081/docs
 ```
 
-#### RTX 4090 variant
-`./docker/rtx4090` is the same stack tuned for a single RTX 4090 (24 GB): bigger vLLM batches and fixed KV caches, worker never recycled. It is optimized for latency, not for VRAM usage.
-```bash
-cd docker/rtx4090/
-docker compose up -d --wait
-```
+Sizing rules and measured unit costs (worker, vLLM, LibreOffice): end of `pipeline_config.yaml`.
 
 ---
 
@@ -250,6 +260,8 @@ docker compose up -d --wait
 
 - **`pipeline_config.yaml`** — PaddleOCR-VL-1.5 pipeline settings. Update the vLLM URL to point to your model endpoint. Other pipeline settings can be changed at your own risk 😉.
 - **`server_config.toml`** — API keys, VLM model definitions, prompts, resource limits, spreadsheet processing options, and OCR output control.
+
+Every `server_config.toml` key is required and unknown keys are rejected: the server refuses to start rather than fall back to a hidden default.
 
 ### VLM model config (`server_config.toml`)
 
@@ -278,15 +290,14 @@ ignore_small_images = true        # true: dropped from the Markdown and `images`
 
 ### Spreadsheet processing (`server_config.toml`)
 
-Every `server_config.toml` key is required and unknown keys are rejected: the server refuses to start rather than fall back to a hidden default.
 
 | Setting | Shipped value | Applies to | Description |
 |---|---|---|---|
 | `table_output_format` | `"llm"` | all | `"llm"` compact or `"human"` aligned — also used for HTML tables from the OCR pipeline |
 | `excel_mask_cell_errors` | `true` | pandas | Mask error cells with an empty string, or label them (`#ref`, `#n/a`, …) |
-| `excel_max_output_ratio` | `5.0` | all | Size budget **per conversion section**, as a ratio of the input size. An oversized section is dropped with a note; HTTP 413 only when none survives |
+| `excel_max_output_ratio` | `7.0` | all | Size budget **per conversion section**, as a ratio of the input size. An oversized section is dropped with a note; HTTP 413 only when none survives |
 | `excel_pdf_fallback_enabled` | `true` | `auto` only | Fall back to PDF+OCR for empty or sparse spreadsheets |
-| `excel_min_input_for_fallback_mb` | `0.5` | `auto` only | Skip the sparse check below this input size |
+| `excel_min_input_for_fallback_mb` | `0.25` | `auto` only | Skip the sparse check below this input size |
 | `excel_min_output_ratio` | `0.01` | `auto` only | Below this output/input ratio the file is considered sparse (picture and chart bytes excluded from the input size). Overridable per request |
 | `excel_extract_images` | `true` | `auto`, `pandas`, `both` | Extract pictures and charts under each sheet's table. `false`: cell values only |
 | `excel_render_charts` | `true` | `auto`, `pandas`, `both` | Render charts to images with LibreOffice. `false`: text summary only |
@@ -302,8 +313,8 @@ Controls whether `<ocr>` tags (Paddle OCR text on images) appear in the final Ma
 | Setting | Shipped value | Description |
 |---|---|---|
 | `output_paddle_ocr` | `false` | When VLM image description **is** requested: keep `<ocr>` tags alongside `<figcaption>`. |
-| `output_paddle_ocr_no_img_desc` | `true` | When **no** VLM is requested: keep `<ocr>` tags. If `false`, the OCR-on-images pipeline step is skipped entirely (performance optimization). |
-| `add_pdf_page` | `false` | Start each page of a paginated document (PDF, office documents, multipage TIFF/WebP) with `<page number="n/n_max" />`. Spreadsheets and single images are never marked. |
+| `output_paddle_ocr_no_img_desc` | `false` | When **no** VLM is requested: keep `<ocr>` tags. If `false`, the OCR-on-images pipeline step is skipped entirely (performance optimization). |
+| `add_pdf_page` | `true` | Start each page of a paginated document (PDF, office documents, multipage TIFF/WebP) with `<page number="n/n_max" />`. Spreadsheets and single images are never marked. |
 
 When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and the image-block OCR step is skipped, reducing processing time.
 
@@ -312,13 +323,13 @@ When both OCR output and VLM are disabled, `<figcaption>` tags are omitted, and 
 ## ⚠️ Known limitations
 
 ### Images without text
-If an image-only document contains no text, the Paddle pipeline may produce sparse Markdown (without even referencing the image), causing the VLM description step to be skipped. This server is not recommended for pure image description use cases.
+When the pipeline finds no block at all (a photo, a drawing without text) and an image description is requested, the whole pages are sent to the VLM (documents up to `empty_document_vlm_max_pages` pages). Without a VLM, such a document answers 422.
 
 ### Embedded objects in spreadsheets
 The pandas conversion extracts cell content, pictures and charts. Text boxes, shapes, SmartArt, embedded OLE objects (Word, PDF, Visio…), cell comments and Excel 365 "place in cell" pictures are ignored. The `ocr` and `both` modes (and the `auto` fallback) render the sheets to PDF first, which does capture those visual elements, but with OCR fidelity rather than exact values. Excel 2016+ chart types (waterfall, treemap, sunburst…) get a best-effort summary and may not render. Charts written by tools that store no cached values (e.g. openpyxl) have unnamed series in their summary.
 
 ### OCR cost on large spreadsheets
-A dense spreadsheet renders to as many PDF pages as it needs, and each page goes through the model. A file with tens of thousands of rows can therefore occupy the single Paddle worker for a long time in `ocr` or `both` mode. Something to keep in mind before lowering `excel_min_output_ratio` or routing large files to a fixed OCR mode.
+A dense spreadsheet renders to as many PDF pages as it needs, and each page goes through the model. A file with tens of thousands of rows can therefore keep the Paddle workers busy for a long time in `ocr` or `both` mode. Something to keep in mind before lowering `excel_min_output_ratio` or routing large files to a fixed OCR mode.
 
 ### Upside-down images
 Extracted images may be rotated relative to the original document.
@@ -334,13 +345,15 @@ Office documents (excluding spreadsheets) are converted to PDF before OCR. This 
 
 | Module | Role |
 |---|---|
-| `main.py` | Application assembly only — lifespan (runtime dirs, semaphores, LibreOffice server, PaddleOCR pipeline + startup smoke test) and the router mount |
+| `main.py` | Application assembly only — lifespan (runtime dirs, semaphores, LibreOffice pool, PaddleOCR workers + startup smoke test), the upload budget middleware and the router mount |
+| `admission.py` | Upload budget (`max_inflight_upload_mb`: 503 + Retry-After beyond) and the open-files limit |
 | `api.py` | The HTTP surface. The six fixed-mode routes are generated by one closure factory rather than written out |
 | `processing.py` | `process_document()` — the conversion orchestration. Owns what the domain modules deliberately do not: mapping domain errors to HTTP status codes, and accounting *active* time |
 | `spreadsheet.py` | Cell extraction, figure blocks, header + table-of-contents assembly, and the pure decision rules (`resolve_strategy`, `is_sparse`) |
 | `spreadsheet_drawings.py` | Pictures and charts of a workbook: cheap survey (before the fallback decision), native `.xlsx` / `.ods` parsing, chart summaries, decoding |
-| `pipeline.py` | The PaddleOCR worker pool. Returns **one Markdown string per PDF page** |
-| `libreoffice.py` | Persistent UNO server, Office/spreadsheet → PDF, the per-sheet page counts, and chart / metafile rendering |
+| `pipeline.py` / `worker_pool.py` | PaddleOCR in `pipeline_workers` processes, documents split in page ranges spread over idle workers; crash → 503, timeout → 504. Returns **one Markdown string per page** |
+| `page_images.py` | Pages rendered for the pipeline (pypdfium2 + Pillow, pixel cap) |
+| `libreoffice.py` | Pool of `max_concurrent_libreoffice` instances (one conversion each, restarted after every use), Office/spreadsheet → PDF, the per-sheet page counts, chart / metafile rendering |
 | `postprocessing.py` / `table_utils.py` | Figure blocks, per-page helpers, HTML table simplification |
 | `external.py`, `vlm.py`, `utils.py`, `debug.py`, `settings.py`, `schemas.py`, `security.py` | Remote backends, VLM fan-out, MIME/size/archive helpers, failure artifacts, config, models, auth |
 
@@ -359,16 +372,14 @@ uv run pytest tests/live/ -v  # end-to-end, needs a running server (skipped othe
 `tests/live/` talks to an actual instance and is skipped automatically when none answers on `$FOIL_SERVE_URL` (default `http://127.0.0.1:8081`). It covers what the offline suite structurally cannot — chiefly that the sheet → page map LibreOffice reports lines up with the pages PaddleOCR returns. See `tests/README.md` for the full layout and for the fixture generator.
 
 ### Memory management & worker recycling
-PaddleOCR is not thread-safe and leaks GPU/CPU memory over time. The current workaround uses a `spawn`-based multiprocessing pool (`processes=1`) that recycles the worker process every N documents (`max_tasks_between_pipeline_reload` in `server_config.toml`). Each recycle takes a few seconds while the pipeline reloads.
-
-The root cause of the memory leak has not been fully identified — feel free to investigate 🔍
+PaddleOCR is not thread-safe: each pipeline runs in its own `spawn`ed worker process. A worker's RSS grows with the largest page range it processed (memory Paddle frees stays in glibc's arenas, no leak measured) and `pipeline_malloc_trim` gives it back after each task: ~2.3 GB per worker, flat. Recycling (`max_tasks_between_pipeline_reload`, `max_worker_rss_mb`) is only a safety net, staggered so that the service never stops. `pipeline_worker_vram_limit_mb` caps each worker's VRAM.
 
 ### Why vLLM for PaddleOCR-VL-1.5
 Running PaddleOCR-VL-1.5 natively proved problematic (*Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars*).
-The model is instead served via vLLM through an OpenAI-compatible endpoint. This also benefits from faster inference compared to the native Paddle runtime, and greatly reduces wasted time during [worker recycling](#memory-management--worker-recycling).
+The model is instead served via vLLM through an OpenAI-compatible endpoint. This also benefits from faster inference compared to the native Paddle runtime, and keeps the 0.9B model out of the worker processes.
 
 ### Debug artifact saving
-When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `failed_artifacts_dir` (default `/foil-log/failed`):
+When `save_failed_artifacts = true` in `server_config.toml`, any processing failure creates a timestamped subdirectory under `artifact_dir/failed_artifacts_subdir` (default `/var/log/foil/artifacts/failed`):
 
 ```
 <yy-mm-dd_hh-mm>_<mime-type>/
@@ -386,22 +397,63 @@ Additional artifact types can be enabled independently:
 - `save_cell_error_artifacts`: saves Markdown before/after error masking when cell errors are detected.
 
 ### LibreOffice UNO transport (Unix domain socket)
-The persistent LibreOffice server is reached over a UNO **pipe**, which on Linux is a Unix domain socket — **no TCP port is exposed**. The pipe name is unique per start and namespaced with `foil_soffice_`; the osl library creates the socket under `/tmp` (`OSL_PIPE_<euid>_foil_soffice_<pid>_<rnd>`). foil-serve does **not** hard-code that location: the real socket path is resolved from the kernel via `/proc/net/unix`, matched by the unique pipe name (see `_resolve_socket_path()` in `libreoffice.py`).
+Each LibreOffice instance is reached over a UNO **pipe**, which on Linux is a Unix domain socket — **no TCP port is exposed**. The pipe name is unique per start and namespaced with `foil_soffice_`; the osl library creates the socket under `/tmp` (`OSL_PIPE_<euid>_foil_soffice_<pid>_<rnd>`). foil-serve does **not** hard-code that location: the real socket path is resolved from the kernel via `/proc/net/unix`, matched by the unique pipe name (see `_resolve_socket_path()` in `libreoffice.py`).
 
 Deployment notes (relevant for non-root containers):
 - The app must be able to **write to `/tmp`** (the default `1777` permissions are fine) — that's where osl places the socket, and it ignores `$TMPDIR`.
-- The soffice server and the UNO client run under the **same UID** (same process tree), so the socket's owner-only write bit is sufficient — no cross-user access is involved.
+- soffice and the UNO client run under the **same UID** (same process tree), so the socket's owner-only write bit is sufficient — no cross-user access is involved.
 - Residual sockets left by a hard crash are cleaned up automatically at startup: within the resolved socket directory, any `foil_soffice_*` socket with no live listener is unlinked (a socket still accepting connections — e.g. another instance — is left untouched). See `_sweep_dead_pipes()` in `libreoffice.py`.
 
 ### Single uvicorn worker
-Foil Serve is not compatible with multiple uvicorn worker (because of the way we spawn and kill the LibreOffice server). 
-This should not be too hard to solve, but I don't expect uvicorn worker to be the bottleneck.
+Run foil with **one** uvicorn worker. The heavy work already runs outside the event loop (pipeline worker processes, LibreOffice instances, threads), so a second uvicorn worker adds no throughput; it would also start its own pipeline workers (VRAM ×2) and its own LibreOffice pool on the same profile directories (`lo_profile_<slot>`, whose stale processes are killed at start), and split the upload budget and the description cache. To scale, raise `pipeline_workers` and `max_concurrent_libreoffice`.
 
-The UNO pipe name is already unique per process. Making it multi-worker-safe would additionally require **namespacing each worker**:
-- a per-worker LibreOffice profile (`-env:UserInstallation=file://<per-worker dir>`) — otherwise LibreOffice's `SingleOfficeIPC` mechanism routes every worker to a single soffice instance;
-- a per-worker PID file (the current `soffice.pid` path is shared).
+### Architecture: from the upload to the Markdown
 
-If extra ressources are available and scaling is required, it would probably be better to try increasing the number of paddle pipeline.
+Each request is one coroutine in the API process; it hands the heavy work to pools of processes or threads and waits for them. A request only holds a worker while that worker is working for it.
+
+```
+client ── POST /v1/process
+  │
+  ├─ 1. admission          API process · RAM: the upload           max_inflight_upload_mb → 503 beyond
+  ├─ 2. type + size checks  thread · temp_dir on disk
+  │    ├─ external MIME ──► remote foil-compatible server           [[external_processors]].max_concurrent_requests
+  │    ├─ text ───────────► returned as is
+  │    └─ spreadsheet ────► 3. pandas: thread · CPU, RAM             max_concurrent_excel
+  │                            (pictures / charts: LibreOffice, 4.)
+  ├─ 4. LibreOffice         soffice processes · CPU, RAM            max_concurrent_libreoffice (FIFO queue)
+  │      office → PDF, spreadsheet → PDF, charts, EMF, .xls          libreoffice_conversion_timeout_s → 504
+  ├─ 5. pipeline            Paddle worker processes · CPU, RAM, VRAM pipeline_workers (fair queue)
+  │      document split in ranges of pipeline_chunk_pages pages      pipeline_task_timeout_s → 504
+  │      per range: render pages (CPU) → orientation + layout (GPU) → crops
+  │      └─ 6. PaddleOCR-VL vLLM   separate container · GPU          max_concurrency per worker (pipeline_config.yaml)
+  │                                                                  max_num_seqs, kv-cache-memory-bytes (vLLM)
+  ├─ 7. post-processing     threads · CPU (tables, OCR text)
+  ├─ 8. image descriptions  async calls to the VLM server             [[vlm_models]].max_concurrent_requests
+  │                         exact-match cache · RAM                  vlm_description_cache_mb
+  └─ 9. Markdown + images   API process · RAM (base64 images)  ──► JSON or tar.zst
+```
+
+A client that disconnects cancels its request at whatever stage it is in (499): it leaves the queues, its LibreOffice conversion is killed, no further page range starts.
+
+| Stage | Runs in | Uses | Unit cost (measured, RTX 3070) | Becomes the bottleneck when |
+|---|---|---|---|---|
+| 1. Admission | API event loop | RAM | the size of each upload in progress | uploads pile up faster than they are processed: 503 |
+| 3. pandas | thread | CPU, RAM | not measured: grows with the sheets | many big spreadsheets at once |
+| 4. LibreOffice | `max_concurrent_libreoffice` soffice processes, restarted after each use (~1 s) | ~1 CPU core each, RAM | 0.1-0.35 GB, up to ~2 GB on a heavy docx; seconds to 20 min | long conversions occupy every instance: the others wait in the queue |
+| 5. Pipeline worker | `pipeline_workers` processes, one page range each at a time | CPU (rendering), VRAM (layout models), RAM | VRAM 0.8 GB (layout batch 1) to 2.5 GB (batch 4); RAM ~2.3 GB, peak ~2.6 GB | too few workers to keep vLLM busy (`num_requests_running` well below `max_num_seqs`) |
+| 6. PaddleOCR-VL vLLM | its own container | GPU compute, VRAM | ~2 GB + KV 18.4 KB/token; 0.5-2k tokens per crop | usually: requests waiting in vLLM, GPU at 100 % |
+| 8. VLM | the VLM server (local or remote) | its GPU | Ministral-3-3B: 3.4 GB + 107 KB/token; 0.7-2.7k tokens per description | descriptions requested on figure-heavy documents |
+
+Where a request waits: the LibreOffice queue (FIFO), the pipeline queue (an idle worker is taken at once; with several documents the workers go round-robin between them), vLLM's queue (FIFO), and the VLM semaphore. `active_conversion_time_no_img_desc` excludes these waits, `wall_clock_time` includes them.
+
+**Setting the concurrency parameters**
+
+1. **VRAM** = PaddleOCR-VL vLLM (base + KV) + `pipeline_workers` × worker VRAM (+ the VLM if it shares the GPU). Cap each worker with `pipeline_worker_vram_limit_mb`, a bit above its layout batch's need. Small layout batches cost little speed: prefer more workers.
+2. **Workers vs vLLM**: on a 3070, 3 workers keep a 10-sequence vLLM busy (1.36 pages/s, a 4th adds nothing). On a faster GPU, scale both by its speed. Then keep `pipeline_workers` × `max_concurrency` ≈ 3 × `max_num_seqs`, and the KV ≥ `max_num_seqs` × ~3k tokens.
+3. **LibreOffice**: about half the workers (at least 3), more if long conversions are common. RAM ≈ instances × 2 GB in the worst case.
+4. **VLM**: `max_concurrent_requests` = the parallel sequences of the VLM server.
+5. **Host RAM** ≈ `pipeline_workers` × 2.6 GB + LibreOffice instances × 2 GB + vLLM (~3-6 GB) + `max_inflight_upload_mb` + ~2 GB for the API.
+6. Check under load with vLLM's `/metrics` and the table at the end of `pipeline_config.yaml`.
 
 
 ---

@@ -1,21 +1,20 @@
-
 pipeline_name: PaddleOCR-VL-1.5
 
-batch_size: 12  # adapt to vram
+batch_size: 12  # pages per input batch
 
-use_queues: True  # keep for async processing
+use_queues: True  # input / layout / VLM stages run in parallel
 
 
-use_ocr_for_image_block: True  # Adds basic OCR in addition to images
+use_ocr_for_image_block: True  # OCR text of figures (VLM context, <ocr>)
 
 use_doc_preprocessor: True
 use_layout_detection: True
-use_chart_recognition: False  # keep False: paddle analysis is not perfect, and prevents image extraction (so no img descr by vlm)
+use_chart_recognition: False  # keep False: True replaces chart images by Paddle's (imperfect) table, no VLM description
 use_seal_recognition: False
 format_block_content: False
-merge_layout_blocks: True  # seems to merge header, footer without text duplication
+merge_layout_blocks: True  # merges split blocks (headers, footers) without duplicated text
 markdown_ignore_labels:
-  - number  # page number (presumably)
+  - number  # page numbers
 #  - footnote
 #  - header
 #  - header_image
@@ -28,11 +27,38 @@ SubModules:
     module_name: layout_detection
     model_name: PP-DocLayoutV3
     model_dir: null
-    batch_size: 8
+    batch_size: 4  # ~2.5 GB VRAM per worker (sizing guide)
     threshold: 0.3
     layout_nms: True
-    layout_unclip_ratio: [1.0, 1.0] 
-    layout_merge_bboxes_mode: 
+    # Box enlargement [x, y] per class: +2 %, charts and images +5 % / +30 % (axes, legends)
+    layout_unclip_ratio: {
+      0: [ 1.02, 1.02 ],  # abstract
+      1: [ 1.02, 1.02 ],  # algorithm (code)
+      2: [ 1.02, 1.02 ],  # aside_text (margin text)
+      3: [ 1.05, 1.30 ],  # chart
+      4: [ 1.02, 1.02 ],  # content (table of contents)
+      5: [ 1.02, 1.02 ],  # display_formula
+      6: [ 1.02, 1.02 ],  # doc_title
+      7: [ 1.02, 1.02 ],  # figure_title (caption)
+      8: [ 1.02, 1.02 ],  # footer (text)
+      9: [ 1.02, 1.02 ],  # footer (image)
+      10: [ 1.02, 1.02 ], # footnote
+      11: [ 1.02, 1.02 ], # formula_number
+      12: [ 1.02, 1.02 ], # header (text)
+      13: [ 1.02, 1.02 ], # header (image)
+      14: [ 1.05, 1.30 ], # image (pictures, photos)
+      15: [ 1.02, 1.02 ], # inline_formula
+      16: [ 1.02, 1.02 ], # number (page number)
+      17: [ 1.02, 1.02 ], # paragraph_title
+      18: [ 1.02, 1.02 ], # reference (bibliography title)
+      19: [ 1.02, 1.02 ], # reference_content
+      20: [ 1.02, 1.02 ], # seal
+      21: [ 1.02, 1.02 ], # table
+      22: [ 1.02, 1.02 ], # text (body)
+      23: [ 1.02, 1.02 ], # text (secondary)
+      24: [ 1.02, 1.02 ]  # vision_footnote
+    }
+    layout_merge_bboxes_mode:
       0: "union" # abstract
       1: "union" # algorithm
       2: "union" # aside_text
@@ -62,20 +88,18 @@ SubModules:
     module_name: vl_recognition
     model_name: PaddleOCR-VL-1.5-0.9B
     model_dir: null
-    batch_size: 4096
+    batch_size: 4096  # max crops per VLM wave
     genai_config:
-#      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
       backend: vllm-server
-      max_concurrency: 256 # added to mitigate `RuntimeError: Exception from the 'vlm' worker: Error code: 400 - {'error': {'message': 'Already borrowed', 'type': 'BadRequestError', 'param': None, 'code': 400}}`
-      server_url: http://localhost:8000/v1  # on localhost
-#      server_url: http://paddle_vllm-PaddleOCR-VL-1.5:8000/v1  # if vlm in docker
+      max_concurrency: 30  # VLM requests in flight per worker: pipeline_workers x this ≈ 3 x max_num_seqs
+      server_url: http://localhost:8000/v1  # local development (uv run)
 
 SubPipelines:
   DocPreprocessor:
     pipeline_name: doc_preprocessor
     batch_size: 8
     use_doc_orientation_classify: True
-    use_doc_unwarping: False  # default = True (but distorts too much and crops images)
+    use_doc_unwarping: False  # True distorts pages and crops images
     SubModules:
       DocOrientationClassify:
         module_name: doc_text_orientation
@@ -89,121 +113,22 @@ SubPipelines:
 
 
 # =====================================================================================
-# TUNING GUIDE — who controls what (concurrency, parallelism, batching)
+# SIZING GUIDE (measured on an RTX 3070 with 0.1.7; recipes: docker/<gpu>/)
 # =====================================================================================
-# Read from the PaddleX 3.4.2 source (paddlex/inference/pipelines/paddleocr_vl/pipeline.py,
-# models/common/genai.py) and measured on an RTX 3070 (8 GB) with foil's bench.
-#
-# ── Dependency tree: one HTTP request down to the GPU ────────────────────────────────
-#
-#  foil API (any number of concurrent requests; LibreOffice / Excel have their own semaphores)
-#  └── pipeline_workers = W             [server_config.toml]
-#      W processes, ONE document each at a time; other requests wait for a free worker.
-#      Each worker holds its own copy of the orientation + layout models in VRAM.
-#      └── one document = one predict() call; with use_queues: True it runs 3 threads:
-#          │
-#          ├── [input]  rasterizes the pages, `batch_size` pages at a time (top level, 12)
-#          │            → queue of up to 64 batches (it can run far ahead: RAM, not VRAM)
-#          │
-#          ├── [cv]     takes each input batch and splits it into sub-batches of
-#          │            SubModules.LayoutDetection.batch_size pages (8):
-#          │              DocPreprocessor (orientation, its own batch_size 8)
-#          │              → LayoutDetection (PP-DocLayoutV3, batch 8)  ← VRAM peak of a worker
-#          │              → crops of every block → queue
-#          │
-#          └── [vlm]    WAVES: collects the cv output for up to 0.5 s, or until
-#                       SubModules.VLRecognition.batch_size crops (4096: in practice the
-#                       0.5 s window decides), groups the crops by resolution setting, and
-#                       for each group sends ALL its crops to vLLM at once, at most
-#                       genai_config.max_concurrency in flight (a semaphore per worker,
-#                       overridden by `pipeline_vlm_max_concurrency` in server_config.toml),
-#                       then WAITS FOR THE LAST ANSWER before starting the next wave.
-#                       └── vLLM (shared by all workers, separate container)
-#                           max_num_seqs: requests decoded together; the others wait FIFO
-#                           max-num-batched-tokens: tokens per engine step (prefill)
-#                           gpu-memory-utilization / kv-cache: VRAM for the KV cache
-#
-#  Requests in flight in vLLM ≈ min( W × max_concurrency, crops of the current waves )
-#  Requests vLLM actually runs  = min( that, max_num_seqs ); the rest queue, in FIFO order.
-#
-# ── What each knob costs ─────────────────────────────────────────────────────────────
-#
-#  knob                                  | acts on                      | costs
-#  --------------------------------------|------------------------------|---------------------------
-#  pipeline_workers (W)                  | documents in parallel        | VRAM ×W (~1.2 GB idle each,
-#                                        |                              | more under load), RAM ×W
-#  batch_size (top level, 12)            | pages rasterized per batch   | RAM (page images)
-#                                        | (with use_queues: False, the |
-#                                        |  WHOLE batch goes through the|
-#                                        |  layout at once: VRAM)       |
-#  LayoutDetection.batch_size (8)        | pages per layout inference   | VRAM peak of a worker
-#  DocPreprocessor batch_size (8, ×2)    | pages per orientation pass   | VRAM (small model)
-#  VLRecognition.batch_size (4096)       | max crops per VLM wave       | lower = more, smaller waves
-#                                        |                              | = more waiting at barriers
-#  genai_config.max_concurrency (256)    | VLM requests in flight, per  | none on its own, but see
-#   / pipeline_vlm_max_concurrency       | worker                       | "head-of-line" below
-#  use_queues (True)                     | input / cv / vlm overlap     | False = fully sequential
-#  vLLM max_num_seqs                     | crops decoded together       | VRAM (activations, KV)
-#  vLLM gpu-memory-utilization           | KV cache size                | VRAM taken from the workers
-#
-# ── Where the time goes (RTX 3070, 1 worker) ─────────────────────────────────────────
-#  The workers spend ~80 % of their time waiting for vLLM; orientation + layout are
-#  ~10 %, rasterization a few %. vLLM is the bottleneck: tune it first. With 1 worker,
-#  vLLM still sits idle ~30 % of the time (between documents and at the wave barriers):
-#  that idle time is what extra workers can recover, if VRAM allows.
-#
-# ── Tuning recipe ────────────────────────────────────────────────────────────────────
-#  1. vLLM first. Watch vllm:num_requests_running / _waiting and the KV cache usage
-#     (http://<vllm>/metrics). Raise max_num_seqs only if `running` is stuck at the
-#     limit while the GPU is not saturated (on the 3070 with ONE worker, 10 → 24 gave
-#     nothing: one worker could not keep vLLM busy. Not re-measured with 3-4 workers,
-#     where vLLM ran ~9 of its 10 sequences with requests waiting).
-#  2. Workers next, while vLLM is often idle (`running` = 0) and VRAM allows it (see 4).
-#     A worker only helps when there are at least as many concurrent requests as workers.
-#     Measured on the 3070 (layout batch 1, 900 MB cap, vLLM 10 sequences, 4 or 10
-#     concurrent requests, documents of 1-24 pages): 1 worker 0.84 pages/s, 2 workers
-#     1.09, 3 workers 1.16-1.18, 4 workers 1.14-1.21 (vLLM idle 21 % → 1-3 % of the time).
-#     Differences under ~8 % are run-to-run noise.
-#  3. With W >= 2, ALWAYS cap the per-worker VLM concurrency, at about
-#        pipeline_vlm_max_concurrency ≈ max_num_seqs × vLLM replicas   (not divided by W)
-#     - Uncapped (256), a worker sending a big document's crops fills vLLM's FIFO queue
-#       and the other workers' documents wait behind them ("head-of-line blocking").
-#       Measured, 2 workers, 4 concurrent requests: 0.70 → 0.99 pages/s, p95 96 → 53 s.
-#       Very high values also trigger vLLM "Already borrowed" errors.
-#     - Below max_num_seqs, a document processed alone gets fewer crops in flight,
-#       whatever the number of workers (3070, 10 sequences: cap 3 → 0.62 pages/s,
-#       5 → 0.75, 10 → 0.84, the same as 1 uncapped worker). Under load the cap barely
-#       matters as long as W × cap >= max_num_seqs (2 workers × 3 = 6 < 10: 0.92 pages/s
-#       instead of 1.09).
-#     - 4 workers × 10 on a 10-sequence vLLM (~16 requests waiting in vLLM): 1-3 page
-#       documents still took ~4 s with 4 concurrent requests. Not tested with a
-#       100-page document in the mix.
-#  4. VRAM per worker is set by LayoutDetection.batch_size (set the two DocPreprocessor
-#     batch sizes to the same value). Measured peak of one worker process, CUDA context
-#     included (Paddle allocator peak in brackets), on documents up to 100 pages:
-#        batch 8 → 4.3 GB (4.2)   batch 4 → 2.5 GB (2.0)
-#        batch 2 → 1.4 GB (1.1)   batch 1 → 0.8 GB (0.6)
-#     Speed barely changes (layout is ~10 % of the time): 1 worker, batch 2 vs 8 →
-#     0.81-0.83 vs 0.84-0.88 pages/s. Paddle's allocator grows into whatever VRAM is free
-#     unless capped with `pipeline_worker_vram_limit_mb` (server_config.toml): set the cap
-#     a bit above the allocator peak of your batch size (batch 2 → 1500, batch 1 → 900
-#     ran 0 errors), never below it (batch 8 with a 2.2 GB cap: multi-page documents
-#     failed with out of memory).
-#     RTX 3070 (8 GB, vLLM ~3.5 GB): batch 8 fits 1 worker; batch 1 with a 900 MB cap
-#     fits 4 (GPU peak 4.6 / 5.5 / 6.3 / 7.1 GB with 1 / 2 / 3 / 4 workers, 0 errors).
-#     A smaller batch does not make a worker faster; it is what lets more workers fit,
-#     and that is where the speed comes from (step 2).
-#  5. RAM per worker grows with the document length: predict() returns every page at
-#     once and the input thread may rasterize up to 64 batches ahead. Measured peak:
-#     ~3.5 GB for a 100-page PDF (back to ~2.1 GB after `pipeline_malloc_trim`).
-#
-# ── Quick reference: symptom → knob ──────────────────────────────────────────────────
-#  vLLM `waiting` high, GPU < 80 %          → raise max_num_seqs (if KV cache allows)
-#  vLLM `waiting` high, GPU saturated       → bigger GPU / more vLLM replicas, not knobs
-#  vLLM often idle, VRAM free               → one more worker (+ cap the VLM concurrency)
-#  small documents slow behind big ones     → cap pipeline_vlm_max_concurrency (≈ max_num_seqs)
-#  a lone document slow, W >= 2             → raise pipeline_vlm_max_concurrency (≈ max_num_seqs)
-#  worker out of memory (Paddle)            → lower LayoutDetection.batch_size, or raise
-#                                             pipeline_worker_vram_limit_mb
-#  worker RSS high after big documents      → pipeline_malloc_trim = true
-#  vLLM 400 "Already borrowed"              → lower max_concurrency (it is retried 3×)
+# Unit costs
+#   pipeline worker    VRAM: layout batch 1 → 0.8 GB, 2 → 1.4, 4 → 2.5, 8 → 4.3; about the
+#                      same speed at any batch: small batches, more workers.
+#                      RAM ~2.3 GB, peak ~2.6 GB with 20-page ranges.
+#   PaddleOCR-VL vLLM  ~2 GB + KV 18.4 KB/token; a crop = 0.5-2k tokens (5.4k at most).
+#   Ministral-3-3B     vLLM AWQ: 3.4 GB + KV 107 KB/token; a description = 0.7-2.7k tokens.
+#   LibreOffice        RAM 0.1-0.35 GB, up to ~2 GB on heavy documents; no VRAM.
+# Balance: on a 3070, 3 workers keep a 10-sequence vLLM busy (1.36 pages/s, a 4th adds
+# nothing). Faster GPU: scale workers AND max_num_seqs by its speed (~3x RTX 4090, ~4-5x
+# A100, ~8x H100); keep pipeline_workers x max_concurrency ≈ 3 x max_num_seqs.
+# Under load (vLLM /metrics, nvidia-smi):
+#   running < max_num_seqs, waiting ≈ 0       → add workers
+#   running = max_num_seqs, waiting > 0       → raise max_num_seqs (and the KV)
+#   kv_cache_usage_perc ≈ 100 %, preemptions  → raise kv-cache-memory-bytes
+#   GPU at 100 %                              → the GPU is full, no setting helps
+#   worker out of memory (HTTP 500)           → raise pipeline_worker_vram_limit_mb
+#   vLLM 400 "Already borrowed"               → lower max_concurrency

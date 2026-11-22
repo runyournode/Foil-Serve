@@ -115,7 +115,6 @@ def _peak_rss_mb() -> float | None:
 
 def _init_worker(
     config_path: str,
-    vlm_max_concurrency: int,
     malloc_trim: bool,
     vram_limit_mb: int,
     log_queue: "multiprocessing.queues.Queue",
@@ -142,11 +141,6 @@ def _init_worker(
     from paddlex.inference import load_pipeline_config
 
     config: dict[str, Any] = load_pipeline_config(config_path)
-    if vlm_max_concurrency > 0:
-        # Per-worker cap on in-flight VLM requests: N workers x this value is what
-        # vLLM receives at most, so it should stay close to vLLM's max_num_seqs.
-        genai = config["SubModules"]["VLRecognition"]["genai_config"]
-        genai["max_concurrency"] = vlm_max_concurrency
     _worker_pipeline = PaddleOCRVL(paddlex_config=config)
     logger.info(
         f"[WORKER: pid={os.getpid()}] Pipeline initialized "
@@ -313,14 +307,14 @@ class PaddlePipelineWrapper:
     Chosen solution
     ---------------
     `WorkerPool` (worker_pool.py): one pipeline per process, never shared — N
-    processes run N documents at once. Each worker is recycled after
+    processes run N page ranges at once. Each worker is recycled after
     `max_tasks_between_pipeline_reload` documents or once its RSS reaches
     `max_worker_rss_mb`, never all at the same time; a worker that dies or exceeds
     `pipeline_task_timeout_s` fails its request with 503/504 and is replaced.
 
     The VLM stage is served by vLLM: the worker only runs the layout / orientation
-    models and sends the crops to vLLM (at most `pipeline_vlm_max_concurrency`
-    requests in flight per worker).
+    models and sends the crops to vLLM (at most `genai_config.max_concurrency` of
+    pipeline_config.yaml in flight per worker).
     """
 
     def __init__(self, config_path: str) -> None:
@@ -335,7 +329,6 @@ class PaddlePipelineWrapper:
             _init_worker,
             (
                 config_path,
-                settings.pipeline_vlm_max_concurrency,
                 settings.pipeline_malloc_trim,
                 settings.pipeline_worker_vram_limit_mb,
                 self._log_queue,

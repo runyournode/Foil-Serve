@@ -1,0 +1,205 @@
+# -------------------------------------------------------------------
+# Logging & artifacts (the directory must exist and be writable; no cleanup)
+# -------------------------------------------------------------------
+log_level = "INFO"          # DEBUG | INFO | WARNING | ERROR
+libs_log_level = "WARNING"  # third-party libraries (httpx, openai, ...)
+log_file = "/var/log/foil/foil.log"  # "" = no log file
+log_max_mb = 50             # rotate log_file at this size (0 = never)
+log_backup_count = 5        # rotated files kept
+
+artifact_dir = "/var/log/foil/artifacts"
+save_failed_artifacts = true             # input + debug info of failed requests
+failed_artifacts_subdir = "failed"
+save_table_conversion_artifacts = false  # spreadsheet + PDF when a sparse sheet falls back to OCR
+table_conversion_artifacts_subdir = "xls2pdf"
+save_cell_error_artifacts = false        # spreadsheets with error cells (#REF!, #N/A, ...)
+cell_error_artifacts_subdir = "cell_errors"
+
+# Every setting below is required.
+
+# -------------------------------------------------------------------
+# Security & limits
+# -------------------------------------------------------------------
+requires_auth = true  # false: app_api_keys ignored
+app_api_keys = [
+    "changeme",
+]
+
+# Check every enabled [[vlm_models]] at startup (startup fails if one is unreachable)
+check_vlm_endpoints = false  # VLM on another server
+
+max_file_size_mb = 250          # any file, checked before writing to disk
+max_pdf_file_size_mb = 250      # per-type limits, after MIME detection
+max_image_file_size_mb = 50
+max_office_file_size_mb = 250
+max_excel_file_size_mb = 50     # .xlsx: compressed and real decompressed size
+max_unzip_size_mb = 2048        # decompressed size of ZIP-based files (zip bomb guard)
+
+# Total upload size (MB) of the requests in progress; beyond: HTTP 503 + Retry-After.
+# Bounds the waiting queue and its RAM: size it from the RAM left. 0 = no limit.
+max_inflight_upload_mb = 4096
+
+# -------------------------------------------------------------------
+# Spreadsheets (.xls / .xlsx / .ods)
+# -------------------------------------------------------------------
+# Mode per request (`spreadsheet_mode` or a /v1/process/spreadsheet_* route): auto (default:
+# pandas, PDF+OCR fallback when empty or sparse), pandas, ocr, both.
+table_output_format = "llm"     # "llm" compact | "human" aligned (every Markdown table)
+excel_mask_cell_errors = true   # error cells → "" (true) or a short label (false)
+excel_max_output_ratio = 7.0    # max Markdown per section, x input size (beyond: section dropped)
+
+# auto mode only
+excel_pdf_fallback_enabled = true       # PDF+OCR fallback for empty or sparse spreadsheets
+excel_min_input_for_fallback_mb = 0.25  # no sparse check below this size
+excel_min_output_ratio = 0.01           # sparse: Markdown < this x input (per-request override)
+
+# Pictures and charts (auto, pandas, both)
+excel_extract_images = true       # listed under each sheet, described by the VLM on request
+excel_render_charts = true        # charts → PNG by LibreOffice (false: text summary only)
+excel_rasterize_metafiles = true  # EMF/WMF by LibreOffice (false: skipped)
+excel_max_images = 200            # distinct images per document
+
+# PDF rendering (ocr, both, auto fallback)
+excel_pdf_paper_format = "A3"     # A2 | A3 | A4 | Letter | Legal | Tabloid
+excel_pdf_landscape = true
+
+# -------------------------------------------------------------------
+# Output
+# -------------------------------------------------------------------
+output_paddle_ocr = false              # keep <ocr> next to the VLM <figcaption>
+output_paddle_ocr_no_img_desc = false  # keep <ocr> without VLM (false also skips OCR in images)
+add_pdf_page = true                    # <page number="n/N" /> before each page (not spreadsheets)
+small_image_threshold = [64, 64]       # width OR height below: small image, never described
+ignore_small_images = true             # drop small images (false: bare <img>)
+# No block found in a document + image description requested: its whole pages go to
+# the VLM, for documents up to this many pages (0 = HTTP 422).
+empty_document_vlm_max_pages = 5
+# Descriptions reused across documents, byte-identical VLM requests only (MB, 0 = off).
+# A hit answers at once: a client can tell an exact image was already sent by another.
+vlm_description_cache_mb = 200
+temp_dir = "/tmp/foil-runtime"         # per-request temp files ("/dev/shm" = in RAM)
+
+# -------------------------------------------------------------------
+# Resources (sizing guide and measured costs: end of pipeline_config.yaml)
+# -------------------------------------------------------------------
+# Pipeline worker processes: one page range at a time, own copy of the layout models
+pipeline_workers = 10  # bound by the 20 GB of VRAM; not measured
+# VRAM cap per worker (MB, 0 = none), a bit above the layout batch's need:
+# batch 1 → 900, 2 → 1500, 4 → 3000. Too low: HTTP 500 (out of memory).
+pipeline_worker_vram_limit_mb = 900  # layout batch 1
+# VLM requests in flight per worker: genai_config.max_concurrency in pipeline_config.yaml
+pipeline_chunk_pages = 20          # pages per worker task (0 = whole document)
+pipeline_max_page_megapixels = 16  # bigger pages are downscaled (0 = no cap)
+pipeline_task_timeout_s = 600      # per page range: worker killed, HTTP 504 (0 = none)
+pipeline_malloc_trim = true        # give freed memory back to the OS after each task
+# Worker recycling, a safety net (no leak measured; 0 = never)
+max_tasks_between_pipeline_reload = 0
+max_worker_rss_mb = 5000           # RSS after a task is ~2.3 GB
+
+# LibreOffice instances: one conversion each, restarted after every use.
+# RAM up to ~2 GB each on heavy documents.
+max_concurrent_libreoffice = 5
+libreoffice_conversion_timeout_s = 2700  # HTTP 504 beyond (0 = none)
+max_concurrent_excel = 10
+
+
+# -------------------------------------------------------------------
+# VLM models for image descriptions (image_description_model_name = name)
+# -------------------------------------------------------------------
+# url: OpenAI-compatible endpoint; endpoint_name: model served there; endpoint_api_key:
+# any non-empty string without auth; max_concurrent_requests ≈ parallel sequences of the
+# server; max_input_ocr_length: OCR chars put in the prompt; prompt: a [prompts] key or a
+# text; extra_body: sent as is (e.g. {chat_template_kwargs = {enable_thinking = false}}).
+
+[[vlm_models]]
+enabled = true
+max_concurrent_requests = 10
+name = "qwen3.8-27b"
+temperature = 0.0
+max_output_tokens = 10_000
+max_input_ocr_length = 700
+url = "http://qwen-server.example:9080/v1"  # EDIT: the server running Qwen
+endpoint_name = "Qwen/Qwen3.8-27B-FP8"  # EDIT: the model name it serves
+endpoint_api_key = "none"
+prompt = "default"
+extra_body.reasoning_effort = "none"
+extra_body.chat_template_kwargs.enable_thinking = false
+
+
+# -------------------------------------------------------------------
+# External processors: MIME types delegated to a foil-compatible server (e.g. video)
+# -------------------------------------------------------------------
+# One enabled processor per MIME type (it overrides native support). health_route "" =
+# none (then check_on_startup = false); endpoint_api_key "" = no auth header. Retries on
+# timeouts / HTTP 5xx only, retry_backoff_s doubling each time.
+
+[[external_processors]]
+enabled = false
+name = "video"
+url = "http://localhost:8090"
+process_route = "/v1/process"
+health_route = "/health"
+endpoint_api_key = "changeme"
+mime_types = [
+    "video/mp4",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/webm",
+    "video/x-msvideo",
+    "video/mpeg",
+]
+max_concurrent_requests = 2
+timeout_s = 600.0
+max_retries = 2
+retry_backoff_s = 1.0
+max_file_size_mb = 500
+check_on_startup = false
+
+
+# -------------------------------------------------------------------
+# Prompt definition for image description                           -
+# -------------------------------------------------------------------
+
+[prompts]
+
+default = """
+You are a document analysis expert who specializes in creating text descriptions for images.
+You will receive an image of a picture or figure.  Your job will be to create a short description of the image.
+
+**Instructions:**
+1. Carefully examine the provided image and the provided extracted text.
+2. The extracted text may contain OCR errors, hallucinations, or be entirely irrelevant. Cross-reference it with the visual information. Priority Rule: If there is a conflict between the extracted text and what you visually perceive in the image, prioritize your own visual understanding.
+3. Output a faithful description of the image.  Make sure there is enough specific detail to accurately reconstruct the image.  If the image is a figure or contains numeric data, include the numeric data in the output.
+
+**Strict Instructions:**
+1. **Style Neutrality:** Do not describe colors, font styles (modern, bold), or artistic layouts unless they convey specific data.
+2. **Logos & Simple Text:** If the image is a logo or just stylized text, output ONLY the name of the entity or the exact text found. Do not describe the shapes or colors.
+3. **Data Integrity:** If the image is a chart or table, extract the numeric data and titles.
+4. **No Fluff:** Avoid introductory phrases like "The image depicts" or "In this graphic". Start directly with the description.
+
+
+**Example 1 (Logo with Erroneous OCR):**
+Input:
+```text
+D4SSAULT
+AVIATION
+```
+Output:
+Logo of DASSAULT AVIATION.
+
+**Example 2 (Chart):**
+Input:
+```text
+"Fruit Preference Survey"
+20, 15, 10
+Apples, Bananas, Oranges
+```
+Output:
+A bar chart titled "Fruit Preference Survey" is showing the number of people who prefer different types of fruits.  The x-axis shows the types of fruits, and the y-axis shows the number of people.  The bar chart shows that most people prefer apples, followed by bananas and oranges.  20 people prefer apples, 15 people prefer bananas, and 10 people prefer oranges.
+**Input:**
+```text
+{raw_text}
+```
+"""
+
+another_prompt = "You can define as many prompt as you like. (do not use this one for image descripton :-))"

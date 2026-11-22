@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     pipeline_workers: int = Field(ge=1)
     max_worker_rss_mb: int = Field(ge=0)
     pipeline_task_timeout_s: int = Field(ge=0)
-    pipeline_vlm_max_concurrency: int = Field(ge=0)
     pipeline_malloc_trim: bool
     pipeline_worker_vram_limit_mb: int = Field(ge=0)
     pipeline_chunk_pages: int = Field(ge=0)

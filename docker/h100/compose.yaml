@@ -1,0 +1,68 @@
+# H100 with 20 GB available, image descriptions on another server (Qwen).
+# Not measured (from the 3070): vLLM ~7 GB + 10 workers x 1.1 GB ≈ 18 GB; host RAM ~45 GB.
+# The VRAM limits here: with more of it, add workers first.
+# VLM url: [[vlm_models]] in mount_config/foil_serve/server_config.toml.
+#   cd docker/h100 && docker compose up -d --wait   → http://localhost:8081/docs
+
+services:
+  foil_app:
+    image: ghcr.io/runyournode/foil-serve:0.1.7-offline
+    container_name: foil_app
+    gpus: all
+    ipc: host
+    init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
+    # File descriptors: foil raises its soft limit to min(hard limit, 65536) at startup.
+    # Deliberately large; the waiting queue (before HTTP 503) is bounded by
+    # max_inflight_upload_mb in server_config.toml, not by this limit.
+    expose:
+      - "8080"
+    ports:
+      - "8081:8080"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - APP_PORT=8080 # must match CMD if you override (default: 8080)
+    volumes:
+      - ./mount_config/foil_serve/server_config.toml:/app/config/server_config.toml:Z,ro
+      - ./mount_config/foil_serve/pipeline_config.yaml:/app/config/pipeline_config.yaml:Z,ro
+      # [optional] logs + artifacts (log file, failed/, xls2pdf/, cell_errors/)
+      - ./mount_runtime/foil_serve/logs:/var/log/foil:Z
+    restart: unless-stopped
+    depends_on:
+      foil_vllm-PaddleOCR-VL-1.5:
+        condition: service_healthy
+
+
+  # Hard Req : PaddleOCR-VL-1.5 served by vllm
+  foil_vllm-PaddleOCR-VL-1.5:
+    image: docker.io/vllm/vllm-openai:v0.33.0
+    container_name: foil_vllm-PaddleOCR-VL-1.5
+    gpus: all
+    ipc: host
+    expose:
+      - "8000"
+    networks:
+      - foil-net
+    environment:
+      - HF_HUB_OFFLINE=1
+      - PORT=8000  # must match CMD
+    volumes:
+      - ./mount_config/vllm/PaddlePaddleOCR-VL-1.5.yaml:/config/config.yaml:Z,ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface:z
+      - ${HOME}/.cache/vllm:/root/.cache/vllm:z
+    command: ["--port", "8000", "--config", "/config/config.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request, os; port = os.getenv('PORT'); urllib.request.urlopen(f'http://localhost:{port}/health')"
+      ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+networks:
+  foil-net:
+    driver: bridge

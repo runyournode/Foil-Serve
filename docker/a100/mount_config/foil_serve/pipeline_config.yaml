@@ -1,21 +1,20 @@
-
 pipeline_name: PaddleOCR-VL-1.5
 
-batch_size: 12
+batch_size: 12  # pages per input batch
 
-use_queues: True  # keep for async processing
+use_queues: True  # input / layout / VLM stages run in parallel
 
 
-use_ocr_for_image_block: True  # Adds basic OCR in addition to images
+use_ocr_for_image_block: True  # OCR text of figures (VLM context, <ocr>)
 
 use_doc_preprocessor: True
 use_layout_detection: True
-use_chart_recognition: False  # keep False: paddle analysis is not perfect, and prevents image extraction (so no img descr by vlm)
+use_chart_recognition: False  # keep False: True replaces chart images by Paddle's (imperfect) table, no VLM description
 use_seal_recognition: False
 format_block_content: False
-merge_layout_blocks: True  # seems to merge header, footer without text duplication
+merge_layout_blocks: True  # merges split blocks (headers, footers) without duplicated text
 markdown_ignore_labels:
-  - number  # page number (presumably)
+  - number  # page numbers
 #  - footnote
 #  - header
 #  - header_image
@@ -28,10 +27,37 @@ SubModules:
     module_name: layout_detection
     model_name: PP-DocLayoutV3
     model_dir: null
-    batch_size: 4  # ~2.5 GB VRAM per worker (8 → 4.3 GB): more workers fit, speed per worker nearly unchanged
+    batch_size: 2  # ~1.4 GB VRAM per worker (sizing guide)
     threshold: 0.3
     layout_nms: True
-    layout_unclip_ratio: [1.0, 1.0]
+    # Box enlargement [x, y] per class: +2 %, charts and images +5 % / +30 % (axes, legends)
+    layout_unclip_ratio: {
+      0: [ 1.02, 1.02 ],  # abstract
+      1: [ 1.02, 1.02 ],  # algorithm (code)
+      2: [ 1.02, 1.02 ],  # aside_text (margin text)
+      3: [ 1.05, 1.30 ],  # chart
+      4: [ 1.02, 1.02 ],  # content (table of contents)
+      5: [ 1.02, 1.02 ],  # display_formula
+      6: [ 1.02, 1.02 ],  # doc_title
+      7: [ 1.02, 1.02 ],  # figure_title (caption)
+      8: [ 1.02, 1.02 ],  # footer (text)
+      9: [ 1.02, 1.02 ],  # footer (image)
+      10: [ 1.02, 1.02 ], # footnote
+      11: [ 1.02, 1.02 ], # formula_number
+      12: [ 1.02, 1.02 ], # header (text)
+      13: [ 1.02, 1.02 ], # header (image)
+      14: [ 1.05, 1.30 ], # image (pictures, photos)
+      15: [ 1.02, 1.02 ], # inline_formula
+      16: [ 1.02, 1.02 ], # number (page number)
+      17: [ 1.02, 1.02 ], # paragraph_title
+      18: [ 1.02, 1.02 ], # reference (bibliography title)
+      19: [ 1.02, 1.02 ], # reference_content
+      20: [ 1.02, 1.02 ], # seal
+      21: [ 1.02, 1.02 ], # table
+      22: [ 1.02, 1.02 ], # text (body)
+      23: [ 1.02, 1.02 ], # text (secondary)
+      24: [ 1.02, 1.02 ]  # vision_footnote
+    }
     layout_merge_bboxes_mode:
       0: "union" # abstract
       1: "union" # algorithm
@@ -62,20 +88,18 @@ SubModules:
     module_name: vl_recognition
     model_name: PaddleOCR-VL-1.5-0.9B
     model_dir: null
-    batch_size: 4096
+    batch_size: 4096  # max crops per VLM wave
     genai_config:
-#      backend: native  # default -> Exception from the 'vlm' worker: only 0-dimensional arrays can be converted to Python scalars
       backend: vllm-server
-      max_concurrency: 256 # added to mitigate `RuntimeError: Exception from the 'vlm' worker: Error code: 400 - {'error': {'message': 'Already borrowed', 'type': 'BadRequestError', 'param': None, 'code': 400}}`
-#      server_url: http://localhost:8088/v1  # in localhost
-      server_url: http://foil_vllm-PaddleOCR-VL-1.5:8000/v1  # if vlm in docker
+      max_concurrency: 24  # VLM requests in flight per worker: pipeline_workers x this ≈ 3 x max_num_seqs
+      server_url: http://foil_vllm-PaddleOCR-VL-1.5:8000/v1  # vLLM service of the stack
 
 SubPipelines:
   DocPreprocessor:
     pipeline_name: doc_preprocessor
     batch_size: 8
     use_doc_orientation_classify: True
-    use_doc_unwarping: False  # default = True (but distorts too much and crops images)
+    use_doc_unwarping: False  # True distorts pages and crops images
     SubModules:
       DocOrientationClassify:
         module_name: doc_text_orientation
@@ -86,3 +110,25 @@ SubPipelines:
         module_name: image_unwarping
         model_name: UVDoc
         model_dir: null
+
+
+# =====================================================================================
+# SIZING GUIDE (measured on an RTX 3070 with 0.1.7; recipes: docker/<gpu>/)
+# =====================================================================================
+# Unit costs
+#   pipeline worker    VRAM: layout batch 1 → 0.8 GB, 2 → 1.4, 4 → 2.5, 8 → 4.3; about the
+#                      same speed at any batch: small batches, more workers.
+#                      RAM ~2.3 GB, peak ~2.6 GB with 20-page ranges.
+#   PaddleOCR-VL vLLM  ~2 GB + KV 18.4 KB/token; a crop = 0.5-2k tokens (5.4k at most).
+#   Ministral-3-3B     vLLM AWQ: 3.4 GB + KV 107 KB/token; a description = 0.7-2.7k tokens.
+#   LibreOffice        RAM 0.1-0.35 GB, up to ~2 GB on heavy documents; no VRAM.
+# Balance: on a 3070, 3 workers keep a 10-sequence vLLM busy (1.36 pages/s, a 4th adds
+# nothing). Faster GPU: scale workers AND max_num_seqs by its speed (~3x RTX 4090, ~4-5x
+# A100, ~8x H100); keep pipeline_workers x max_concurrency ≈ 3 x max_num_seqs.
+# Under load (vLLM /metrics, nvidia-smi):
+#   running < max_num_seqs, waiting ≈ 0       → add workers
+#   running = max_num_seqs, waiting > 0       → raise max_num_seqs (and the KV)
+#   kv_cache_usage_perc ≈ 100 %, preemptions  → raise kv-cache-memory-bytes
+#   GPU at 100 %                              → the GPU is full, no setting helps
+#   worker out of memory (HTTP 500)           → raise pipeline_worker_vram_limit_mb
+#   vLLM 400 "Already borrowed"               → lower max_concurrency

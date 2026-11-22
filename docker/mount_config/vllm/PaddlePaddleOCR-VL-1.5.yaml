@@ -2,25 +2,23 @@ model: PaddlePaddle/PaddleOCR-VL-1.5
 served-model-name:
   - PaddlePaddle/PaddleOCR-VL-1.5
   - PaddleOCR-VL-1.5-0.9B
-trust-remote-code: True  # keep true even if vllm says it's ignored
-
-# Required for vllm>=0.31: PaddleX sends per-request mm_processor_kwargs (rejected with HTTP 400 otherwise)
-trust-request-mm-kwargs: True
-#max-num-batched-tokens: 16384  # default
-
-# ---non default - dev-only---
+trust-remote-code: True
+trust-request-mm-kwargs: True   # required (vLLM >= 0.31): PaddleX sends mm_processor_kwargs
+enable-offline-docs: True       # /docs without a CDN
 limit_mm_per_prompt: {image: 1}
-max_num_seqs : 10
-# max_waiting_queue_length: xx  # not implemented/released yet
-
-max-num-batched-tokens: 16384
-max-model-len: 16384
-# ----------------------------
-
-no-enable-prefix-caching: True
+no-enable-prefix-caching: True  # PaddleX recommendation: every crop is a new image
 mm-processor-cache-gb: 0
-# Fixed KV cache (~21.7k tokens). vLLM >= 0.33 profiles its batched vision encoder with a
-# larger activation peak: the former `gpu-memory-utilization: 0.35` leaves it a negative KV
-# budget on an 8 GB GPU. gpu-memory-utilization is then only the free-VRAM check at startup.
-kv-cache-memory-bytes: 400000000
-gpu-memory-utilization: 0.05
+# image ≤ 1280 + prompt + output ≤ 4096 (PaddleX cap); at 4096 vLLM silently cuts the output
+max-model-len: 8192
+
+# Sizing (guide at the end of pipeline_config.yaml)
+max_num_seqs: 10
+max-num-batched-tokens: 16384
+# HTTP front-end processes (decode and resize the images: CPU), ~1.9 GB of RAM each.
+# Under load, `top` in this container: the front-ends (`vllm serve` / VLLM::APIServer_*)
+# near 100 % of a core → raise; all well below 50 % → overkill (3070: 1 at ~25 %).
+# VLLM::EngineCore near 100 % instead: more front-ends do not help (add a vLLM replica).
+api-server-count: 1
+# Fixed KV cache, 18.4 KB per token (vLLM >= 0.33: never a gpu-memory-utilization fraction)
+kv-cache-memory-bytes: 400000000  # ~21.7k tokens
+gpu-memory-utilization: 0.05    # with a fixed KV: only the free-VRAM check at startup

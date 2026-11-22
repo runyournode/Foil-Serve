@@ -1,26 +1,7 @@
-# Foil-Serve FULL stack on a single NVIDIA RTX 3070 (8 GB): OCR + image descriptions.
-# MEASURED (WSL2, 0.1.7):
-#   - PaddleOCR-VL-1.5 on vLLM 0.33 (8 sequences, 400 MB fixed KV)       ~2.4 GB
-#   - Ministral-3-3B Q4_K_M + mmproj Q8_0 on llama.cpp (2 slots of 5120)   ~3.4 GB
-#   - 1 pipeline worker (layout batch 1, allocator capped at 900 MB)       ~1.4 GB at peak
-#   → 7.4 GB peak with the Windows desktop at ~0.5 GB. Close GPU-hungry desktop apps
-#     (browsers with hardware acceleration): the desktop's share varied 0.46-1.34 GB.
-#   - 100-page PDF: 118 s (0.85 page/s); descriptions ~130 tokens/s.
-# Ministral does NOT fit next to PaddleOCR-VL with vLLM (its AWQ build keeps the
-# embeddings and the vision tower in bf16: 3.2 GB of weights, 4.1 GB loaded, measured);
-# the GGUF build on llama.cpp (what LM Studio runs) takes 2.4 GB of weights.
-#
-# OCR only, faster under load (3 workers, 1.36 page/s at 4 concurrent requests,
-# 6.2 GB): remove the llama.cpp service, set pipeline_workers = 3 and point
-# [[vlm_models]] to an external endpoint in mount_config/foil_serve/server_config.toml.
-#
-# Models for llama.cpp (once, ~2.4 GB):
-#   mkdir -p ~/.cache/foil-models/ministral-3-3b && cd ~/.cache/foil-models/ministral-3-3b
-#   curl -LO https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-GGUF/resolve/main/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf
-#   curl -LO https://huggingface.co/ggml-org/Ministral-3-3B-Instruct-2512-GGUF/resolve/main/mmproj-Ministral-3-3B-Instruct-2512-Q8_0.gguf
-#
-#   cd docker/rtx3070 && docker compose up -d --wait
-#   → API http://localhost:8081/docs
+# RTX 3070 (8 GB), image descriptions on another server. MEASURED (0.1.7):
+# vLLM ~2.4 GB + 3 workers x 0.8 GB → 6.6-7.1 GB peak with the desktop; 1.36 pages/s.
+# VLM url: [[vlm_models]] in mount_config/foil_serve/server_config.toml.
+#   cd docker/rtx3070 && docker compose up -d --wait   → http://localhost:8081/docs
 
 services:
   foil_app:
@@ -49,8 +30,6 @@ services:
     restart: unless-stopped
     depends_on:
       foil_vllm-PaddleOCR-VL-1.5:
-        condition: service_healthy
-      foil_llamacpp-ministral:
         condition: service_healthy
 
 
@@ -85,31 +64,6 @@ services:
       retries: 3
       start_period: 300s
 
-
-  # Soft Req : image description — Ministral-3-3B GGUF on llama.cpp (OpenAI-compatible)
-  foil_llamacpp-ministral:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b12602
-    container_name: foil_llamacpp-ministral
-    gpus: all
-    expose:
-      - "8080"
-    networks:
-      - foil-net
-    volumes:
-      - ${HOME}/.cache/foil-models/ministral-3-3b:/models:ro
-    # 2 slots of 5120 tokens (image + prompt + 1200 output), q8_0 KV cache, flash attention
-    command: ["-m", "/models/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
-              "--mmproj", "/models/mmproj-Ministral-3-3B-Instruct-2512-Q8_0.gguf",
-              "--host", "0.0.0.0", "--port", "8080", "-c", "10240", "-np", "2", "-ngl", "99",
-              "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
-              "--alias", "mistralai/ministral-3-3b"]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 120s
 
 networks:
   foil-net:

@@ -2,18 +2,14 @@ model: cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
 served-model-name:
   - cyankiwi/Ministral-3-3B-Instruct-2512-AWQ-4bit
   - mistralai/ministral-3-3b
-
 tokenizer_mode: mistral
 config_format: mistral
 load_format: mistral
-
-# Image <= ~3000 tokens + prompt + answer (max_output_tokens = 1200 in server_config.toml)
+# a description: 0.7-2.7k prompt tokens + ≤ 1200 output (max_output_tokens)
 max-model-len: 5000
-# Matches max_concurrent_requests of the "ministral-3-3b" entry in server_config.toml
-max-num-seqs: 8
+max-num-seqs: 16  # = max_concurrent_requests of "ministral-3-3b" in server_config.toml
 limit-mm-per-prompt: {image: 1, video: 0}
 mm-processor-cache-gb: 0
-
-# Fixed KV cache size (~14k tokens); gpu-memory-utilization is then only used for the free-VRAM check at startup
-kv-cache-memory-bytes: 1500000000
-gpu-memory-utilization: 0.05
+# Fixed KV cache, 107 KB per token: ~32.7k tokens (~2k per description); total ~7 GB
+kv-cache-memory-bytes: 3500000000
+gpu-memory-utilization: 0.05  # with a fixed KV: only the free-VRAM check at startup

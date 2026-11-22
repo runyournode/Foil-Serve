@@ -31,6 +31,10 @@ docker/a100/mount_runtime/**
 !docker/a100/mount_runtime/foil_serve/
 !docker/a100/mount_runtime/foil_serve/logs/
 !docker/a100/mount_runtime/foil_serve/logs/.gitkeep
+docker/h100/mount_runtime/**
+!docker/h100/mount_runtime/foil_serve/
+!docker/h100/mount_runtime/foil_serve/logs/
+!docker/h100/mount_runtime/foil_serve/logs/.gitkeep
 docker/mount_runtime_dev/
 
 # Local working notes

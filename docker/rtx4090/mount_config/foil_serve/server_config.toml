@@ -1,359 +1,122 @@
 # -------------------------------------------------------------------
-# Logging & artifacts                                               -
-# All paths below default to /var/log/foil/. This directory must    -
-# exist and be writable by the application user.                    -
-# Docker: created by the Dockerfile.                                -
-# Baremetal: run `sudo mkdir -p /var/log/foil && sudo chown $(whoami) /var/log/foil` -
-# (No clearing mechanism — manage disk space manually.)             -
+# Logging & artifacts (the directory must exist and be writable; no cleanup)
 # -------------------------------------------------------------------
-log_level = "INFO"         # DEBUG | INFO | WARNING | ERROR
-libs_log_level = "WARNING"  # Override for verbose third-party libs (httpx, openai, etc.)
-log_file = "/var/log/foil/foil.log"  # "" to disable logging to file
-# Rotation of log_file: a new file once it reaches log_max_mb (0 = never rotate),
-# log_backup_count older files kept (foil.log.1 … foil.log.N). Only the API process
-# writes the file; the pipeline workers send it their records.
-log_max_mb = 50
-log_backup_count = 5
+log_level = "INFO"          # DEBUG | INFO | WARNING | ERROR
+libs_log_level = "WARNING"  # third-party libraries (httpx, openai, ...)
+log_file = "/var/log/foil/foil.log"  # "" = no log file
+log_max_mb = 50             # rotate log_file at this size (0 = never)
+log_backup_count = 5        # rotated files kept
 
-# Base directory for debug artifacts. Subdirectories are created automatically.
 artifact_dir = "/var/log/foil/artifacts"
-
-# Save input files and debug artifacts for any failed processing request.
-# A timestamped subdirectory is created under `artifact_dir/failed_artifacts_subdir`.
-save_failed_artifacts = true
+save_failed_artifacts = true             # input + debug info of failed requests
 failed_artifacts_subdir = "failed"
-
-# Save artifacts (input spreadsheet + generated PDF) when a sparse spreadsheet
-# triggers fallback to PDF+OCR conversion.
-save_table_conversion_artifacts = false
+save_table_conversion_artifacts = false  # spreadsheet + PDF when a sparse sheet falls back to OCR
 table_conversion_artifacts_subdir = "xls2pdf"
-
-# Save artifacts when spreadsheet cells contain errors (#REF!, #N/A, nan, etc.).
-# A timestamped subdirectory is created containing: input file,
-# md with short error labels (before masking), and final md (after masking).
-# Only triggers when at least one error cell is detected.
-save_cell_error_artifacts = false
+save_cell_error_artifacts = false        # spreadsheets with error cells (#REF!, #N/A, ...)
 cell_error_artifacts_subdir = "cell_errors"
 
-
-# All settings below are required
-# 'default' are recommanded settings but not set in python code
+# Every setting below is required.
 
 # -------------------------------------------------------------------
-# Safety & Startup checks                                           -
+# Security & limits
 # -------------------------------------------------------------------
-
-# Auth to use this app, if `requires_auth` is false, keys are ignored
-requires_auth = true
+requires_auth = true  # false: app_api_keys ignored
 app_api_keys = [
     "changeme",
-#    "changeme2",
 ]
 
-# Check if all vlm_models declared below are properly reachable on server start-up.
-# If any VLM is not reachable, server will not start
-check_vlm_endpoints = true
+# Check every enabled [[vlm_models]] at startup (startup fails if one is unreachable)
+check_vlm_endpoints = true  # Ministral is in this stack
 
-# Maximum accepted file size in MB, checked BEFORE writing to disk.
-# Applies to all file types.
-max_file_size_mb = 200
+max_file_size_mb = 250          # any file, checked before writing to disk
+max_pdf_file_size_mb = 250      # per-type limits, after MIME detection
+max_image_file_size_mb = 50
+max_office_file_size_mb = 250
+max_excel_file_size_mb = 50     # .xlsx: compressed and real decompressed size
+max_unzip_size_mb = 2048        # decompressed size of ZIP-based files (zip bomb guard)
 
-# Admission budget: total size (MB) of the uploads of the requests in progress (waiting
-# or being processed). A request that would go beyond it is refused at once with HTTP
-# 503 + Retry-After; its body is discarded, never held. It is THE setting that bounds the waiting
-# queue (and the RAM it takes: a waiting request holds its upload in memory); size it
-# from the RAM left once the workers, LibreOffice and the API are counted. 0 = none.
+# Total upload size (MB) of the requests in progress; beyond: HTTP 503 + Retry-After.
+# Bounds the waiting queue and its RAM: size it from the RAM left. 0 = no limit.
 max_inflight_upload_mb = 4096
 
-# Per-type size limits (checked after MIME detection).
-# Each is independent from max_file_size_mb; both are enforced.
-max_pdf_file_size_mb = 100
-max_image_file_size_mb = 50
-max_office_file_size_mb = 100
-
-# Maximum accepted Excel file size in MB.
-# For .xlsx (ZIP format): both the compressed (on-disk) size and the actual decompressed
-# size are checked. The decompressed size is measured by reading the real deflate output
-# stream — the ZIP central directory 'file_size' field is attacker-controlled and is NOT
-# used, as a forged value would allow a zip bomb to bypass the check.
-# For .xls (OLE2 binary, not ZIP): only the on-disk size is checked.
-max_excel_file_size_mb = 50
-
-# Maximum allowed decompressed size for ZIP-based files (xlsx, docx, pptx, ods, odt, odp).
-# Phase 1: checked against the ZIP central directory declared sizes (fast, no decompression).
-# If the declared size exceeds this limit, the file is rejected immediately.
-# Phase 2: actual decompression is checked against 1.25× the declared size to detect zip bombs
-max_unzip_size_mb = 2048
-
 # -------------------------------------------------------------------
-# Spreadsheet processing                                            -
+# Spreadsheets (.xls / .xlsx / .ods)
 # -------------------------------------------------------------------
-# A spreadsheet (.xls / .xlsx / .ods) can be converted in four ways, chosen per
-# request with the `spreadsheet_mode` query param on /v1/process (and its variants),
-# or with a dedicated route that pins the mode:
-#
-#   auto (default)  pandas cell extraction, falling back to PDF+OCR when the file is
-#                   empty or suspiciously sparse. This is the ONLY mode driven by the
-#                   excel_pdf_fallback_enabled / excel_min_* settings below.
-#                   → POST /v1/process                        (+ /download)
-#   pandas          cell extraction only. Never falls back, whatever those settings say.
-#                   → POST /v1/process/spreadsheet_pandas     (+ /download)
-#   ocr             LibreOffice → PDF → PaddleOCR only. pandas is not run at all.
-#                   → POST /v1/process/spreadsheet_ocr        (+ /download)
-#   both            both conversions, concatenated in a single Markdown document.
-#                   → POST /v1/process/spreadsheet_both       (+ /download)
-#
-# Whatever the mode, a spreadsheet output starts with a header stating the method used
-# and a table of contents giving the line number of every sheet in the document.
-# The mode is ignored for every other file type: the dedicated routes accept PDF,
-# Office, image and text files too, they just process them as usual.
+# Mode per request (`spreadsheet_mode` or a /v1/process/spreadsheet_* route): auto (default:
+# pandas, PDF+OCR fallback when empty or sparse), pandas, ocr, both.
+table_output_format = "llm"     # "llm" compact | "human" aligned (every Markdown table)
+excel_mask_cell_errors = true   # error cells → "" (true) or a short label (false)
+excel_max_output_ratio = 7.0    # max Markdown per section, x input size (beyond: section dropped)
 
-# Table format for all pure-MD table rendering (Excel/ODS sheets and HTML tables from the OCR pipeline).
-# "llm" (default): minimal formatting, reduced tokens (no padding, short separators)
-# "human": aligned columns, full separators (standard tabulate "pipe" format)
-table_output_format = "llm"
+# auto mode only
+excel_pdf_fallback_enabled = true       # PDF+OCR fallback for empty or sparse spreadsheets
+excel_min_input_for_fallback_mb = 0.25  # no sparse check below this size
+excel_min_output_ratio = 0.01           # sparse: Markdown < this x input (per-request override)
 
-# How to handle Excel cell errors (#REF!, #N/A, #VALUE!, #NAME?, #DIV/0!, #NULL!, #NUM!, nan).
-# true (default): error cells become empty strings before rendering.
-# false: error cells show a short label (e.g. #ref, #n/a, #val, #name, #div, #null, #num).
-# In both cases, fully empty rows and columns are stripped from the output.
-# Applies to the pandas conversion only (modes auto, pandas, both).
-excel_mask_cell_errors = true
+# Pictures and charts (auto, pandas, both)
+excel_extract_images = true       # listed under each sheet, described by the VLM on request
+excel_render_charts = true        # charts → PNG by LibreOffice (false: text summary only)
+excel_rasterize_metafiles = true  # EMF/WMF by LibreOffice (false: skipped)
+excel_max_images = 200            # distinct images per document
 
-# Size budget for EACH conversion section of the output, as a ratio of the input file size.
-# A section that exceeds it is removed from the Markdown and replaced by a short note
-# saying why — in "both" mode, a huge pandas section is dropped and the OCR section is
-# still returned (and vice versa). HTTP 413 is returned only when no section survives,
-# which is what the single-section modes (auto, pandas, ocr) always come down to.
-# Example: 5.0 means a 10 MB spreadsheet may yield at most 50 MB of Markdown per section.
-excel_max_output_ratio = 5.0
-
-# -- The three settings below apply to mode "auto" ONLY -------------
-# Fallback: if a spreadsheet produces very little cell data (e.g. text boxes,
-# shapes only), convert to PDF and process via Paddle OCR instead. Pictures and
-# charts do not count against the file when `excel_extract_images` is on — see below
-# (which mean possible allucinations... ).
-# Set to false to disable the fallback entirely (sparse spreadsheets will return minimal output).
-# The explicit modes (pandas / ocr / both) are a direct client request and ignore this flag.
-excel_pdf_fallback_enabled = true
-# Minimum input file size (MB) to trigger the emptiness check (skip tiny files).
-excel_min_input_for_fallback_mb = 0.25
-# If Markdown output is smaller than this fraction of input size, trigger fallback.
-# Overridable per request with the `excel_min_output_ratio` query param (the request
-# value wins when provided); the param is accepted only on the "auto" routes.
-excel_min_output_ratio = 0.01
-
-
-# -- Pictures and charts: modes "auto", "pandas", "both" ------------
-# The pandas section extracts the pictures and charts of each sheet and lists them
-# under the sheet's table (in on-sheet order), returned in `images` and described
-# by the VLM when `image_description_model_name` is requested.
-# Pictures are read from the file as-is. Their bytes are excluded from the file
-# size in the "auto" sparse check: a small table next to a big picture stays pandas.
-# false: pictures and charts are ignored by the pandas section (previous behaviour).
-excel_extract_images = true
-# Charts are stored as data, not as a bitmap: LibreOffice renders them to PNG.
-# false: a chart is described by its text summary only (type, title, series), no
-# LibreOffice call.
-excel_render_charts = true
-# EMF/WMF pictures cannot be decoded natively on Linux: LibreOffice renders them.
-# false: such pictures are skipped.
-excel_rasterize_metafiles = true
-# Max distinct images extracted per document (pictures + rendered charts). Beyond
-# it, pictures are dropped with a note and charts keep their text summary.
-excel_max_images = 200
-
-
-# -- PDF rendering: modes "ocr", "both", and the "auto" fallback ----
-# Paper format used when converting spreadsheets to PDF.
-# Supported values: "A3", "A4", "A2", "Letter", "Legal", "Tabloid"
-excel_pdf_paper_format = "A3"
-
-# Page orientation for spreadsheet → PDF conversion.
-# true (default): landscape — better for wide spreadsheets with many columns.
-# false: portrait — better for narrow spreadsheets with few columns.
+# PDF rendering (ocr, both, auto fallback)
+excel_pdf_paper_format = "A3"     # A2 | A3 | A4 | Letter | Legal | Tabloid
 excel_pdf_landscape = true
 
-
 # -------------------------------------------------------------------
-# OCR output control in Images  (OCR performed by paddle)           -
+# Output
 # -------------------------------------------------------------------
-# When a VLM image description IS requested:
-# true  → keep <ocr> tags in the final Markdown alongside <figcaption>.
-# false → only <figcaption> (VLM description) is emitted; OCR is still
-#         used internally as context for the VLM prompt.
-output_paddle_ocr = false
-
-# When NO VLM image description is requested:
-# true  → keep <ocr> tags in the final Markdown.
-# false → no <ocr> tags; also skips the OCR-on-images step in the
-#         Paddle pipeline (performance optimization).
-output_paddle_ocr_no_img_desc = false
-
-# Start each page of a paginated document (PDF, office documents converted to PDF,
-# multipage TIFF/WebP) with `<page number="n/n_max" />` in the Markdown.
-# Spreadsheets are never marked: they already have per-sheet headings.
-add_pdf_page = false
-
-
-# -------------------------------------------------------------------
-# Miscellaneous                                                     -
-# -------------------------------------------------------------------
-
-# Directory for temporary files created during request processing.
-# Each request gets a short-lived subdirectory that is cleaned up automatically.
-# Use "/dev/shm" for pure in-memory I/O (ensure sufficient --shm-size in Docker).
-temp_dir = "/tmp/foil-runtime"
-
-# Small images: width OR height (in pixels) below this threshold.
-# Small images are never sent to the VLM for description.
-small_image_threshold = [64, 64]
-# true  → small images are dropped: nothing in the Markdown, not returned in `images`.
-# false → small images are returned in `images` and only referenced in the Markdown
-#         (bare <img>, no <figure>/<figcaption>; their OCR is kept only when OCR output
-#         is enabled and the text is shorter than 40 chars).
-ignore_small_images = true
-
-# When the pipeline finds nothing at all in a document (a photo or a drawing without
-# text: no block detected) and an image description is requested, its whole pages are
-# sent to the VLM as figures instead of answering 422 "no content". Only for documents
-# of at most this many pages (a long run of blank scanned pages stays a 422);
-# 0 = disabled. Spreadsheets are not concerned.
+output_paddle_ocr = false              # keep <ocr> next to the VLM <figcaption>
+output_paddle_ocr_no_img_desc = false  # keep <ocr> without VLM (false also skips OCR in images)
+add_pdf_page = true                    # <page number="n/N" /> before each page (not spreadsheets)
+small_image_threshold = [64, 64]       # width OR height below: small image, never described
+ignore_small_images = true             # drop small images (false: bare <img>)
+# No block found in a document + image description requested: its whole pages go to
+# the VLM, for documents up to this many pages (0 = HTTP 422).
 empty_document_vlm_max_pages = 5
-
-# Image descriptions reused across documents, in MB of RAM (0 = disabled). A
-# description is reused ONLY for a byte-identical VLM request: same endpoint, model,
-# generation parameters, prompt text (context included: OCR, alt text, chart summary)
-# and image bytes — never on an approximate match. A logo shared by many documents is
-# then described once. Side channel to know when clients do not trust each other: a
-# hit answers at once (img_desc_time 0), so a client that submits an exact image it
-# guesses can learn another client already sent it.
+# Descriptions reused across documents, byte-identical VLM requests only (MB, 0 = off).
+# A hit answers at once: a client can tell an exact image was already sent by another.
 vlm_description_cache_mb = 200
-
+temp_dir = "/tmp/foil-runtime"         # per-request temp files ("/dev/shm" = in RAM)
 
 # -------------------------------------------------------------------
-# Ressource managaement                                             -
+# Resources (sizing guide and measured costs: end of pipeline_config.yaml)
 # -------------------------------------------------------------------
+# Pipeline worker processes: one page range at a time, own copy of the layout models
+pipeline_workers = 6  # not measured: add some if vLLM idles
+# VRAM cap per worker (MB, 0 = none), a bit above the layout batch's need:
+# batch 1 → 900, 2 → 1500, 4 → 3000. Too low: HTTP 500 (out of memory).
+pipeline_worker_vram_limit_mb = 900  # layout batch 1
+# VLM requests in flight per worker: genai_config.max_concurrency in pipeline_config.yaml
+pipeline_chunk_pages = 20          # pages per worker task (0 = whole document)
+pipeline_max_page_megapixels = 16  # bigger pages are downscaled (0 = no cap)
+pipeline_task_timeout_s = 600      # per page range: worker killed, HTTP 504 (0 = none)
+pipeline_malloc_trim = true        # give freed memory back to the OS after each task
+# Worker recycling, a safety net (no leak measured; 0 = never)
+max_tasks_between_pipeline_reload = 0
+max_worker_rss_mb = 5000           # RSS after a task is ~2.3 GB
 
-# -- PaddleOCR pipeline workers --------------------------------------
-# The pipeline (orientation + layout models, crops, Markdown) runs in dedicated worker
-# processes; the VLM part is served by vLLM. Each worker holds its own copy of the
-# layout models in VRAM (~1.2 GB idle, more under load: cap it with
-# `pipeline_worker_vram_limit_mb`) and processes one
-# document at a time: N workers = N documents in parallel.
-# A worker only helps when there are at least as many concurrent requests as workers.
-# Measured on an RTX 3070 (layout batch 1, 900 MB cap each, vLLM 10 sequences), pages/s
-# under load: 1 worker 0.84, 2 → 1.09, 3-4 → ~1.2. Bigger GPUs: not measured, re-run a load
-# test (tuning guide at the end of pipeline_config.yaml). Shared GPU: cap VRAM explicitly.
-pipeline_workers = 3  # 3070 bench: throughput grows up to 3 workers; a 4090 feeds vLLM faster (re-measure: add workers while vLLM idles)
-
-# A worker's RSS grows with the largest document it has processed: the memory Paddle
-# frees stays in the glibc heap (fragmentation; no real leak found on the test corpus).
-# `pipeline_malloc_trim` hands it back to the OS after every document (measured: 3.9 GB →
-# 2.1 GB after 100-page PDFs, ~0.15 s per document; VRAM and models untouched).
-# No effect outside glibc.
-pipeline_malloc_trim = true
-
-# Measured over 57 tasks (mixed corpus + 100-page PDFs, malloc_trim on): the RSS after a
-# task stays flat at ~2.3 GB — no leak, recycling is a safety net only. Size host RAM
-# with the PEAK (see pipeline_chunk_pages), compare max_worker_rss_mb with the RSS after.
-# Safety net: a worker is recycled (models reloaded, a few seconds) after
-# `max_tasks_between_pipeline_reload` documents (0 = never) OR as soon as its RSS reaches
-# `max_worker_rss_mb` (0 = never). The RSS threshold reloads only when needed.
-# With N >= 2 workers, at most N-1 reload at the same time: the service never stops.
-max_tasks_between_pipeline_reload = 0  # no leak measured (RSS after a task flat at ~2.3 GB over 57 tasks)
-max_worker_rss_mb = 5000  # safety net: a worker sits at ~2.3-2.6 GB after a task
-
-# VRAM cap per worker for Paddle's allocator (FLAGS_gpu_memory_limit_mb), 0 = no cap.
-# Without a cap a worker keeps growing into whatever VRAM is free (measured on an 8 GB
-# RTX 3070: ~1.2 GB per idle worker, the GPU full under load): set it on a GPU shared
-# with vLLM or another service, so that the sum of all caps stays predictable.
-# The need is set by the layout batch (`LayoutDetection.batch_size` in
-# pipeline_config.yaml), measured per worker: batch 8 → 4.3 GB, 4 → 2.5, 2 → 1.4,
-# 1 → 0.8 GB. Set the cap a bit above it (batch 2 → 1500, batch 1 → 900); below it,
-# multi-page documents fail with HTTP 500 (out of memory). See the tuning guide at the
-# end of pipeline_config.yaml.
-# Size it from the peak VRAM of one worker under load, with margin.
-pipeline_worker_vram_limit_mb = 3000  # layout batch 4 needs ~2.5 GB; 3 x 3 GB + 2 vLLM ~9 GB fits in 24 GB
-
-# A document running longer than this kills its worker and fails with HTTP 504 (0 = no limit).
-pipeline_task_timeout_s = 600  # per page range
-
-# Max in-flight VLM requests per worker (0 = `max_concurrency` of pipeline_config.yaml, 256).
-# With 2+ workers, set it to about `max_num_seqs` x vLLM replicas (not divided by the
-# number of workers). Uncapped, one worker floods vLLM's FIFO queue with a big document's
-# crops and the other workers' documents wait behind them (RTX 3070, 2 workers, 4
-# concurrent requests: p95 96 s → 53 s, +40 % throughput with a cap). Lower values slow a
-# document processed alone (3070, 10 sequences: 3 → 0.62 pages/s, 5 → 0.75, 10 → 0.84)
-# without helping throughput under load.
-pipeline_vlm_max_concurrency = 32  # = max_num_seqs of the PaddleOCR-VL vLLM (single replica), NOT divided by the workers
-
-# Long documents are sent to the workers in consecutive ranges of this many pages, one
-# task each: every range goes back to the end of the queue, so small documents get a
-# worker between two ranges of a big one (no head-of-line blocking, even with 1
-# worker). The task timeout and a worker's peak RSS also become per range.
-# Pages are independent for the pipeline: the output does not depend on the split.
-# Cost for a big document processed ALONE (RTX 3070, 100 pages, 1 worker): 115 s in one
-# task, 124 s in ranges of 40, 140 s in ranges of 20 (one VLM wave barrier per range);
-# under load (several requests, several workers) the barriers are filled by others.
-# Worker peak RSS (RTX 3070, layout batch 1): ~2.3 GB + ~12-15 MB per page of the range
-# (20 pages → 2.6 GB, 40 → 2.8 GB, 100 → 3.4 GB; layout batch 8: +0.5-0.7 GB).
-# 0 = whole document in one task.
-pipeline_chunk_pages = 20
-
-# Pixel budget per page, in megapixels (0 = no cap). Pages are rendered by foil (PDF at
-# 144 dpi, images at their native size, multipage TIFF / WebP included); a page above
-# the budget is rendered / downscaled to it. 16 Mpx = A2 at 144 dpi: the VLM brings
-# every crop down to ~1 Mpx anyway, and vLLM's Pillow refuses images above ~179 Mpx.
-pipeline_max_page_megapixels = 16
-
-# LibreOffice instances (docx, pptx, doc, ppt, odt, odp, rtf, spreadsheets → pdf; .xls
-# decryption; spreadsheet chart rendering). Each instance runs ONE conversion at a time
-# (concurrent conversions inside one soffice are serialized anyway, and can livelock
-# it), and is restarted after every use, in the background (~1 s; the first start on a
-# new profile takes ~15 s): every conversion starts on a fresh soffice, no memory
-# accumulates over documents, a wedged or crashed conversion never affects another
-# one. A long conversion holds one instance only. RAM: size it as instances x the peak
-# of your largest documents (a 47 MB docx: ~2 GB), plus the pipeline workers.
+# LibreOffice instances: one conversion each, restarted after every use.
+# RAM up to ~2 GB each on heavy documents.
 max_concurrent_libreoffice = 3
-
-# Wall-clock limit of one LibreOffice conversion, in seconds (0 = none). Beyond it the
-# request fails with HTTP 504 and its instance is replaced; a crash answers 503.
-# Leave room for legitimately slow documents (some take 15-20 min).
-libreoffice_conversion_timeout_s = 2700
-
-# Max parallel Excel → markdown conversions
+libreoffice_conversion_timeout_s = 2700  # HTTP 504 beyond (0 = none)
 max_concurrent_excel = 5
 
 
 # -------------------------------------------------------------------
-# Definition of available vlm models for image description          -
+# VLM models for image descriptions (image_description_model_name = name)
 # -------------------------------------------------------------------
-
-# [[vlm_models]]
-# enabled = <true | false>
-# max_concurrent_requests = <int>
-# temperature = <float>
-# max_output_tokens = <int>
-# max_input_ocr_length = <int — max chars of OCR text injected into the VLM prompt, e.g. 700>
-# name = <"image_description_model_name from the client">
-# url = <"url to the openai endpoint">
-# endpoint_api_key = <"api key" — any non-empty string when the endpoint has no auth>
-# endpoint_name = <exact model name to pass to the openai endpoint">
-# prompt = <"prompt key defined in [prompts] or direct string: e.g: "Describe the image ..." ">
-# extra_body = <provider-specific parameters forwarded as-is to the API call; {} for none>
-#   Examples:
-#     vLLM / Qwen3 thinking:      extra_body = {chat_template_kwargs = {enable_thinking = true}}
-#     OpenRouter thinking:         extra_body = {reasoning = {effort = "high"}}
-#     OpenAI o-series (workaround): extra_body = {reasoning_effort = "high"}  # prefer top-level if supported
+# url: OpenAI-compatible endpoint; endpoint_name: model served there; endpoint_api_key:
+# any non-empty string without auth; max_concurrent_requests ≈ parallel sequences of the
+# server; max_input_ocr_length: OCR chars put in the prompt; prompt: a [prompts] key or a
+# text; extra_body: sent as is (e.g. {chat_template_kwargs = {enable_thinking = false}}).
 
 [[vlm_models]]
 enabled = true
-# Matches max-num-seqs of the Ministral vLLM
-max_concurrent_requests = 8
+max_concurrent_requests = 16  # = max-num-seqs of the Ministral vLLM
 name = "ministral-3-3b"
 temperature = 0.0
-max_output_tokens = 1200  # fits the 5000-token context of the Ministral vLLM
+max_output_tokens = 1200  # a description: ≤ 2.7k prompt + 1200 output < max-model-len 5000
 max_input_ocr_length = 700
 url = "http://foil_vllm-ministral-3-3b:8000/v1"
 endpoint_name = "mistralai/ministral-3-3b"
@@ -363,29 +126,11 @@ extra_body = {}
 
 
 # -------------------------------------------------------------------
-# External processors (e.g. video → markdown backend)               -
+# External processors: MIME types delegated to a foil-compatible server (e.g. video)
 # -------------------------------------------------------------------
-# MIME types listed in `mime_types` are delegated to a remote server exposing
-# the same API as foil-serve (POST /v1/process, GET /health).
-# Each MIME type may be claimed by at most one enabled processor.
-# If a MIME type is also supported natively, the external processor takes
-# precedence (a warning is logged at start-up).
-#
-# [[external_processors]]
-# enabled = <true | false>
-# name = <"identifier used in logs and /health?external_processor_name=...">
-# url = <"base url of the external server">
-# process_route = <processing route on the external server, e.g. "/v1/process">
-# health_route = <health-check route on the external server, e.g. "/health"; "" when it has none
-#                 (then /health cannot check it and check_on_startup must be false)>
-# endpoint_api_key = <api key, sent as `Authorization: Bearer <key>`; "" for no auth header>
-# mime_types = <list of MIME types routed to this processor>
-# max_concurrent_requests = <int — semaphore size; extra requests queue without blocking the event loop>
-# timeout_s = <total HTTP timeout per attempt, in seconds, e.g. 600.0>
-# max_retries = <extra attempts after the first one — transient errors only (timeouts, connection errors, HTTP 5xx); HTTP 4xx are never retried, e.g. 2>
-# retry_backoff_s = <base delay between attempts, doubles after each retry, e.g. 1.0>
-# max_file_size_mb = <int — per-type size limit, like max_pdf_file_size_mb>
-# check_on_startup = <check the processor /health at server start-up; server will not start on failure>
+# One enabled processor per MIME type (it overrides native support). health_route "" =
+# none (then check_on_startup = false); endpoint_api_key "" = no auth header. Retries on
+# timeouts / HTTP 5xx only, retry_backoff_s doubling each time.
 
 [[external_processors]]
 enabled = false
