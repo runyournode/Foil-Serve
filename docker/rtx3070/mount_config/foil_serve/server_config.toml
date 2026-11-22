@@ -58,6 +58,13 @@ check_vlm_endpoints = true
 # Applies to all file types.
 max_file_size_mb = 200
 
+# Admission budget: total size (MB) of the uploads of the requests in progress (waiting
+# or being processed). A request that would go beyond it is refused at once with HTTP
+# 503 + Retry-After; its body is discarded, never held. It is THE setting that bounds the waiting
+# queue (and the RAM it takes: a waiting request holds its upload in memory); size it
+# from the RAM left once the workers, LibreOffice and the API are counted. 0 = none.
+max_inflight_upload_mb = 4096
+
 # Per-type size limits (checked after MIME detection).
 # Each is independent from max_file_size_mb; both are enforced.
 max_pdf_file_size_mb = 100

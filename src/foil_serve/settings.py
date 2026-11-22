@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     libreoffice_conversion_timeout_s: int = Field(ge=0)
     max_concurrent_excel: int
     max_file_size_mb: int
+    max_inflight_upload_mb: int = Field(ge=0)  # 0 = no admission budget
     max_pdf_file_size_mb: int
     max_image_file_size_mb: int
     max_office_file_size_mb: int

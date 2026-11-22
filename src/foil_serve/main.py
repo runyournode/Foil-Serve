@@ -23,6 +23,7 @@ warnings.filterwarnings(
     "ignore", message="urllib3.*chardet.*doesn't match", category=Warning
 )
 
+from admission import UploadBudget, raise_open_files_limit
 from api import router
 from external import EXTERNAL_MIME_EXT, check_external_processor
 from libreoffice import LibreOfficePool
@@ -41,6 +42,12 @@ from vlm import DescriptionCache
 _log_file_handler = setup_logging()
 
 logger = logging.getLogger(__name__)
+
+# Each waiting connection holds a file descriptor: a generous limit, never reached first
+# (the queue is bounded by the upload budget below).
+_fd_before, _fd_after = raise_open_files_limit()
+if _fd_after != _fd_before:
+    logger.info(f"Open files limit raised from {_fd_before} to {_fd_after}")
 
 
 @asynccontextmanager
@@ -161,6 +168,12 @@ app = FastAPIOffline(
 )
 
 app.include_router(router)
+
+# Admission: 503 + Retry-After once the uploads in progress would exceed the budget
+app.add_middleware(
+    UploadBudget,  # ty: ignore[invalid-argument-type]
+    max_bytes=settings.max_inflight_upload_mb * 1024 * 1024,
+)
 
 
 if __name__ == "__main__":

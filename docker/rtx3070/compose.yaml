@@ -29,6 +29,9 @@ services:
     gpus: all
     ipc: host
     init: true  # reaps orphaned processes (uvicorn would otherwise be PID 1)
+    # File descriptors: foil raises its soft limit to min(hard limit, 65536) at startup.
+    # Deliberately large; the waiting queue (before HTTP 503) is bounded by
+    # max_inflight_upload_mb in server_config.toml, not by this limit.
     expose:
       - "8080"
     ports:
